@@ -17,6 +17,8 @@ La batería se ejecutó contra SQLite real y PostgreSQL 17.5 real proporcionado 
 - Preservación de decimales de 38 dígitos y 18 decimales.
 - Preservación canónica de JSON, UUID y timestamps con nanosegundos.
 - Comportamiento equivalente de claves foráneas.
+- Restricciones `CHECK` canónicas aplicadas y rechazando los mismos datos inválidos.
+- Índices canónicos únicos, parciales y descendentes creados y aplicados en ambos motores.
 - Vistas canónicas con joins, filtros, agrupaciones y agregaciones.
 - Triggers canónicos con efectos equivalentes.
 - Rutinas transaccionales ejecutadas por el runtime común.
@@ -31,12 +33,14 @@ La batería se ejecutó contra SQLite real y PostgreSQL 17.5 real proporcionado 
 
 La prueba de cobertura integral falla porque el sistema aún no proporciona equivalencia exacta demostrada para variantes arbitrarias específicas de cada dialecto de:
 
+- Restricciones `CHECK`.
+- Índices y expresiones de índice.
 - Triggers.
 - Vistas.
 - Rutinas almacenadas.
 - Búsqueda de texto completo.
 
-El resultado de la batería es 12 pruebas superiores superadas y 1 fallida. Esta proporción no representa un porcentaje de compatibilidad total; el fallo significa que el objetivo del 100% no está cumplido.
+El resultado de la batería es 13 pruebas superiores superadas y 1 fallida. Esta proporción no representa un porcentaje de compatibilidad total; el fallo significa que el objetivo del 100% no está cumplido.
 
 ## Defectos detectados y corregidos durante la ejecución
 

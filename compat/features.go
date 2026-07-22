@@ -9,8 +9,10 @@ const (
 	PrimaryKeys       Feature = "primary_keys"
 	ForeignKeys       Feature = "foreign_keys"
 	CheckRules        Feature = "check_constraints"
+	CanonicalChecks   Feature = "canonical_check_constraints"
 	Transactions      Feature = "transactions"
 	Indexes           Feature = "indexes"
+	CanonicalIndexes  Feature = "canonical_indexes"
 	JSONValues        Feature = "json"
 	UUIDValues        Feature = "uuid"
 	Triggers          Feature = "triggers"
@@ -54,11 +56,11 @@ func Audit(contract Contract) ([]Finding, error) {
 
 func assess(feature Feature) Finding {
 	switch feature {
-	case Tables, PrimaryKeys, ForeignKeys, CheckRules, Transactions, Indexes, CanonicalViews, CanonicalTriggers, CanonicalRoutines, CanonicalFullText:
+	case Tables, PrimaryKeys, ForeignKeys, Transactions, CanonicalChecks, CanonicalIndexes, CanonicalViews, CanonicalTriggers, CanonicalRoutines, CanonicalFullText:
 		return Finding{Feature: feature, Status: Exact}
 	case JSONValues, UUIDValues:
 		return Finding{Feature: feature, Status: Exact, Reason: "lossless canonical text representation"}
-	case Triggers, Views, StoredRoutines, FullText:
+	case CheckRules, Indexes, Triggers, Views, StoredRoutines, FullText:
 		return Finding{Feature: feature, Status: Unknown, Reason: "requires parser and semantic compiler"}
 	default:
 		return Finding{Feature: feature, Status: Unknown, Reason: "feature is not in the compatibility catalog"}
@@ -88,6 +90,9 @@ func InferFeatures(schema Schema) []Feature {
 	if len(schema.Routines) > 0 {
 		seen[CanonicalRoutines] = struct{}{}
 	}
+	if len(schema.Indexes) > 0 {
+		seen[CanonicalIndexes] = struct{}{}
+	}
 	for _, table := range schema.Tables {
 		for _, column := range table.Columns {
 			switch column.Type.Family {
@@ -104,7 +109,7 @@ func InferFeatures(schema Schema) []Feature {
 			case ForeignKey:
 				seen[ForeignKeys] = struct{}{}
 			case Check:
-				seen[CheckRules] = struct{}{}
+				seen[CanonicalChecks] = struct{}{}
 			}
 		}
 	}

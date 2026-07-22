@@ -629,6 +629,73 @@ func TestSystemEnforcesForeignKeysEqually(t *testing.T) {
 	}
 }
 
+func TestSystemEnforcesCanonicalChecksAndIndexesEqually(t *testing.T) {
+	ctx := context.Background()
+	nonNegative := compat.Expression{Kind: "gte", Args: []compat.Expression{
+		{Kind: "column", Value: "price"},
+		{Kind: "integer", Value: "0"},
+	}}
+	active := compat.Expression{Kind: "eq", Args: []compat.Expression{
+		{Kind: "column", Value: "active"},
+		{Kind: "boolean", Value: "true"},
+	}}
+	schema := compat.Schema{
+		Tables: []compat.Table{{
+			Name: "indexed_products",
+			Columns: []compat.Column{
+				{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+				{Name: "code", Type: compat.Type{Family: compat.TextType}},
+				{Name: "price", Type: compat.Type{Family: compat.IntegerType}},
+				{Name: "active", Type: compat.Type{Family: compat.BooleanType}},
+			},
+			Constraints: []compat.Constraint{
+				{Kind: compat.PrimaryKey, Columns: []string{"id"}},
+				{Kind: compat.Check, Expression: &nonNegative},
+			},
+		}},
+		Indexes: []compat.Index{
+			{Name: "indexed_products_code_unique", Table: "indexed_products", Unique: true, Columns: []compat.IndexColumn{{Column: "code"}}},
+			{Name: "indexed_products_active_price", Table: "indexed_products", Columns: []compat.IndexColumn{{Column: "price", Descending: true}}, Where: &active},
+		},
+	}
+
+	stores := []*compat.Store{
+		openSQLite(t, filepath.Join(t.TempDir(), "checks-indexes.db")),
+		openPostgres(t),
+	}
+	for _, store := range stores {
+		if err := store.ApplySchema(ctx, schema); err != nil {
+			t.Fatalf("%s apply schema: %v", store.Target.Engine, err)
+		}
+		if _, err := store.DB.ExecContext(ctx, `INSERT INTO indexed_products (id, code, price, active) VALUES (1, 'A', 25, TRUE)`); err != nil {
+			t.Fatalf("%s rejected valid row: %v", store.Target.Engine, err)
+		}
+		if _, err := store.DB.ExecContext(ctx, `INSERT INTO indexed_products (id, code, price, active) VALUES (2, 'B', -1, TRUE)`); err == nil {
+			t.Fatalf("%s accepted row violating CHECK", store.Target.Engine)
+		}
+		if _, err := store.DB.ExecContext(ctx, `INSERT INTO indexed_products (id, code, price, active) VALUES (3, 'A', 30, FALSE)`); err == nil {
+			t.Fatalf("%s accepted row violating unique index", store.Target.Engine)
+		}
+		inspection, err := store.InspectSchema(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !inspection.Exact || !reflect.DeepEqual(schema, inspection.Schema) {
+			t.Fatalf("%s did not reconstruct checks and indexes exactly: %+v", store.Target.Engine, inspection)
+		}
+		var count int
+		if store.Target.Engine == compat.SQLite {
+			err = store.DB.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name IN ('indexed_products_code_unique', 'indexed_products_active_price')`).Scan(&count)
+		} else {
+			err = store.DB.QueryRowContext(ctx, `SELECT count(*) FROM pg_indexes WHERE schemaname = current_schema() AND indexname IN ('indexed_products_code_unique', 'indexed_products_active_price')`).Scan(&count)
+		}
+		if err != nil || count != 2 {
+			t.Fatalf("%s physical indexes: count=%d error=%v", store.Target.Engine, count, err)
+		}
+	}
+	assertStoreSnapshotsEquivalent(t, ctx, schema, stores[0], stores[1])
+}
+
 func TestSystemClaimsExactCoverageForRequiredFeatureFamilies(t *testing.T) {
 	contract := compat.Contract{
 		Source:      compat.Target{Engine: compat.SQLite, Version: compat.Version{Major: 3}},

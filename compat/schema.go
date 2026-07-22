@@ -7,6 +7,7 @@ import "fmt"
 // explicit capability rather than hidden in a raw SQL string.
 type Schema struct {
 	Tables   []Table   `json:"tables"`
+	Indexes  []Index   `json:"indexes,omitempty"`
 	Views    []View    `json:"views,omitempty"`
 	Triggers []Trigger `json:"triggers,omitempty"`
 	Routines []Routine `json:"routines,omitempty"`
@@ -51,6 +52,7 @@ type Constraint struct {
 	Kind       ConstraintKind `json:"kind"`
 	Columns    []string       `json:"columns"`
 	References *Reference     `json:"references,omitempty"`
+	Expression *Expression    `json:"expression,omitempty"`
 }
 
 type ConstraintKind string
@@ -65,6 +67,19 @@ const (
 type Reference struct {
 	Table   string   `json:"table"`
 	Columns []string `json:"columns"`
+}
+
+type Index struct {
+	Name    string        `json:"name"`
+	Table   string        `json:"table"`
+	Unique  bool          `json:"unique,omitempty"`
+	Columns []IndexColumn `json:"columns"`
+	Where   *Expression   `json:"where,omitempty"`
+}
+
+type IndexColumn struct {
+	Column     string `json:"column"`
+	Descending bool   `json:"descending,omitempty"`
 }
 
 // Expression is an AST placeholder. Raw SQL is intentionally excluded from
@@ -155,6 +170,7 @@ type RoutineAction struct {
 
 func (s Schema) Validate() error {
 	tables := make(map[string]struct{}, len(s.Tables))
+	tableColumns := make(map[string]map[string]struct{}, len(s.Tables))
 	for _, table := range s.Tables {
 		if table.Name == "" {
 			return fmt.Errorf("table name is required")
@@ -178,6 +194,28 @@ func (s Schema) Validate() error {
 				return fmt.Errorf("duplicate column %q.%q", table.Name, column.Name)
 			}
 			columns[column.Name] = struct{}{}
+		}
+		tableColumns[table.Name] = columns
+	}
+	indexes := make(map[string]struct{}, len(s.Indexes))
+	for _, index := range s.Indexes {
+		if index.Name == "" || index.Table == "" || len(index.Columns) == 0 {
+			return fmt.Errorf("index name, table and columns are required")
+		}
+		if _, exists := indexes[index.Name]; exists {
+			return fmt.Errorf("duplicate index %q", index.Name)
+		}
+		indexes[index.Name] = struct{}{}
+		if _, exists := tables[index.Table]; !exists {
+			return fmt.Errorf("index %q references unknown table %q", index.Name, index.Table)
+		}
+		for _, column := range index.Columns {
+			if column.Column == "" {
+				return fmt.Errorf("index %q has an empty column", index.Name)
+			}
+			if _, exists := tableColumns[index.Table][column.Column]; !exists {
+				return fmt.Errorf("index %q references unknown column %q.%q", index.Name, index.Table, column.Column)
+			}
 		}
 	}
 	views := make(map[string]struct{}, len(s.Views))

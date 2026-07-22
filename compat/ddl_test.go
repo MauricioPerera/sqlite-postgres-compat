@@ -115,3 +115,57 @@ func TestCompileCanonicalTriggerForBothEngines(t *testing.T) {
 		}
 	}
 }
+
+func TestCompileCanonicalCheckAndIndexesForBothEngines(t *testing.T) {
+	nonNegative := Expression{Kind: "gte", Args: []Expression{
+		{Kind: "column", Value: "price"},
+		{Kind: "integer", Value: "0"},
+	}}
+	active := Expression{Kind: "eq", Args: []Expression{
+		{Kind: "column", Value: "active"},
+		{Kind: "boolean", Value: "true"},
+	}}
+	schema := Schema{
+		Tables: []Table{{
+			Name: "products",
+			Columns: []Column{
+				{Name: "code", Type: Type{Family: TextType}},
+				{Name: "price", Type: Type{Family: IntegerType}},
+				{Name: "active", Type: Type{Family: BooleanType}},
+			},
+			Constraints: []Constraint{{Kind: Check, Expression: &nonNegative}},
+		}},
+		Indexes: []Index{
+			{Name: "products_code_unique", Table: "products", Unique: true, Columns: []IndexColumn{{Column: "code"}}},
+			{Name: "products_active_price", Table: "products", Columns: []IndexColumn{{Column: "price", Descending: true}}, Where: &active},
+		},
+	}
+	for _, engine := range []Engine{SQLite, Postgres} {
+		statements, err := CompileDDL(Target{Engine: engine, Version: Version{Major: 17}}, schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(statements) != 3 {
+			t.Fatalf("unexpected statements for %s: %#v", engine, statements)
+		}
+		if !strings.Contains(statements[0], `CHECK (("price" >= 0))`) {
+			t.Fatalf("missing CHECK for %s: %s", engine, statements[0])
+		}
+		if statements[1] != `CREATE UNIQUE INDEX "products_code_unique" ON "products" ("code" ASC)` {
+			t.Fatalf("unexpected unique index for %s: %s", engine, statements[1])
+		}
+		if !strings.Contains(statements[2], `("price" DESC) WHERE ("active" = TRUE)`) {
+			t.Fatalf("unexpected partial index for %s: %s", engine, statements[2])
+		}
+	}
+}
+
+func TestSchemaRejectsIndexOnUnknownColumn(t *testing.T) {
+	schema := Schema{
+		Tables:  []Table{{Name: "products", Columns: []Column{{Name: "id", Type: Type{Family: IntegerType}}}}},
+		Indexes: []Index{{Name: "invalid", Table: "products", Columns: []IndexColumn{{Column: "missing"}}}},
+	}
+	if err := schema.Validate(); err == nil || !strings.Contains(err.Error(), "unknown column") {
+		t.Fatalf("expected unknown index column error, got %v", err)
+	}
+}

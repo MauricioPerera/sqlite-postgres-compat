@@ -29,3 +29,23 @@ func TestAuditDoesNotSilentlyDowngrade(t *testing.T) {
 		t.Fatal("expected unknown feature to fail an exact contract")
 	}
 }
+
+func TestAuditSeparatesCanonicalChecksAndIndexesFromArbitrarySQL(t *testing.T) {
+	contract := Contract{
+		Source:      Target{Engine: SQLite, Version: Version{Major: 3}},
+		Destination: Target{Engine: Postgres, Version: Version{Major: 17}},
+		RequiredFeatures: []Feature{
+			CanonicalChecks, CanonicalIndexes, CheckRules, Indexes,
+		},
+	}
+	findings, err := Audit(contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []MappingStatus{Exact, Exact, Unknown, Unknown}
+	for i := range want {
+		if findings[i].Status != want[i] {
+			t.Fatalf("feature %s: got %s, want %s", findings[i].Feature, findings[i].Status, want[i])
+		}
+	}
+}

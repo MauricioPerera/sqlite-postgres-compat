@@ -16,11 +16,18 @@ func CompileDDL(target Target, schema Schema) ([]string, error) {
 		return nil, err
 	}
 
-	statements := make([]string, 0, len(schema.Tables)+len(schema.Views)+len(schema.Triggers)*2)
+	statements := make([]string, 0, len(schema.Tables)+len(schema.Indexes)+len(schema.Views)+len(schema.Triggers)*2)
 	for _, table := range schema.Tables {
 		statement, err := compileTable(target.Engine, table)
 		if err != nil {
 			return nil, err
+		}
+		statements = append(statements, statement)
+	}
+	for _, index := range schema.Indexes {
+		statement, err := compileIndex(target.Engine, index)
+		if err != nil {
+			return nil, fmt.Errorf("index %s: %w", index.Name, err)
 		}
 		statements = append(statements, statement)
 	}
@@ -39,6 +46,31 @@ func CompileDDL(target Target, schema Schema) ([]string, error) {
 		statements = append(statements, compiled...)
 	}
 	return statements, nil
+}
+
+func compileIndex(engine Engine, index Index) (string, error) {
+	columns := make([]string, len(index.Columns))
+	for i, column := range index.Columns {
+		columns[i] = quoteIdentifier(column.Column)
+		if column.Descending {
+			columns[i] += " DESC"
+		} else {
+			columns[i] += " ASC"
+		}
+	}
+	statement := "CREATE "
+	if index.Unique {
+		statement += "UNIQUE "
+	}
+	statement += "INDEX " + quoteIdentifier(index.Name) + " ON " + quoteIdentifier(index.Table) + " (" + strings.Join(columns, ", ") + ")"
+	if index.Where != nil {
+		where, err := compileExpression(engine, *index.Where)
+		if err != nil {
+			return "", err
+		}
+		statement += " WHERE " + where
+	}
+	return statement, nil
 }
 
 func compileTable(engine Engine, table Table) (string, error) {
@@ -62,7 +94,7 @@ func compileTable(engine Engine, table Table) (string, error) {
 		parts = append(parts, definition)
 	}
 	for _, constraint := range table.Constraints {
-		definition, err := compileConstraint(constraint)
+		definition, err := compileConstraint(engine, constraint)
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", table.Name, err)
 		}
@@ -135,7 +167,7 @@ func compileType(engine Engine, typ Type) (string, error) {
 	return "", fmt.Errorf("type family %q is not supported by %s", typ.Family, engine)
 }
 
-func compileConstraint(constraint Constraint) (string, error) {
+func compileConstraint(engine Engine, constraint Constraint) (string, error) {
 	if len(constraint.Columns) == 0 && constraint.Kind != Check {
 		return "", fmt.Errorf("constraint %q has no columns", constraint.Kind)
 	}
@@ -152,7 +184,14 @@ func compileConstraint(constraint Constraint) (string, error) {
 		return "FOREIGN KEY (" + strings.Join(columns, ", ") + ") REFERENCES " +
 			quoteIdentifier(constraint.References.Table) + " (" + strings.Join(quoteIdentifiers(constraint.References.Columns), ", ") + ")", nil
 	case Check:
-		return "", fmt.Errorf("check constraints require an expression AST")
+		if constraint.Expression == nil {
+			return "", fmt.Errorf("check constraint requires an expression")
+		}
+		expression, err := compileExpression(engine, *constraint.Expression)
+		if err != nil {
+			return "", err
+		}
+		return "CHECK (" + expression + ")", nil
 	default:
 		return "", fmt.Errorf("unknown constraint %q", constraint.Kind)
 	}
