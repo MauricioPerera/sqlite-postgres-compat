@@ -53,7 +53,7 @@ func assess(feature Feature) Finding {
 	case Tables, PrimaryKeys, ForeignKeys, CheckRules, Transactions, Indexes:
 		return Finding{Feature: feature, Status: Exact}
 	case JSONValues, UUIDValues:
-		return Finding{Feature: feature, Status: Transformed, Reason: "requires target-specific physical representation"}
+		return Finding{Feature: feature, Status: Exact, Reason: "lossless canonical text representation"}
 	case Triggers, Views, StoredRoutines, FullText:
 		return Finding{Feature: feature, Status: Unknown, Reason: "requires parser and semantic compiler"}
 	default:

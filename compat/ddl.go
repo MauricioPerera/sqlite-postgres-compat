@@ -109,9 +109,13 @@ func compileType(engine Engine, typ Type) (string, error) {
 			// text preserves nanoseconds and offsets without rounding.
 			return "TEXT", nil
 		case JSONType:
-			return "JSONB", nil
+			// JSONB rewrites key order, whitespace, duplicate keys and number
+			// representations. TEXT preserves the canonical payload byte-for-byte.
+			return "TEXT", nil
 		case UUIDType:
-			return "UUID", nil
+			// Native UUID normalizes textual representation. TEXT preserves the
+			// exact canonical value used by both engines.
+			return "TEXT", nil
 		}
 	}
 	return "", fmt.Errorf("type family %q is not supported by %s", typ.Family, engine)

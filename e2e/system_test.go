@@ -242,7 +242,7 @@ func TestSystemPreservesJSONUUIDAndTimestampSemantics(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := source.DB.ExecContext(ctx, `INSERT INTO rich_values (id, document, occurred_at) VALUES (?, ?, ?)`,
-		"550e8400-e29b-41d4-a716-446655440000", `{"b":2,"a":1}`, "2026-07-22T12:34:56.123456789-06:00"); err != nil {
+		"550E8400-E29B-41D4-A716-446655440000", `{ "b": 123456789012345678901234567890, "a": 1 }`, "2026-07-22T12:34:56.123456789-06:00"); err != nil {
 		t.Fatal(err)
 	}
 	sourceSnapshot, err := source.ExportSnapshot(ctx, schema)
@@ -324,8 +324,13 @@ func TestSystemClaimsExactCoverageForRequiredFeatureFamilies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := compat.RequireExact(findings); err != nil {
-		t.Fatalf("system does not provide exact coverage: %v; findings=%+v", err, findings)
+	for _, finding := range findings {
+		finding := finding
+		t.Run(string(finding.Feature), func(t *testing.T) {
+			if finding.Status != compat.Exact {
+				t.Fatalf("system does not provide exact coverage: status=%s reason=%s", finding.Status, finding.Reason)
+			}
+		})
 	}
 }
 

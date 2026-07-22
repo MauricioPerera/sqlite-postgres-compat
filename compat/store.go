@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -228,15 +229,20 @@ func canonicalValue(kind TypeFamily, source any) (Value, error) {
 		}
 		return Value{Kind: TimestampValue, Value: timestamp.UTC().Format(time.RFC3339Nano)}, nil
 	case JSONType:
+		decoder := json.NewDecoder(strings.NewReader(text))
+		decoder.UseNumber()
 		var document any
-		if err := json.Unmarshal([]byte(text), &document); err != nil {
+		if err := decoder.Decode(&document); err != nil {
 			return Value{}, fmt.Errorf("invalid JSON: %w", err)
 		}
-		normalized, err := json.Marshal(document)
-		if err != nil {
-			return Value{}, err
+		var trailing any
+		if err := decoder.Decode(&trailing); err != io.EOF {
+			if err == nil {
+				return Value{}, fmt.Errorf("invalid JSON: multiple top-level values")
+			}
+			return Value{}, fmt.Errorf("invalid JSON trailing data: %w", err)
 		}
-		return Value{Kind: JSONValue, Value: string(normalized)}, nil
+		return Value{Kind: JSONValue, Value: text}, nil
 	case UUIDType:
 		return Value{Kind: UUIDValue, Value: text}, nil
 	default:

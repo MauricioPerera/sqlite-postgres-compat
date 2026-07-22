@@ -56,11 +56,12 @@ func TestSQLiteSnapshotRoundTrip(t *testing.T) {
 }
 
 func TestCanonicalJSONAndTimestampNormalization(t *testing.T) {
-	jsonValue, err := canonicalValue(JSONType, `{"b":2,"a":1}`)
+	rawJSON := `{ "b": 123456789012345678901234567890, "a": 1 }`
+	jsonValue, err := canonicalValue(JSONType, rawJSON)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if jsonValue.Value != `{"a":1,"b":2}` {
+	if jsonValue.Value != rawJSON {
 		t.Fatalf("unexpected JSON %s", jsonValue.Value)
 	}
 

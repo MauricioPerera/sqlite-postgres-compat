@@ -26,8 +26,20 @@ func TestCompileDDLForBothEngines(t *testing.T) {
 	if !strings.Contains(sqlite[0], `"id" TEXT`) {
 		t.Fatalf("unexpected sqlite DDL: %s", sqlite[0])
 	}
-	if !strings.Contains(postgres[0], `"id" UUID`) || !strings.Contains(postgres[0], `"profile" JSONB`) {
+	if !strings.Contains(postgres[0], `"id" TEXT`) || !strings.Contains(postgres[0], `"profile" TEXT`) {
 		t.Fatalf("unexpected postgres DDL: %s", postgres[0])
+	}
+}
+
+func TestPostgresJSONAndUUIDUseLosslessTextStorage(t *testing.T) {
+	for _, family := range []TypeFamily{JSONType, UUIDType} {
+		typ, err := compileType(Postgres, Type{Family: family})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if typ != "TEXT" {
+			t.Fatalf("expected TEXT for %s, got %s", family, typ)
+		}
 	}
 }
 

@@ -23,7 +23,6 @@ La batería se ejecutó contra SQLite real y PostgreSQL 17.5 real proporcionado 
 
 La prueba de cobertura integral falla porque el sistema aún no proporciona equivalencia exacta demostrada para:
 
-- JSON y UUID en el catálogo de capacidades, aunque los casos de datos probados sí completaron el viaje de ida y vuelta.
 - Triggers.
 - Vistas.
 - Rutinas almacenadas.
