@@ -81,7 +81,10 @@ func RequireExact(findings []Finding) error {
 // schema. Migration callers use this to prevent a schema from claiming an
 // exact plan while omitting its difficult capabilities from the contract.
 func InferFeatures(schema Schema) []Feature {
-	seen := map[Feature]struct{}{Tables: {}}
+	// CanonicalFullText is provided unconditionally by the portable SearchText
+	// runtime, independent of the schema's tables, so it is always inferred —
+	// mirroring how Tables is seeded below rather than gated on a schema check.
+	seen := map[Feature]struct{}{Tables: {}, CanonicalFullText: {}}
 	if len(schema.Views) > 0 {
 		seen[CanonicalViews] = struct{}{}
 	}

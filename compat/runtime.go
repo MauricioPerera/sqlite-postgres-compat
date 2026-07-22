@@ -120,6 +120,11 @@ func (store *Store) SearchText(ctx context.Context, table, idColumn string, text
 		}
 		var content strings.Builder
 		for _, value := range values[1:] {
+			// A NULL column carries no searchable text; stringify(nil) would
+			// otherwise emit "<nil>" and tokenize to a spurious "nil" token.
+			if value == nil {
+				continue
+			}
 			content.WriteString(stringify(value))
 			content.WriteByte(' ')
 		}
