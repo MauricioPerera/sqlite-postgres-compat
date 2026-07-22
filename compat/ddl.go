@@ -266,7 +266,19 @@ func compileExpression(engine Engine, expression Expression) (string, error) {
 		}
 		operators := map[string]string{
 			"and": "AND", "or": "OR", "eq": "=", "ne": "<>", "lt": "<", "lte": "<=", "gt": ">", "gte": ">=",
-			"add": "+", "sub": "-", "mul": "*", "div": "/", "like": "LIKE",
+			"add": "+", "sub": "-", "mul": "*", "div": "/",
+		}
+		// SQLite's LIKE is case-insensitive (ASCII) by default, while Postgres's
+		// LIKE is case-sensitive. Compile to ILIKE on Postgres to preserve the
+		// SQLite semantics. Note: ILIKE is case-insensitive across the full
+		// Unicode range, whereas SQLite only folds ASCII — this is the standard
+		// pragmatic mapping, accepted as a known trade-off.
+		if expression.Kind == "like" {
+			operator := "LIKE"
+			if engine == Postgres {
+				operator = "ILIKE"
+			}
+			return "(" + left + " " + operator + " " + right + ")", nil
 		}
 		return "(" + left + " " + operators[expression.Kind] + " " + right + ")", nil
 	case "not", "is_null", "is_not_null":

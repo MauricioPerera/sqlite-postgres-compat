@@ -160,6 +160,60 @@ func TestCompileCanonicalCheckAndIndexesForBothEngines(t *testing.T) {
 	}
 }
 
+func TestCompileLikePreservesSQLiteSemanticsForBothEngines(t *testing.T) {
+	like := Expression{Kind: "like", Args: []Expression{
+		{Kind: "column", Value: "code"},
+		{Kind: "string", Value: "prod_%"},
+	}}
+	schema := Schema{
+		Tables: []Table{{Name: "products", Columns: []Column{
+			{Name: "code", Type: Type{Family: TextType}},
+			{Name: "price", Type: Type{Family: IntegerType}},
+		}}},
+		Views: []View{{
+			Name: "product_codes",
+			Query: SelectQuery{
+				Columns: []Projection{{Expression: Expression{Kind: "column", Value: "code"}, Alias: "code"}},
+				From:   TableSource{Table: "products"},
+				Where:  &like,
+			},
+		}},
+	}
+
+	for _, engine := range []Engine{SQLite, Postgres} {
+		statements, err := CompileDDL(Target{Engine: engine, Version: Version{Major: 17}}, schema)
+		if err != nil {
+			t.Fatalf("%s: %v", engine, err)
+		}
+		if len(statements) != 2 {
+			t.Fatalf("%s: expected 2 statements, got %#v", engine, statements)
+		}
+		view := statements[1]
+		if engine == Postgres {
+			if !strings.Contains(view, " ILIKE ") {
+				t.Fatalf("postgres view must use ILIKE: %s", view)
+			}
+			if strings.Contains(view, " LIKE ") {
+				t.Fatalf("postgres view must not emit bare LIKE: %s", view)
+			}
+			if !strings.Contains(view, `("code" ILIKE 'prod_%')`) {
+				t.Fatalf("unexpected postgres view DDL: %s", view)
+			}
+		}
+		if engine == SQLite {
+			if !strings.Contains(view, " LIKE ") {
+				t.Fatalf("sqlite view must use LIKE: %s", view)
+			}
+			if strings.Contains(view, "ILIKE") {
+				t.Fatalf("sqlite view must not emit ILIKE: %s", view)
+			}
+			if !strings.Contains(view, `("code" LIKE 'prod_%')`) {
+				t.Fatalf("unexpected sqlite view DDL: %s", view)
+			}
+		}
+	}
+}
+
 func TestSchemaRejectsIndexOnUnknownColumn(t *testing.T) {
 	schema := Schema{
 		Tables:  []Table{{Name: "products", Columns: []Column{{Name: "id", Type: Type{Family: IntegerType}}}}},
