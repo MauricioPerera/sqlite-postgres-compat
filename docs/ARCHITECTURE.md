@@ -33,12 +33,12 @@ Las capacidades `canonical_*` se refieren exclusivamente a objetos expresados me
 
 `compat.Schema` modela:
 
-- tablas, columnas y tipos;
+- tablas, columnas y tipos (familias escalares, `decimal(p,s)` con argumentos y `vector(N)` con dimensión canónica);
 - claves primarias, `UNIQUE`, claves foráneas y `CHECK`;
 - índices únicos, parciales y descendentes;
 - vistas, joins, filtros, agrupaciones y orden;
 - triggers con acciones `INSERT`, `UPDATE` y `DELETE`;
-- rutinas transaccionales parametrizadas.
+- rutinas transaccionales parametrizadas con acciones `INSERT`, `UPDATE` y `DELETE`.
 
 No se aceptan fragmentos de SQL opacos dentro del esquema. Expresiones, acciones y consultas se representan como nodos estructurados para poder compilarlos por separado.
 
@@ -69,8 +69,8 @@ La importación es aditiva: no borra ni reemplaza tablas existentes.
 - aplica un stream de un solo origen dentro de una transacción;
 - registra secuencias en `__compat_applied_changes` para permitir reintentos;
 - compara la imagen `before` antes de actualizar o eliminar;
-- devuelve `ConflictError` ante divergencia;
-- inhibe temporalmente la captura para evitar ecos infinitos.
+- devuelve `ConflictError` (con `Expected`/`Actual`) ante divergencia;
+- inhibe la captura para evitar ecos infinitos: la supresión es transaccional, y en Postgres se arma con el GUC local `compat.suppress` en vez de una fila compartida, de modo que no filtra a transacciones ajenas bajo MVCC.
 
 Todas las tablas capturadas necesitan una clave primaria canónica.
 

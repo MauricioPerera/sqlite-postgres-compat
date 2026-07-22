@@ -17,12 +17,24 @@
 | Índices | Únicos, parciales, varias columnas, `ASC`/`DESC` | B-tree por columnas y predicados comunes | Índices de expresión, métodos, colaciones y clases de operador específicas |
 | Vistas | Proyección, filtro, joins, agregación, orden, límite y desplazamiento | `INNER`, `LEFT`, `CROSS`, `GROUP BY`, `HAVING` y agregados comunes | Subconsultas, ventanas, CTE y operaciones de conjuntos |
 | Triggers | `BEFORE`/`AFTER`; eventos y acciones `INSERT`/`UPDATE`/`DELETE` | Auditoría basada en `NEW`/`OLD` | Control de flujo, SQL dinámico y código procedural arbitrario |
-| Rutinas | Acciones transaccionales del runtime común | Procedimientos SQL/PLpgSQL parametrizados de inserción | Funciones con retorno, modos avanzados y lógica procedural arbitraria |
+| Rutinas | Acciones transaccionales del runtime común (`INSERT`/`UPDATE`/`DELETE`) | Procedimientos SQL/PLpgSQL parametrizados con acciones `INSERT`/`UPDATE`/`DELETE` y `WHERE` restringido a comparaciones columna↔parámetro/literal compuestas con `AND`/`OR`/`NOT` | Funciones con retorno, modos avanzados y lógica procedural arbitraria |
 | JSON | Texto canónico sin pérdida de representación | Columnas JSON/JSONB se reconocen | Operadores e índices JSON específicos |
 | UUID | Texto canónico | UUID nativo se reconoce | Operadores o extensiones específicas |
 | Vector | `vector(N)` con dimensión canónica | `F32_BLOB(N)` de libSQL y `vector` de pgvector se reconocen | Tipos vectoriales no modelados, índices ANN y funciones de distancia nativas |
 | Timestamp | Texto canónico RFC3339Nano | Tipos timestamp se reconocen | Semántica arbitraria de zona, infinidades y funciones específicas |
 | Búsqueda textual | Tokenización Unicode determinista en Go | No se traduce FTS nativo | Ranking, stemming, diccionarios, FTS5, `tsvector`/`tsquery` arbitrarios |
+
+## Gramática de expresiones y funciones
+
+El parser canónico (`compat/sqlparse.go`) reconoce un subconjunto deliberadamente acotado de SQL. Las expresiones, predicados `CHECK`, `WHERE` de índices parciales, condiciones de trigger y cuerpos de vista se traducen sólo dentro de esa gramática; todo lo demás se rechaza con error explícito en vez de aceptarse de forma silenciosa.
+
+Operadores por nivel de precedencia (de menor a mayor): `OR` · `AND` · `NOT` · `IS NULL`/`IS NOT NULL` · comparaciones (`<=`, `>=`, `<>`, `!=`, `=`, `<`, `>`, `LIKE`) · `||` (concatenación) · `+`/`-` · `*`/`/`. `NOT` se resuelve entre `AND` y las comparaciones, de modo que `NOT a = b` se parsea como `not(eq(a, b))`. La forma `a NOT LIKE b` se pliega a `not(like(a, b))`.
+
+`LIKE` se compila a `ILIKE` en PostgreSQL para preservar la semántica de SQLite (insensible a mayúsculas/minúsculas en ASCII); es el mapeo pragmático estándar y se acepta como compromiso conocido (ILIKE pliega todo el rango Unicode, SQLite sólo ASCII).
+
+Funciones escalares admitidas (allowlist exacta): agregadas `count`, `sum`, `avg`, `min`, `max` (aceptan `*` o una expresión); de caja `lower`, `upper` (una expresión); `length`, `abs`, `trim` (una expresión); `coalesce` (al menos un argumento); `replace` (exactamente tres argumentos). Cualquier otra función se rechaza con `unsupported catalog function`.
+
+Literales admitidos: cadenas `'...'` (con `''` como escape), booleanos `TRUE`/`FALSE`, `NULL`, `CURRENT_TIMESTAMP`, enteros y decimales (`123`, `1.5`, `1e3`), y literales hexadecimales SQLite `0x10`/`0XABCDEF` convertidos a su valor decimal. Identificadores pueden cualificarse con `.` y citarse con `"..."`.
 
 ## Capacidades de auditoría
 

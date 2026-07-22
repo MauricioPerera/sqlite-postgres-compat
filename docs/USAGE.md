@@ -140,7 +140,7 @@ if len(changes) > 0 {
 
 Repite el flujo en dirección contraria con un cursor independiente. Nunca compartas cursores entre orígenes.
 
-`ApplyChanges` es idempotente por motor, versión y secuencia de origen. Los cambios replicados no se vuelven a registrar en el journal del destino.
+`ApplyChanges` es idempotente por motor, versión y secuencia de origen. Los cambios replicados no se vuelven a registrar en el journal del destino: la supresión anti-eco es transaccional, y en Postgres se implementa con el GUC local `compat.suppress` (`set_config('compat.suppress','1',true)`), invisible a otras transacciones bajo MVCC y reiniciado al hacer COMMIT/ROLLBACK. `ConflictError` expone `Table`, `PrimaryKey`, `Expected` y `Actual` para diagnosticar exactamente qué valores divergieron. `Version{0,0,0}` es inválida y se rechaza: no es segura como clave de deduplicación entre orígenes.
 
 ### Catch-up tolerante para cutover sin ventana
 
@@ -201,7 +201,7 @@ err := store.CallRoutine(ctx, schema, "create_entry", map[string]compat.Value{
 })
 ```
 
-Las rutinas canónicas se ejecutan en una transacción. Actualmente las rutinas externas traducibles son comandos parametrizados de inserción; funciones con retorno o control de flujo quedan sin resolver.
+Las rutinas canónicas se ejecutan en una transacción. Las acciones admitidas son `INSERT`, `UPDATE` y `DELETE`: `UPDATE` exige asignaciones y un `WHERE`; `DELETE` exige un `WHERE` y no admite asignaciones. El `WHERE` de una rutina se restringe a comparaciones columna↔parámetro/literal (`=`, `<>`, `<`, `<=`, `>`, `>=`, `LIKE`) compuestas con `AND`/`OR`/`NOT`, más `IS NULL`/`IS NOT NULL`; los cualificadores `tabla.columna` y cualquier construcción fuera de esa gramática se rechazan con error explícito. `LIKE` se compila a `ILIKE` en PostgreSQL para preservar la semántica de SQLite. Las rutinas externas traducibles son procedimientos SQL/PLpgSQL parametrizados con esas acciones; las funciones con retorno, modos avanzados o control de flujo quedan sin resolver.
 
 ## Búsqueda textual común
 

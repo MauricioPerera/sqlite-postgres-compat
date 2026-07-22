@@ -57,7 +57,7 @@ Los cursores SQLite y PostgreSQL son independientes. No se debe usar el máximo 
 
 ## Conflictos
 
-Una actualización o eliminación compara la imagen `before` del origen con la fila actual del destino. Si difieren, `ApplyChanges` aborta toda la transacción y devuelve `ConflictError`.
+Una actualización o eliminación compara la imagen `before` del origen con la fila actual del destino. Si difieren, `ApplyChanges` aborta toda la transacción y devuelve `ConflictError`, que incluye `Table`, `PrimaryKey`, `Expected` y `Actual` para identificar exactamente qué valores divergieron. La supresión anti-eco durante la aplicación es transaccional (GUC local `compat.suppress` en Postgres), y `Version{0,0,0}` se rechaza como identificador de origen: no es segura como clave de deduplicación.
 
 La aplicación debe decidir una política explícita:
 

@@ -4,7 +4,7 @@ Motor experimental de compatibilidad bidireccional SQLite ↔ PostgreSQL escrito
 
 El proyecto usa un esquema canónico independiente de ambos dialectos. Su contrato declara las versiones de origen y destino y las capacidades que deben conservarse. Una capacidad desconocida o no traducida detiene la operación en vez de degradarse silenciosamente.
 
-Las capas implementadas son el contrato de compatibilidad, la representación canónica de esquemas, persistencia e inspección exacta del contrato, traducción de catálogos externos para claves primarias, restricciones `UNIQUE`, claves foráneas con acciones referenciales, valores por defecto, expresiones `CHECK`, índices, vistas `SELECT` con joins y agregaciones, triggers con acciones `INSERT`/`UPDATE`/`DELETE` y procedimientos de inserción parametrizados dentro de la gramática SQL común, auditoría de capacidades, compiladores DDL SQLite/PostgreSQL, adaptadores para snapshots, captura automática de cambios, replicación incremental transaccional e idempotente con detección de conflictos y supresión de ecos, y un runtime común para vistas, triggers, rutinas y búsqueda textual canónicos. La siguiente capa es completar el análisis de dialectos externos.
+Las capas implementadas son el contrato de compatibilidad, la representación canónica de esquemas, persistencia e inspección exacta del contrato, traducción de catálogos externos para claves primarias, restricciones `UNIQUE`, claves foráneas con acciones referenciales, valores por defecto, expresiones `CHECK`, índices, vistas `SELECT` con joins y agregaciones, triggers con acciones `INSERT`/`UPDATE`/`DELETE`, rutinas parametrizadas con acciones `INSERT`/`UPDATE`/`DELETE` dentro de la gramática SQL común, tipos canónicos escalares y `vector(N)` (feature `canonical_vectors`), auditoría de capacidades, compiladores DDL SQLite/PostgreSQL, adaptadores para snapshots, captura automática de cambios, replicación incremental transaccional e idempotente con detección de conflictos (incluye `Expected`/`Actual` en `ConflictError`) y supresión de ecos transaccional (GUC local `compat.suppress` en Postgres), un runtime común para vistas, triggers, rutinas y búsqueda textual canónicos, y la CLI `compat-cutover` para migración sin ventana. La siguiente capa es completar el análisis de dialectos externos.
 
 > Estado: el núcleo canónico funciona y está probado en ambos motores, pero el proyecto todavía no ofrece compatibilidad total con cualquier SQL arbitrario de SQLite y PostgreSQL. La prueba global permanece roja hasta que esa afirmación sea verdadera.
 
@@ -68,6 +68,7 @@ La suite comprueba el núcleo portable, CLI completa, precisión decimal, JSON, 
 - [Operación, concurrencia y recuperación](docs/OPERATIONS.md)
 - [Pruebas y criterios de aceptación](docs/TESTING.md)
 - [Informe de la última validación](docs/reports/VALIDATION_REPORT.md)
+- [Especificación para agentes/LLMs](AGENTS.md): gramática canónica, CLIs y flujo de migración.
 
 Ejemplo de `contract.json`:
 
