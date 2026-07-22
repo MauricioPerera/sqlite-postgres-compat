@@ -214,6 +214,130 @@ func TestCompileLikePreservesSQLiteSemanticsForBothEngines(t *testing.T) {
 	}
 }
 
+func TestCompileConcatForBothEngines(t *testing.T) {
+	concat := Expression{Kind: "concat", Args: []Expression{
+		{Kind: "column", Value: "first"},
+		{Kind: "concat", Args: []Expression{
+			{Kind: "string", Value: " "},
+			{Kind: "column", Value: "last"},
+		}},
+	}}
+	schema := Schema{
+		Tables: []Table{{Name: "people", Columns: []Column{
+			{Name: "first", Type: Type{Family: TextType}},
+			{Name: "last", Type: Type{Family: TextType}},
+		}}},
+		Views: []View{{
+			Name: "full_names",
+			Query: SelectQuery{
+				Columns: []Projection{{Expression: concat, Alias: "name"}},
+				From:    TableSource{Table: "people"},
+			},
+		}},
+	}
+
+	for _, engine := range []Engine{SQLite, Postgres} {
+		statements, err := CompileDDL(Target{Engine: engine, Version: Version{Major: 17}}, schema)
+		if err != nil {
+			t.Fatalf("%s: %v", engine, err)
+		}
+		view := statements[1]
+		if !strings.Contains(view, `("first" || (' ' || "last"))`) {
+			t.Fatalf("%s: expected || concat, got %s", engine, view)
+		}
+		if strings.Contains(view, "ILIKE") || strings.Contains(view, " LIKE ") {
+			t.Fatalf("%s: concat must not involve LIKE, got %s", engine, view)
+		}
+	}
+}
+
+func TestCompileScalarFunctionsForBothEngines(t *testing.T) {
+	schema := Schema{
+		Tables: []Table{{Name: "items", Columns: []Column{
+			{Name: "code", Type: Type{Family: TextType}},
+			{Name: "value", Type: Type{Family: IntegerType}},
+		}}},
+		Views: []View{{
+			Name: "item_report",
+			Query: SelectQuery{
+				Columns: []Projection{
+					{Expression: Expression{Kind: "length", Args: []Expression{{Kind: "column", Value: "code"}}}, Alias: "len"},
+					{Expression: Expression{Kind: "abs", Args: []Expression{{Kind: "column", Value: "value"}}}, Alias: "abs_val"},
+					{Expression: Expression{Kind: "trim", Args: []Expression{{Kind: "column", Value: "code"}}}, Alias: "clean"},
+					{Expression: Expression{Kind: "coalesce", Args: []Expression{
+						{Kind: "column", Value: "code"},
+						{Kind: "string", Value: ""},
+					}}, Alias: "fallback"},
+					{Expression: Expression{Kind: "replace", Args: []Expression{
+						{Kind: "column", Value: "code"},
+						{Kind: "string", Value: "-"},
+						{Kind: "string", Value: "_"},
+					}}, Alias: "normalized"},
+				},
+				From: TableSource{Table: "items"},
+			},
+		}},
+	}
+
+	for _, engine := range []Engine{SQLite, Postgres} {
+		statements, err := CompileDDL(Target{Engine: engine, Version: Version{Major: 17}}, schema)
+		if err != nil {
+			t.Fatalf("%s: %v", engine, err)
+		}
+		view := statements[1]
+		for _, want := range []string{
+			`LENGTH("code")`,
+			`ABS("value")`,
+			`TRIM("code")`,
+			`COALESCE("code", '')`,
+			`REPLACE("code", '-', '_')`,
+		} {
+			if !strings.Contains(view, want) {
+				t.Fatalf("%s: missing %q in %s", engine, want, view)
+			}
+		}
+	}
+}
+
+func TestCompileNotLikeForBothEngines(t *testing.T) {
+	schema := Schema{
+		Tables: []Table{{Name: "products", Columns: []Column{
+			{Name: "code", Type: Type{Family: TextType}},
+		}}},
+		Views: []View{{
+			Name: "non_matching",
+			Query: SelectQuery{
+				Columns: []Projection{{Expression: Expression{Kind: "column", Value: "code"}, Alias: "code"}},
+				From:    TableSource{Table: "products"},
+				Where: &Expression{Kind: "not", Args: []Expression{{Kind: "like", Args: []Expression{
+					{Kind: "column", Value: "code"},
+					{Kind: "string", Value: "x%"},
+				}}}},
+			},
+		}},
+	}
+
+	for _, engine := range []Engine{SQLite, Postgres} {
+		statements, err := CompileDDL(Target{Engine: engine, Version: Version{Major: 17}}, schema)
+		if err != nil {
+			t.Fatalf("%s: %v", engine, err)
+		}
+		view := statements[1]
+		if !strings.Contains(view, "(NOT (") {
+			t.Fatalf("%s: expected (NOT (...)) wrapper, got %s", engine, view)
+		}
+		if engine == Postgres {
+			if !strings.Contains(view, `("code" ILIKE 'x%')`) {
+				t.Fatalf("postgres not-like must wrap ILIKE: %s", view)
+			}
+		} else {
+			if !strings.Contains(view, `("code" LIKE 'x%')`) {
+				t.Fatalf("sqlite not-like must wrap LIKE: %s", view)
+			}
+		}
+	}
+}
+
 func TestSchemaRejectsIndexOnUnknownColumn(t *testing.T) {
 	schema := Schema{
 		Tables:  []Table{{Name: "products", Columns: []Column{{Name: "id", Type: Type{Family: IntegerType}}}}},

@@ -24,6 +24,7 @@ func parseCatalogExpression(input string) (Expression, error) {
 		{{"AND", "and"}},
 		{{"IS NOT NULL", "is_not_null"}, {"IS NULL", "is_null"}},
 		{{"<=", "lte"}, {">=", "gte"}, {"<>", "ne"}, {"!=", "ne"}, {"=", "eq"}, {"<", "lt"}, {">", "gt"}, {"LIKE", "like"}},
+		{{"||", "concat"}},
 		{{"+", "add"}, {"-", "sub"}},
 		{{"*", "mul"}, {"/", "div"}},
 	}
@@ -40,6 +41,16 @@ func parseCatalogExpression(input string) (Expression, error) {
 			return Expression{Kind: "not", Args: []Expression{argument}}, nil
 		}
 		if left, operator, right, found := splitCatalogOperator(text, level); found {
+			// "a NOT LIKE b" leaves a trailing NOT keyword on the left side of the
+			// LIKE split. Fold it into not(like(...)) so the infix form matches the
+			// already-working prefix form "NOT a LIKE b".
+			negateLike := false
+			if operator.kind == "like" {
+				if stripped, ok := stripTrailingNot(left); ok {
+					left = stripped
+					negateLike = true
+				}
+			}
 			leftExpression, err := parseCatalogExpression(left)
 			if err != nil {
 				return Expression{}, err
@@ -51,7 +62,11 @@ func parseCatalogExpression(input string) (Expression, error) {
 			if err != nil {
 				return Expression{}, err
 			}
-			return Expression{Kind: operator.kind, Args: []Expression{leftExpression, rightExpression}}, nil
+			like := Expression{Kind: operator.kind, Args: []Expression{leftExpression, rightExpression}}
+			if negateLike {
+				return Expression{Kind: "not", Args: []Expression{like}}, nil
+			}
+			return like, nil
 		}
 	}
 
@@ -91,6 +106,30 @@ func parseCatalogExpression(input string) (Expression, error) {
 				return Expression{}, err
 			}
 			return Expression{Kind: function, Args: []Expression{parsed}}, nil
+		case "length", "abs", "trim":
+			parsed, err := parseCatalogExpression(argument)
+			if err != nil {
+				return Expression{}, err
+			}
+			return Expression{Kind: function, Args: []Expression{parsed}}, nil
+		case "coalesce":
+			args, err := parseFunctionArguments(argument)
+			if err != nil {
+				return Expression{}, err
+			}
+			if len(args) < 1 {
+				return Expression{}, fmt.Errorf("coalesce requires at least one argument")
+			}
+			return Expression{Kind: "coalesce", Args: args}, nil
+		case "replace":
+			args, err := parseFunctionArguments(argument)
+			if err != nil {
+				return Expression{}, err
+			}
+			if len(args) != 3 {
+				return Expression{}, fmt.Errorf("replace requires three arguments")
+			}
+			return Expression{Kind: "replace", Args: args}, nil
 		default:
 			return Expression{}, fmt.Errorf("unsupported catalog function %q", function)
 		}
@@ -255,6 +294,85 @@ func hasOuterParentheses(text string) bool {
 
 func hasKeywordPrefix(text, keyword string) bool {
 	return len(text) > len(keyword) && strings.EqualFold(text[:len(keyword)], keyword) && unicode.IsSpace(rune(text[len(keyword)]))
+}
+
+// hasKeywordSuffix reports whether text ends with keyword as a standalone
+// word (a whitespace separator precedes it). It mirrors hasKeywordPrefix for
+// the right edge, used to detect the trailing NOT in "a NOT LIKE b".
+func hasKeywordSuffix(text, keyword string) bool {
+	return len(text) > len(keyword) &&
+		strings.EqualFold(text[len(text)-len(keyword):], keyword) &&
+		unicode.IsSpace(rune(text[len(text)-len(keyword)-1]))
+}
+
+// stripTrailingNot removes a trailing NOT keyword from the left side of a
+// LIKE split. It returns the stripped left side and ok=true when a trailing
+// NOT keyword is present, leaving left untouched otherwise.
+func stripTrailingNot(left string) (string, bool) {
+	trimmed := strings.TrimSpace(left)
+	if !hasKeywordSuffix(trimmed, "NOT") {
+		return left, false
+	}
+	rest := strings.TrimSpace(trimmed[:len(trimmed)-3])
+	if rest == "" {
+		return left, false
+	}
+	return rest, true
+}
+
+// splitTopLevelCommas splits text on commas that sit at parenthesis depth zero
+// and outside string/identifier quotes, so nested calls and string literals
+// such as replace(a, ',', b) survive intact.
+func splitTopLevelCommas(text string) []string {
+	var parts []string
+	depth := 0
+	inSingle, inDouble := false, false
+	start := 0
+	for i := 0; i < len(text); i++ {
+		switch text[i] {
+		case '\'':
+			if !inDouble {
+				if inSingle && i+1 < len(text) && text[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+		case '(':
+			if !inSingle && !inDouble {
+				depth++
+			}
+		case ')':
+			if !inSingle && !inDouble {
+				depth--
+			}
+		case ',':
+			if depth == 0 && !inSingle && !inDouble {
+				parts = append(parts, text[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(parts, text[start:])
+}
+
+// parseFunctionArguments splits a function argument list on top-level commas
+// and parses each argument as a catalog expression.
+func parseFunctionArguments(argument string) ([]Expression, error) {
+	parts := splitTopLevelCommas(argument)
+	args := make([]Expression, 0, len(parts))
+	for _, part := range parts {
+		parsed, err := parseCatalogExpression(part)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, parsed)
+	}
+	return args, nil
 }
 
 func catalogWordOperator(token string) bool {

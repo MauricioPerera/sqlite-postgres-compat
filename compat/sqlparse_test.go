@@ -26,6 +26,190 @@ func TestParseCatalogExpressionRejectsUnknownSQL(t *testing.T) {
 	}
 }
 
+func TestParseCatalogExpressionConcat(t *testing.T) {
+	column := func(name string) Expression { return Expression{Kind: "column", Value: name} }
+	str := func(v string) Expression { return Expression{Kind: "string", Value: v} }
+
+	tests := []struct {
+		name  string
+		input string
+		want  Expression
+	}{
+		{
+			name:  "simple concat",
+			input: "a || b",
+			want:  Expression{Kind: "concat", Args: []Expression{column("a"), column("b")}},
+		},
+		{
+			name:  "concat is left associative",
+			input: "a || b || c",
+			want: Expression{Kind: "concat", Args: []Expression{
+				{Kind: "concat", Args: []Expression{column("a"), column("b")}},
+				column("c"),
+			}},
+		},
+		{
+			name:  "concat binds tighter than comparison",
+			input: "a || b = c",
+			want: Expression{Kind: "eq", Args: []Expression{
+				{Kind: "concat", Args: []Expression{column("a"), column("b")}},
+				column("c"),
+			}},
+		},
+		{
+			name:  "concat binds looser than addition",
+			input: "a || b + c",
+			want: Expression{Kind: "concat", Args: []Expression{
+				column("a"),
+				{Kind: "add", Args: []Expression{column("b"), column("c")}},
+			}},
+		},
+		{
+			name:  "concat with string literals",
+			input: "first || ' ' || last",
+			want: Expression{Kind: "concat", Args: []Expression{
+				{Kind: "concat", Args: []Expression{column("first"), str(" ")}},
+				column("last"),
+			}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseCatalogExpression(test.input)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("got %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestParseCatalogExpressionNotLike(t *testing.T) {
+	column := func(name string) Expression { return Expression{Kind: "column", Value: name} }
+	str := func(v string) Expression { return Expression{Kind: "string", Value: v} }
+	like := func(l, r Expression) Expression { return Expression{Kind: "like", Args: []Expression{l, r}} }
+
+	tests := []struct {
+		name  string
+		input string
+		want  Expression
+	}{
+		{
+			name:  "infix not like folds to not(like)",
+			input: "name NOT LIKE 'x%'",
+			want:  Expression{Kind: "not", Args: []Expression{like(column("name"), str("x%"))}},
+		},
+		{
+			name:  "prefix not like still works",
+			input: "NOT name LIKE 'x%'",
+			want:  Expression{Kind: "not", Args: []Expression{like(column("name"), str("x%"))}},
+		},
+		{
+			name:  "not like combined with and",
+			input: "a NOT LIKE 'x%' AND b = 1",
+			want: Expression{Kind: "and", Args: []Expression{
+				{Kind: "not", Args: []Expression{like(column("a"), str("x%"))}},
+				{Kind: "eq", Args: []Expression{column("b"), {Kind: "integer", Value: "1"}}},
+			}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseCatalogExpression(test.input)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("got %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestParseCatalogExpressionScalarFunctions(t *testing.T) {
+	column := func(name string) Expression { return Expression{Kind: "column", Value: name} }
+	str := func(v string) Expression { return Expression{Kind: "string", Value: v} }
+
+	tests := []struct {
+		name  string
+		input string
+		want  Expression
+	}{
+		{
+			name:  "length in comparison",
+			input: "length(a) = 5",
+			want: Expression{Kind: "eq", Args: []Expression{
+				{Kind: "length", Args: []Expression{column("a")}},
+				{Kind: "integer", Value: "5"},
+			}},
+		},
+		{
+			name:  "abs single argument",
+			input: "abs(a)",
+			want:  Expression{Kind: "abs", Args: []Expression{column("a")}},
+		},
+		{
+			name:  "trim single argument",
+			input: "trim(a)",
+			want:  Expression{Kind: "trim", Args: []Expression{column("a")}},
+		},
+		{
+			name:  "coalesce variadic",
+			input: "coalesce(a, b, 'x')",
+			want: Expression{Kind: "coalesce", Args: []Expression{
+				column("a"), column("b"), str("x"),
+			}},
+		},
+		{
+			name:  "replace three arguments",
+			input: "replace(a, 'x', 'y')",
+			want: Expression{Kind: "replace", Args: []Expression{
+				column("a"), str("x"), str("y"),
+			}},
+		},
+		{
+			name:  "nested function call in coalesce argument",
+			input: "coalesce(a, trim(b))",
+			want: Expression{Kind: "coalesce", Args: []Expression{
+				column("a"),
+				{Kind: "trim", Args: []Expression{column("b")}},
+			}},
+		},
+		{
+			name:  "coalesce with empty string literal argument",
+			input: "coalesce(a, '')",
+			want: Expression{Kind: "coalesce", Args: []Expression{
+				column("a"), {Kind: "string", Value: ""},
+			}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseCatalogExpression(test.input)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("got %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestParseCatalogExpressionRejectsUnlistedFunction(t *testing.T) {
+	if _, err := parseCatalogExpression(`substr(a, 1, 2)`); err == nil {
+		t.Fatal("expected unlisted function substr to be rejected")
+	}
+	if _, err := parseCatalogExpression(`replace(a, 'x')`); err == nil {
+		t.Fatal("expected replace with wrong arity to be rejected")
+	}
+}
+
 func TestParsePostgresCatalogDefaultRemovesKnownLiteralCast(t *testing.T) {
 	got, err := parsePostgresCatalogDefault(`'new'::text`)
 	if err != nil {

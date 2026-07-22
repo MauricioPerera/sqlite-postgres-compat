@@ -252,7 +252,7 @@ func compileExpression(engine Engine, expression Expression) (string, error) {
 		return strings.Join(parts, "."), nil
 	case "star":
 		return "*", nil
-	case "and", "or", "eq", "ne", "lt", "lte", "gt", "gte", "add", "sub", "mul", "div", "like":
+	case "and", "or", "eq", "ne", "lt", "lte", "gt", "gte", "add", "sub", "mul", "div", "like", "concat":
 		if len(expression.Args) != 2 {
 			return "", fmt.Errorf("expression %q requires two arguments", expression.Kind)
 		}
@@ -266,7 +266,7 @@ func compileExpression(engine Engine, expression Expression) (string, error) {
 		}
 		operators := map[string]string{
 			"and": "AND", "or": "OR", "eq": "=", "ne": "<>", "lt": "<", "lte": "<=", "gt": ">", "gte": ">=",
-			"add": "+", "sub": "-", "mul": "*", "div": "/",
+			"add": "+", "sub": "-", "mul": "*", "div": "/", "concat": "||",
 		}
 		// SQLite's LIKE is case-insensitive (ASCII) by default, while Postgres's
 		// LIKE is case-sensitive. Compile to ILIKE on Postgres to preserve the
@@ -297,7 +297,7 @@ func compileExpression(engine Engine, expression Expression) (string, error) {
 		default:
 			return "(" + argument + " IS NOT NULL)", nil
 		}
-	case "count", "sum", "avg", "min", "max", "lower", "upper":
+	case "count", "sum", "avg", "min", "max", "lower", "upper", "length", "abs", "trim":
 		if len(expression.Args) != 1 {
 			return "", fmt.Errorf("function %q requires one argument", expression.Kind)
 		}
@@ -306,9 +306,41 @@ func compileExpression(engine Engine, expression Expression) (string, error) {
 			return "", err
 		}
 		return strings.ToUpper(expression.Kind) + "(" + argument + ")", nil
+	case "coalesce":
+		if len(expression.Args) < 1 {
+			return "", fmt.Errorf("function %q requires at least one argument", expression.Kind)
+		}
+		compiled, err := compileExpressionArgs(engine, expression.Args)
+		if err != nil {
+			return "", err
+		}
+		return "COALESCE(" + strings.Join(compiled, ", ") + ")", nil
+	case "replace":
+		if len(expression.Args) != 3 {
+			return "", fmt.Errorf("function %q requires three arguments", expression.Kind)
+		}
+		compiled, err := compileExpressionArgs(engine, expression.Args)
+		if err != nil {
+			return "", err
+		}
+		return "REPLACE(" + strings.Join(compiled, ", ") + ")", nil
 	default:
 		return "", fmt.Errorf("expression %q has no compiler", expression.Kind)
 	}
+}
+
+// compileExpressionArgs compiles each argument expression, returning the
+// compiled fragments in order. Variadic scalar functions share it.
+func compileExpressionArgs(engine Engine, args []Expression) ([]string, error) {
+	compiled := make([]string, len(args))
+	for i, argument := range args {
+		value, err := compileExpression(engine, argument)
+		if err != nil {
+			return nil, err
+		}
+		compiled[i] = value
+	}
+	return compiled, nil
 }
 
 func compileSelect(engine Engine, query SelectQuery) (string, error) {
