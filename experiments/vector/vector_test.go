@@ -222,13 +222,19 @@ func TestSanityDirectPgvector(t *testing.T) {
 
 // =====================================================================
 // 2. INSPECTION of a native F32_BLOB column through the compat layer
+//    (Post-VectorType: F32_BLOB(N) is now recognized as the canonical
+//    vector family with dimension N, no longer silently misread as binary.)
 // =====================================================================
 
-func TestInspectF32BlobMapsToBinaryFamily(t *testing.T) {
+func TestInspectF32BlobMapsToVectorFamily(t *testing.T) {
 	db := openLibSQL(t)
 	defer db.Close()
 	defer cleanupLibSQL(t, db)
 	ctx := ctxSec(t, 120)
+
+	// Force catalog inspection (no canonical metadata) so the column family is
+	// read purely from the sqld catalog, not from a stored schema blob.
+	dropCompatMetadata(t, db, ctx, "sqlite")
 
 	mustExec(t, db, ctx, "DROP TABLE IF EXISTS vexp_inspect")
 	mustExec(t, db, ctx, "CREATE TABLE vexp_inspect(id INTEGER PRIMARY KEY, v F32_BLOB(3))")
@@ -265,13 +271,17 @@ func TestInspectF32BlobMapsToBinaryFamily(t *testing.T) {
 	if !found {
 		t.Fatalf("column vexp_inspect.v not found in inspection")
 	}
-	t.Logf("inspected family of vexp_inspect.v (declared F32_BLOB(3)) = %q", col.Type.Family)
+	t.Logf("inspected family of vexp_inspect.v (declared F32_BLOB(3)) = %q args=%v", col.Type.Family, col.Type.Arguments)
 
-	// The compatibility layer has NO vector type family. F32_BLOB(3) is matched
-	// by the substring rule for "BLOB" and silently misread as BinaryType. This
-	// is the documented incompatibility: no error, wrong family.
-	if col.Type.Family != compat.BinaryType {
-		t.Fatalf("expected F32_BLOB to be misread as %q, got %q", compat.BinaryType, col.Type.Family)
+	// Post-VectorType: sqliteTypeFamily matches "F32_BLOB" before the generic
+	// "BLOB" rule and returns VectorType, and parseTypeArguments extracts the
+	// declared dimension 3. This is the revised verdict for matrix row 2: the
+	// column is now inspected as a vector of dimension 3, not a silent binary.
+	if col.Type.Family != compat.VectorType {
+		t.Fatalf("expected F32_BLOB to be inspected as %q, got %q", compat.VectorType, col.Type.Family)
+	}
+	if len(col.Type.Arguments) != 1 || col.Type.Arguments[0] != 3 {
+		t.Fatalf("expected vector dimension [3], got %v", col.Type.Arguments)
 	}
 }
 
