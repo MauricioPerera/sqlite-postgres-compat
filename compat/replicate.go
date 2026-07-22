@@ -52,7 +52,7 @@ func (store *Store) ApplyChanges(ctx context.Context, schema Schema, changes []C
 	if err := createAppliedChangesTable(ctx, tx); err != nil {
 		return err
 	}
-	if err := setCaptureSuppressed(ctx, tx, true); err != nil {
+	if err := setCaptureSuppressed(ctx, tx, store.Target.Engine, true); err != nil {
 		return err
 	}
 	for _, change := range ordered {
@@ -74,7 +74,7 @@ func (store *Store) ApplyChanges(ctx context.Context, schema Schema, changes []C
 			return err
 		}
 	}
-	if err := setCaptureSuppressed(ctx, tx, false); err != nil {
+	if err := setCaptureSuppressed(ctx, tx, store.Target.Engine, false); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -89,6 +89,12 @@ func createAppliedChangesTable(ctx context.Context, tx *sql.Tx) error {
 	if _, err := tx.ExecContext(ctx, statement); err != nil {
 		return err
 	}
+	// The single-row capture-state table is the suppression flag on SQLite: its
+	// triggers consult suppress=0/1 in their WHEN clause. On Postgres the
+	// triggers no longer read this table (they read the transaction-local GUC
+	// compat.suppress instead), but the table is still created on both engines to
+	// keep this helper engine-agnostic and the diff minimal. It is simply unused
+	// on the Postgres branch.
 	state := "CREATE TABLE IF NOT EXISTS " + quoteIdentifier(captureStateTable) + " (" + quoteIdentifier("id") + " INTEGER PRIMARY KEY, " + quoteIdentifier("suppress") + " INTEGER NOT NULL)"
 	if _, err := tx.ExecContext(ctx, state); err != nil {
 		return err
@@ -99,7 +105,28 @@ func createAppliedChangesTable(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-func setCaptureSuppressed(ctx context.Context, tx *sql.Tx, suppressed bool) error {
+// setCaptureSuppressed arms or disarms the anti-echo suppression that stops the
+// destination's capture triggers from journaling the rows a replication writes.
+//
+// On SQLite the flag lives in the single-row __compat_capture_state table, which
+// is safe because SQLite is constrained to a single connection
+// (OpenStore.SetMaxOpenConns(1)), so no second ApplyChanges transaction can run
+// concurrently. On Postgres that constraint does not hold: under MVCC a second
+// concurrent ApplyChanges transaction would not see the uncommitted suppress=1
+// of the first and its triggers would journal the echo, breaking idempotency.
+// The Postgres branch therefore sets a transaction-local GUC instead —
+// set_config('compat.suppress','1',true) is invisible to other transactions and
+// resets itself on COMMIT/ROLLBACK. Clearing it is a no-op on Postgres: the
+// reset is automatic at transaction end, and no writes happen between the clear
+// and the commit, so leaving the GUC set until commit is harmless.
+func setCaptureSuppressed(ctx context.Context, tx *sql.Tx, engine Engine, suppressed bool) error {
+	if engine == Postgres {
+		if !suppressed {
+			return nil
+		}
+		_, err := tx.ExecContext(ctx, "SELECT set_config('compat.suppress', '1', true)")
+		return err
+	}
 	value := 0
 	if suppressed {
 		value = 1

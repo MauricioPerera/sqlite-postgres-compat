@@ -131,3 +131,33 @@ func TestSQLiteCaptureReplicatesDimensionedVector(t *testing.T) {
 		t.Fatalf("expected canonical vector [1,2,3] at destination, got %q", v)
 	}
 }
+
+// TestCompileCaptureTriggersUsesTransactionLocalGUCOnPostgres guards the
+// anti-echo suppression design without requiring a live database. The Postgres
+// capture functions must gate journaling on the transaction-local GUC
+// compat.suppress and must NOT read the __compat_capture_state table, so that a
+// concurrent replication transaction cannot leak its suppression under MVCC.
+// The SQLite triggers keep the single-row state-table condition, which is safe
+// because SQLite is pinned to one connection.
+func TestCompileCaptureTriggersUsesTransactionLocalGUCOnPostgres(t *testing.T) {
+	schema := replicationTestSchema("suppress_trigger_items")
+	primary, err := primaryKeyColumns(schema.Tables[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	postgresStatements := compileCaptureTriggers(Postgres, schema.Tables[0], primary)
+	joined := strings.Join(postgresStatements, "\n")
+	if !strings.Contains(joined, "current_setting('compat.suppress', true) IS DISTINCT FROM '1'") {
+		t.Fatalf("postgres capture trigger must gate on transaction-local GUC:\n%s", joined)
+	}
+	if strings.Contains(joined, captureStateTable) {
+		t.Fatalf("postgres capture trigger must not depend on %s:\n%s", captureStateTable, joined)
+	}
+
+	sqliteStatements := compileCaptureTriggers(SQLite, schema.Tables[0], primary)
+	sqliteJoined := strings.Join(sqliteStatements, "\n")
+	if !strings.Contains(sqliteJoined, "WHEN (SELECT "+quoteIdentifier("suppress")+" FROM "+quoteIdentifier(captureStateTable)) {
+		t.Fatalf("sqlite capture trigger must keep the state-table condition:\n%s", sqliteJoined)
+	}
+}

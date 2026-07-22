@@ -304,3 +304,50 @@ func TestApplyChangesRejectsDestinationVectorDimensionMismatch(t *testing.T) {
 		t.Fatalf("expected error to mention dimension, got: %v", err)
 	}
 }
+
+// TestSQLiteSetCaptureSuppressedUpdatesStateTable confirms the engine-aware
+// signature change did not regress the SQLite branch: on SQLite the flag still
+// toggles the single-row __compat_capture_state row that the SQLite triggers
+// read. The Postgres branch is exercised against a live database in the e2e
+// suite (e2e/suppress_test.go).
+func TestSQLiteSetCaptureSuppressedUpdatesStateTable(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	tx, err := store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err := createAppliedChangesTable(ctx, tx); err != nil {
+		t.Fatal(err)
+	}
+	var suppress int
+	if err := tx.QueryRowContext(ctx, "SELECT "+quoteIdentifier("suppress")+" FROM "+quoteIdentifier(captureStateTable)+" WHERE "+quoteIdentifier("id")+" = 1").Scan(&suppress); err != nil {
+		t.Fatal(err)
+	}
+	if suppress != 0 {
+		t.Fatalf("initial suppress flag must be 0, got %d", suppress)
+	}
+	if err := setCaptureSuppressed(ctx, tx, SQLite, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.QueryRowContext(ctx, "SELECT "+quoteIdentifier("suppress")+" FROM "+quoteIdentifier(captureStateTable)+" WHERE "+quoteIdentifier("id")+" = 1").Scan(&suppress); err != nil {
+		t.Fatal(err)
+	}
+	if suppress != 1 {
+		t.Fatalf("suppressed=true must set the flag to 1, got %d", suppress)
+	}
+	if err := setCaptureSuppressed(ctx, tx, SQLite, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.QueryRowContext(ctx, "SELECT "+quoteIdentifier("suppress")+" FROM "+quoteIdentifier(captureStateTable)+" WHERE "+quoteIdentifier("id")+" = 1").Scan(&suppress); err != nil {
+		t.Fatal(err)
+	}
+	if suppress != 0 {
+		t.Fatalf("suppressed=false must reset the flag to 0, got %d", suppress)
+	}
+}

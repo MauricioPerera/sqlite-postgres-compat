@@ -112,9 +112,17 @@ func compileCaptureTriggers(engine Engine, table Table, primary []Column) []stri
 			continue
 		}
 		functionName := triggerName + "_fn"
+		// The capture condition reads the transaction-local GUC compat.suppress
+		// instead of the __compat_capture_state table. current_setting(..., true)
+		// returns NULL when the GUC has not been set (missing_ok), and NULL IS
+		// DISTINCT FROM '1' is true, so ordinary writes on a connection that is
+		// not mid-replication are journaled. A replication transaction sets the
+		// GUC via set_config('compat.suppress','1',true), which is visible only to
+		// that transaction, so a concurrent transaction's writes are still
+		// journaled — the suppression cannot leak across connections under MVCC.
 		statements = append(statements,
 			"DROP TRIGGER IF EXISTS "+quoteIdentifier(triggerName)+" ON "+quoteIdentifier(table.Name),
-			"CREATE OR REPLACE FUNCTION "+quoteIdentifier(functionName)+"() RETURNS TRIGGER LANGUAGE plpgsql AS $compat$ BEGIN IF (SELECT "+quoteIdentifier("suppress")+" FROM "+quoteIdentifier(captureStateTable)+" WHERE "+quoteIdentifier("id")+" = 1) = 0 THEN "+insert+"; END IF; RETURN "+mutation.returnAlias+"; END $compat$",
+			"CREATE OR REPLACE FUNCTION "+quoteIdentifier(functionName)+"() RETURNS TRIGGER LANGUAGE plpgsql AS $compat$ BEGIN IF current_setting('compat.suppress', true) IS DISTINCT FROM '1' THEN "+insert+"; END IF; RETURN "+mutation.returnAlias+"; END $compat$",
 			"CREATE TRIGGER "+quoteIdentifier(triggerName)+" AFTER "+mutation.event+" ON "+quoteIdentifier(table.Name)+" FOR EACH ROW EXECUTE FUNCTION "+quoteIdentifier(functionName)+"()",
 		)
 	}
