@@ -367,11 +367,30 @@ func parseTypeArguments(declared string) []int {
 }
 
 func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
-	rows, err := store.DB.QueryContext(ctx, `SELECT table_name, column_name, data_type, udt_name, atttypmod, is_nullable, column_default, is_identity, is_generated
-		FROM information_schema.columns
-		WHERE table_schema = current_schema() AND table_name NOT IN ($1, $2, $3, $4)
-		AND table_name IN (SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE')
-		ORDER BY table_name, ordinal_position`, schemaMetadataTable, appliedChangesTable, captureStateTable, changeJournalTable)
+	// atttypmod is NOT a column of information_schema.columns in PostgreSQL 17
+	// (selecting it raises 42703), so it cannot be read straight from that view.
+	// pgvector stores the vector dimension verbatim in pg_attribute.atttypmod, so
+	// for udt_name='vector' columns we fetch it via a scalar subquery correlated
+	// on (schema, table, column) against pg_attribute joined to pg_class and
+	// pg_namespace. The correlation keys on c.table_schema (not a bare
+	// current_schema()) so homonym tables in other schemas cannot leak in, and
+	// NOT a.attisdropped excludes dropped columns (a dropped column keeps its
+	// attname but is marked dropped; only the live attribute is selected). For
+	// non-vector columns atttypmod is unused downstream, so it defaults to -1 and
+	// the subquery is not evaluated at all.
+	rows, err := store.DB.QueryContext(ctx, `SELECT c.table_name, c.column_name, c.data_type, c.udt_name,
+		CASE WHEN c.udt_name = 'vector'
+			THEN COALESCE((SELECT a.atttypmod
+				FROM pg_attribute a
+				JOIN pg_class cl ON cl.oid = a.attrelid
+				JOIN pg_namespace n ON n.oid = cl.relnamespace
+				WHERE n.nspname = c.table_schema AND cl.relname = c.table_name AND a.attname = c.column_name AND NOT a.attisdropped), -1)
+			ELSE -1 END AS atttypmod,
+		c.is_nullable, c.column_default, c.is_identity, c.is_generated
+		FROM information_schema.columns c
+		WHERE c.table_schema = current_schema() AND c.table_name NOT IN ($1, $2, $3, $4)
+		AND c.table_name IN (SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE')
+		ORDER BY c.table_name, c.ordinal_position`, schemaMetadataTable, appliedChangesTable, captureStateTable, changeJournalTable)
 	if err != nil {
 		return Inspection{}, err
 	}
@@ -539,11 +558,17 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 	if err := triggers.Close(); err != nil {
 		return Inspection{}, err
 	}
+	// Only plain functions ('f') and procedures ('p') are modeled as routines;
+	// aggregates ('a') and window functions ('w') are not. Restricting prokind
+	// also keeps pg_get_function_result/pg_get_functiondef off aggregates: those
+	// helpers raise 42809 on an aggregate (e.g. pgvector installs an avg(vector)
+	// aggregate in the public schema), which would abort the whole inspection.
 	routines, err := store.DB.QueryContext(ctx, `SELECT proc.proname, proc.prosrc, pg_get_function_arguments(proc.oid), COALESCE(pg_get_function_result(proc.oid), ''), lang.lanname, proc.prokind::text, pg_get_functiondef(proc.oid)
 		FROM pg_proc proc
 		JOIN pg_namespace ns ON ns.oid = proc.pronamespace
 		JOIN pg_language lang ON lang.oid = proc.prolang
 		WHERE ns.nspname = current_schema()
+		AND proc.prokind IN ('f', 'p')
 		AND NOT EXISTS (SELECT 1 FROM pg_trigger trg WHERE trg.tgfoid = proc.oid)
 		ORDER BY proc.proname`)
 	if err != nil {
