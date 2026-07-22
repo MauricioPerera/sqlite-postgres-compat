@@ -73,8 +73,10 @@ func TestInspectExternalSQLiteCatalog(t *testing.T) {
 }
 
 func TestReservedMetadataTableIsRejected(t *testing.T) {
-	schema := Schema{Tables: []Table{{Name: schemaMetadataTable, Columns: []Column{{Name: "x", Type: Type{Family: TextType}}}}}}
-	if err := schema.Validate(); err == nil {
-		t.Fatal("expected reserved metadata table to be rejected")
+	for _, name := range []string{schemaMetadataTable, appliedChangesTable} {
+		schema := Schema{Tables: []Table{{Name: name, Columns: []Column{{Name: "x", Type: Type{Family: TextType}}}}}}
+		if err := schema.Validate(); err == nil {
+			t.Fatalf("expected reserved table %q to be rejected", name)
+		}
 	}
 }

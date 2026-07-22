@@ -505,6 +505,54 @@ func TestSystemReconstructsExactCanonicalSchemaFromBothEngines(t *testing.T) {
 	}
 }
 
+func TestSystemReplicatesIncrementalChangesBothDirections(t *testing.T) {
+	ctx := context.Background()
+	schema := compat.Schema{Tables: []compat.Table{{
+		Name: "bidirectional_items",
+		Columns: []compat.Column{
+			{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+			{Name: "title", Type: compat.Type{Family: compat.TextType}},
+		},
+		Constraints: []compat.Constraint{{Kind: compat.PrimaryKey, Columns: []string{"id"}}},
+	}}}
+	sqlite := openSQLite(t, filepath.Join(t.TempDir(), "replication.db"))
+	postgres := openPostgres(t)
+	for _, store := range []*compat.Store{sqlite, postgres} {
+		if err := store.ApplySchema(ctx, schema); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	id := compat.Value{Kind: compat.IntegerValue, Value: "1"}
+	first := compat.Row{"id": id, "title": {Kind: compat.TextValue, Value: "from sqlite"}}
+	updated := compat.Row{"id": id, "title": {Kind: compat.TextValue, Value: "updated by sqlite"}}
+	sqliteStream := []compat.Change{
+		{Source: compat.Target{Engine: compat.SQLite, Version: compat.Version{Major: 3}}, Sequence: 1, Kind: compat.Insert, Table: "bidirectional_items", PrimaryKey: compat.Row{"id": id}, After: first},
+		{Source: compat.Target{Engine: compat.SQLite, Version: compat.Version{Major: 3}}, Sequence: 2, Kind: compat.Update, Table: "bidirectional_items", PrimaryKey: compat.Row{"id": id}, Before: first, After: updated},
+	}
+	for _, store := range []*compat.Store{sqlite, postgres} {
+		if err := store.ApplyChanges(ctx, schema, sqliteStream); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.ApplyChanges(ctx, schema, sqliteStream); err != nil {
+			t.Fatal("stream reapplication must be idempotent:", err)
+		}
+	}
+	assertStoreSnapshotsEquivalent(t, ctx, schema, sqlite, postgres)
+
+	reversed := compat.Row{"id": id, "title": {Kind: compat.TextValue, Value: "returned from postgres"}}
+	postgresStream := []compat.Change{{
+		Source: compat.Target{Engine: compat.Postgres, Version: compat.Version{Major: 17, Minor: 5}}, Sequence: 1,
+		Kind: compat.Update, Table: "bidirectional_items", PrimaryKey: compat.Row{"id": id}, Before: updated, After: reversed,
+	}}
+	for _, store := range []*compat.Store{postgres, sqlite} {
+		if err := store.ApplyChanges(ctx, schema, postgresStream); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertStoreSnapshotsEquivalent(t, ctx, schema, sqlite, postgres)
+}
+
 func TestSystemPreservesJSONUUIDAndTimestampSemantics(t *testing.T) {
 	ctx := context.Background()
 	schema := compat.Schema{Tables: []compat.Table{{
@@ -643,6 +691,19 @@ func assertEquivalent(t *testing.T, source, destination compat.Snapshot) {
 	if err := compat.RequireEquivalent(report); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func assertStoreSnapshotsEquivalent(t *testing.T, ctx context.Context, schema compat.Schema, left, right *compat.Store) {
+	t.Helper()
+	leftSnapshot, err := left.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightSnapshot, err := right.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEquivalent(t, leftSnapshot, rightSnapshot)
 }
 
 func queryNameTotals(t *testing.T, db *sql.DB) []string {
