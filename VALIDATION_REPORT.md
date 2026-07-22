@@ -24,6 +24,8 @@ La batería se ejecutó contra SQLite real y PostgreSQL 17.5 real proporcionado 
 - Reconstrucción de valores por defecto literales de texto, enteros, decimales, booleanos, `NULL` y `CURRENT_TIMESTAMP`, incluidos casts nativos conocidos de PostgreSQL.
 - Reconstrucción de vistas externas con proyecciones, alias, filtros, agrupación, orden, límite y desplazamiento dentro de la gramática `SELECT` común.
 - Reconstrucción de vistas con joins `INNER`, `LEFT` y `CROSS`, condiciones compuestas y agregaciones `COUNT`, `SUM`, `AVG`, `MIN` y `MAX`.
+- Reconstrucción de triggers externos `BEFORE`/`AFTER` para `INSERT`, `UPDATE` y `DELETE` con condición e inserciones de auditoría basadas en `NEW`/`OLD`.
+- Detección explícita de funciones y procedimientos PostgreSQL independientes todavía no traducidos.
 - Detección explícita de defaults no portables, identidades y columnas generadas.
 - Rechazo explícito de expresiones, métodos, colaciones y clases de operador que no pertenecen a la gramática canónica comprobada.
 - Vistas canónicas con joins, filtros, agrupaciones y agregaciones.
@@ -46,7 +48,7 @@ La prueba de cobertura integral falla porque el sistema aún no proporciona equi
 - Claves foráneas con modos `MATCH`, diferimiento u otras extensiones específicas.
 - Restricciones `CHECK`.
 - Índices y expresiones de índice.
-- Triggers.
+- Triggers con acciones distintas de inserciones canónicas o sintaxis procedural arbitraria.
 - Vistas con subconsultas, operaciones de conjuntos, ventanas u otras extensiones todavía fuera del parser común.
 - Rutinas almacenadas.
 - Búsqueda de texto completo.

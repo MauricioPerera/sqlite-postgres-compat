@@ -733,6 +733,8 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 	statements := map[compat.Engine][]string{
 		compat.SQLite: {
 			`CREATE TABLE native_products (code TEXT NOT NULL, price INTEGER NOT NULL DEFAULT 3, active BOOLEAN NOT NULL DEFAULT TRUE, status TEXT NOT NULL DEFAULT 'new', CHECK (price >= 0))`,
+			`CREATE TABLE native_audit (product_code TEXT NOT NULL)`,
+			`CREATE TRIGGER native_product_audit AFTER INSERT ON native_products FOR EACH ROW BEGIN INSERT INTO native_audit (product_code) VALUES (NEW.code); END`,
 			`CREATE UNIQUE INDEX native_products_code ON native_products (code ASC)`,
 			`CREATE INDEX native_products_active_price ON native_products (price DESC) WHERE active = TRUE`,
 			`CREATE VIEW native_active_products AS SELECT code AS product_code, price FROM native_products WHERE active = TRUE`,
@@ -742,6 +744,9 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 		},
 		compat.Postgres: {
 			`CREATE TABLE native_products (code TEXT NOT NULL, price BIGINT NOT NULL DEFAULT 3, active BOOLEAN NOT NULL DEFAULT TRUE, status TEXT NOT NULL DEFAULT 'new', CHECK (price >= 0))`,
+			`CREATE TABLE native_audit (product_code TEXT NOT NULL)`,
+			`CREATE FUNCTION native_product_audit_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO native_audit (product_code) VALUES (NEW.code); RETURN NEW; END $$`,
+			`CREATE TRIGGER native_product_audit AFTER INSERT ON native_products FOR EACH ROW EXECUTE FUNCTION native_product_audit_fn()`,
 			`CREATE UNIQUE INDEX native_products_code ON native_products (code ASC)`,
 			`CREATE INDEX native_products_active_price ON native_products (price DESC) WHERE active = TRUE`,
 			`CREATE VIEW native_active_products AS SELECT code AS product_code, price FROM native_products WHERE active = TRUE`,
@@ -813,6 +818,9 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 		if !activeView || !aggregateView {
 			t.Fatalf("%s native view was not reconstructed: %+v", store.Target.Engine, inspection.Schema.Views)
 		}
+		if len(inspection.Schema.Triggers) != 1 || inspection.Schema.Triggers[0].Name != "native_product_audit" || len(inspection.Schema.Triggers[0].Actions) != 1 {
+			t.Fatalf("%s native trigger was not reconstructed: %+v", store.Target.Engine, inspection.Schema.Triggers)
+		}
 		if _, err := store.DB.ExecContext(ctx, `INSERT INTO native_products (code) VALUES ('A')`); err != nil {
 			t.Fatal(err)
 		}
@@ -820,6 +828,10 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 		var price int
 		if err := store.DB.QueryRowContext(ctx, `SELECT product_code, price FROM native_active_products`).Scan(&code, &price); err != nil || code != "A" || price != 3 {
 			t.Fatalf("%s native view behavior differs: code=%q price=%d error=%v", store.Target.Engine, code, price, err)
+		}
+		var auditedCode string
+		if err := store.DB.QueryRowContext(ctx, `SELECT product_code FROM native_audit`).Scan(&auditedCode); err != nil || auditedCode != "A" {
+			t.Fatalf("%s native trigger behavior differs: code=%q error=%v", store.Target.Engine, auditedCode, err)
 		}
 		if _, err := store.DB.ExecContext(ctx, `INSERT INTO native_parents (id, tenant, code) VALUES (1, 7, 'P')`); err != nil {
 			t.Fatal(err)
@@ -830,6 +842,24 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 		var tenant, childCount int64
 		if err := store.DB.QueryRowContext(ctx, `SELECT tenant, child_count FROM native_parent_counts`).Scan(&tenant, &childCount); err != nil || tenant != 7 || childCount != 1 {
 			t.Fatalf("%s joined aggregate view differs: tenant=%d count=%d error=%v", store.Target.Engine, tenant, childCount, err)
+		}
+		if store.Target.Engine == compat.Postgres {
+			if _, err := store.DB.ExecContext(ctx, `CREATE FUNCTION native_standalone() RETURNS BIGINT LANGUAGE SQL AS 'SELECT 1'`); err != nil {
+				t.Fatal(err)
+			}
+			withRoutine, err := store.InspectSchema(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			foundRoutine := false
+			for _, unresolved := range withRoutine.Unresolved {
+				if unresolved.Kind == "routine" && unresolved.Name == "native_standalone" {
+					foundRoutine = true
+				}
+			}
+			if withRoutine.Exact || !foundRoutine {
+				t.Fatalf("standalone PostgreSQL routine was silently ignored: %+v", withRoutine)
+			}
 		}
 	}
 }

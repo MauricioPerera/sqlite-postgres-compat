@@ -89,6 +89,15 @@ func (store *Store) inspectSQLite(ctx context.Context) (Inspection, error) {
 			}
 			continue
 		}
+		if item.kind == "trigger" {
+			trigger, err := parseSQLiteCatalogTrigger(item.definition)
+			if err != nil {
+				inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: item.kind, Name: item.name, Definition: item.definition, Reason: err.Error()})
+			} else {
+				inspection.Schema.Triggers = append(inspection.Schema.Triggers, trigger)
+			}
+			continue
+		}
 		if item.kind != "table" {
 			inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: item.kind, Name: item.name, Definition: item.definition, Reason: "requires SQL parser translation"})
 			continue
@@ -459,8 +468,57 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 			inspection.Schema.Views = append(inspection.Schema.Views, View{Name: name, Query: query})
 		}
 	}
+	if err := objects.Close(); err != nil {
+		return Inspection{}, err
+	}
+	triggers, err := store.DB.QueryContext(ctx, `SELECT trg.tgname, pg_get_triggerdef(trg.oid, true), proc.prosrc
+		FROM pg_trigger trg
+		JOIN pg_class tbl ON tbl.oid = trg.tgrelid
+		JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+		JOIN pg_proc proc ON proc.oid = trg.tgfoid
+		WHERE ns.nspname = current_schema() AND NOT trg.tgisinternal AND trg.tgname NOT LIKE '__compat_capture_%'
+		ORDER BY trg.tgname`)
+	if err != nil {
+		return Inspection{}, err
+	}
+	for triggers.Next() {
+		var name, definition, functionBody string
+		if err := triggers.Scan(&name, &definition, &functionBody); err != nil {
+			triggers.Close()
+			return Inspection{}, err
+		}
+		trigger, err := parsePostgresCatalogTrigger(definition, functionBody)
+		if err != nil {
+			inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "trigger", Name: name, Definition: definition, Reason: err.Error()})
+		} else {
+			inspection.Schema.Triggers = append(inspection.Schema.Triggers, trigger)
+		}
+	}
+	if err := triggers.Close(); err != nil {
+		return Inspection{}, err
+	}
+	routines, err := store.DB.QueryContext(ctx, `SELECT proc.proname, pg_get_functiondef(proc.oid)
+		FROM pg_proc proc
+		JOIN pg_namespace ns ON ns.oid = proc.pronamespace
+		WHERE ns.nspname = current_schema()
+		AND NOT EXISTS (SELECT 1 FROM pg_trigger trg WHERE trg.tgfoid = proc.oid)
+		ORDER BY proc.proname`)
+	if err != nil {
+		return Inspection{}, err
+	}
+	for routines.Next() {
+		var name, definition string
+		if err := routines.Scan(&name, &definition); err != nil {
+			routines.Close()
+			return Inspection{}, err
+		}
+		inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "routine", Name: name, Definition: definition, Reason: "stored routine requires procedural-language translation"})
+	}
+	if err := routines.Close(); err != nil {
+		return Inspection{}, err
+	}
 	inspection.Exact = len(inspection.Unresolved) == 0
-	return inspection, objects.Err()
+	return inspection, nil
 }
 
 func sqliteReferentialAction(action string) (ReferentialAction, bool) {
