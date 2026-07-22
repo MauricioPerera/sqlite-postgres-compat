@@ -177,7 +177,8 @@ type RoutineParameter struct {
 type RoutineAction struct {
 	Kind        string       `json:"kind"`
 	Table       string       `json:"table"`
-	Assignments []Assignment `json:"assignments"`
+	Assignments []Assignment `json:"assignments,omitempty"`
+	Where       *Expression  `json:"where,omitempty"`
 }
 
 func (s Schema) Validate() error {

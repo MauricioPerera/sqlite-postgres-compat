@@ -33,27 +33,157 @@ func (store *Store) CallRoutine(ctx context.Context, schema Schema, name string,
 		return err
 	}
 	defer tx.Rollback()
+	engine := store.Target.Engine
 	for _, action := range routine.Actions {
-		if action.Kind != "insert" {
-			return fmt.Errorf("routine %q action %q is unsupported", name, action.Kind)
-		}
-		table, err := findTable(schema, action.Table)
-		if err != nil {
-			return err
-		}
-		row := make(Row, len(action.Assignments))
-		for _, assignment := range action.Assignments {
-			value, err := routineValue(assignment.Value, arguments)
+		switch action.Kind {
+		case "insert":
+			table, err := findTable(schema, action.Table)
 			if err != nil {
 				return err
 			}
-			row[assignment.Column] = value
-		}
-		if err := insertRow(ctx, tx, store.Target.Engine, table, row); err != nil {
-			return err
+			row := make(Row, len(action.Assignments))
+			for _, assignment := range action.Assignments {
+				value, err := routineValue(assignment.Value, arguments)
+				if err != nil {
+					return err
+				}
+				row[assignment.Column] = value
+			}
+			if err := insertRow(ctx, tx, engine, table, row); err != nil {
+				return err
+			}
+		case "update":
+			if len(action.Assignments) == 0 || action.Where == nil {
+				return fmt.Errorf("routine %q UPDATE action requires assignments and WHERE", name)
+			}
+			table, err := findTable(schema, action.Table)
+			if err != nil {
+				return err
+			}
+			sets := make([]string, 0, len(action.Assignments))
+			args := make([]any, 0, len(action.Assignments))
+			position := 1
+			for _, assignment := range action.Assignments {
+				value, err := routineValue(assignment.Value, arguments)
+				if err != nil {
+					return err
+				}
+				argument, err := driverValue(engine, value)
+				if err != nil {
+					return err
+				}
+				sets = append(sets, quoteIdentifier(assignment.Column)+" = "+placeholder(engine, position))
+				args = append(args, argument)
+				position++
+			}
+			where, _, err := compileRoutineWhere(engine, *action.Where, arguments, &args, position)
+			if err != nil {
+				return err
+			}
+			statement := "UPDATE " + quoteIdentifier(table.Name) + " SET " + strings.Join(sets, ", ") + " WHERE " + where
+			if _, err := tx.ExecContext(ctx, statement, args...); err != nil {
+				return err
+			}
+		case "delete":
+			if action.Where == nil {
+				return fmt.Errorf("routine %q DELETE action requires WHERE", name)
+			}
+			table, err := findTable(schema, action.Table)
+			if err != nil {
+				return err
+			}
+			args := make([]any, 0)
+			where, _, err := compileRoutineWhere(engine, *action.Where, arguments, &args, 1)
+			if err != nil {
+				return err
+			}
+			statement := "DELETE FROM " + quoteIdentifier(table.Name) + " WHERE " + where
+			if _, err := tx.ExecContext(ctx, statement, args...); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("routine %q action %q is unsupported", name, action.Kind)
 		}
 	}
 	return tx.Commit()
+}
+
+// compileRoutineWhere compiles a routine WHERE expression into a SQL fragment
+// bound with engine placeholders, appending the resolved argument values to
+// args. Columns compile to quoted identifiers; parameters and literals resolve
+// to values via routineValue and are bound as placeholders so the routine never
+// inlines caller data. position is the next placeholder index (1-based for
+// PostgreSQL, ignored by SQLite which uses "?"). The returned position is the
+// index following the last placeholder emitted.
+func compileRoutineWhere(engine Engine, expression Expression, arguments map[string]Value, args *[]any, position int) (string, int, error) {
+	emitPlaceholder := func(value Value) (string, int, error) {
+		argument, err := driverValue(engine, value)
+		if err != nil {
+			return "", position, err
+		}
+		*args = append(*args, argument)
+		return placeholder(engine, position), position + 1, nil
+	}
+	switch expression.Kind {
+	case "parameter", "string", "integer", "decimal", "boolean":
+		value, err := routineValue(expression, arguments)
+		if err != nil {
+			return "", position, err
+		}
+		return emitPlaceholder(value)
+	case "null":
+		return "NULL", position, nil
+	case "column":
+		if strings.Contains(expression.Value, ".") {
+			return "", position, fmt.Errorf("routine WHERE column %q is unsupported", expression.Value)
+		}
+		return quoteIdentifier(expression.Value), position, nil
+	case "and", "or", "eq", "ne", "lt", "lte", "gt", "gte", "like":
+		if len(expression.Args) != 2 {
+			return "", position, fmt.Errorf("routine WHERE expression %q requires two arguments", expression.Kind)
+		}
+		left, position, err := compileRoutineWhere(engine, expression.Args[0], arguments, args, position)
+		if err != nil {
+			return "", position, err
+		}
+		right, position, err := compileRoutineWhere(engine, expression.Args[1], arguments, args, position)
+		if err != nil {
+			return "", position, err
+		}
+		operator := map[string]string{
+			"and": "AND", "or": "OR", "eq": "=", "ne": "<>", "lt": "<", "lte": "<=", "gt": ">", "gte": ">=",
+		}[expression.Kind]
+		if expression.Kind == "like" {
+			operator = "LIKE"
+			if engine == Postgres {
+				operator = "ILIKE"
+			}
+		}
+		return "(" + left + " " + operator + " " + right + ")", position, nil
+	case "not":
+		if len(expression.Args) != 1 {
+			return "", position, fmt.Errorf("routine WHERE expression %q requires one argument", expression.Kind)
+		}
+		argument, position, err := compileRoutineWhere(engine, expression.Args[0], arguments, args, position)
+		if err != nil {
+			return "", position, err
+		}
+		return "(NOT " + argument + ")", position, nil
+	case "is_null", "is_not_null":
+		if len(expression.Args) != 1 {
+			return "", position, fmt.Errorf("routine WHERE expression %q requires one argument", expression.Kind)
+		}
+		argument, position, err := compileRoutineWhere(engine, expression.Args[0], arguments, args, position)
+		if err != nil {
+			return "", position, err
+		}
+		if expression.Kind == "is_null" {
+			return "(" + argument + " IS NULL)", position, nil
+		}
+		return "(" + argument + " IS NOT NULL)", position, nil
+	default:
+		return "", position, fmt.Errorf("routine WHERE expression %q is unsupported at runtime", expression.Kind)
+	}
 }
 
 func findTable(schema Schema, name string) (Table, error) {

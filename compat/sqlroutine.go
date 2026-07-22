@@ -48,20 +48,99 @@ func parsePostgresCatalogRoutine(name, body, arguments, resultType, language, ki
 		return Routine{}, err
 	}
 	for _, triggerAction := range actions {
-		if triggerAction.Kind != "insert" {
-			return Routine{}, fmt.Errorf("routine action %q is outside the canonical command grammar", triggerAction.Kind)
-		}
-		action := RoutineAction{Kind: triggerAction.Kind, Table: triggerAction.Table}
-		for _, assignment := range triggerAction.Assignments {
-			expression, err := routineCatalogExpression(assignment.Value, parameterNames)
+		switch triggerAction.Kind {
+		case "insert":
+			action := RoutineAction{Kind: triggerAction.Kind, Table: triggerAction.Table}
+			for _, assignment := range triggerAction.Assignments {
+				expression, err := routineCatalogExpression(assignment.Value, parameterNames)
+				if err != nil {
+					return Routine{}, err
+				}
+				action.Assignments = append(action.Assignments, Assignment{Column: assignment.Column, Value: expression})
+			}
+			routine.Actions = append(routine.Actions, action)
+		case "update":
+			if len(triggerAction.Assignments) == 0 || triggerAction.Where == nil {
+				return Routine{}, fmt.Errorf("routine UPDATE action requires assignments and WHERE")
+			}
+			action := RoutineAction{Kind: triggerAction.Kind, Table: triggerAction.Table}
+			for _, assignment := range triggerAction.Assignments {
+				expression, err := routineCatalogExpression(assignment.Value, parameterNames)
+				if err != nil {
+					return Routine{}, err
+				}
+				action.Assignments = append(action.Assignments, Assignment{Column: assignment.Column, Value: expression})
+			}
+			where, err := routineCatalogWhereExpression(*triggerAction.Where, parameterNames)
 			if err != nil {
 				return Routine{}, err
 			}
-			action.Assignments = append(action.Assignments, Assignment{Column: assignment.Column, Value: expression})
+			action.Where = &where
+			routine.Actions = append(routine.Actions, action)
+		case "delete":
+			if triggerAction.Where == nil || len(triggerAction.Assignments) != 0 {
+				return Routine{}, fmt.Errorf("routine DELETE action requires WHERE and no assignments")
+			}
+			where, err := routineCatalogWhereExpression(*triggerAction.Where, parameterNames)
+			if err != nil {
+				return Routine{}, err
+			}
+			routine.Actions = append(routine.Actions, RoutineAction{Kind: triggerAction.Kind, Table: triggerAction.Table, Where: &where})
+		default:
+			return Routine{}, fmt.Errorf("routine action %q is outside the canonical command grammar", triggerAction.Kind)
 		}
-		routine.Actions = append(routine.Actions, action)
 	}
 	return routine, nil
+}
+
+// routineCatalogWhereExpression rewrites a parsed WHERE expression for a routine
+// body. A bare identifier that names a declared parameter becomes a "parameter"
+// node (mirroring routineCatalogExpression for assignment values); any other
+// bare identifier is a table column and is left as a "column" node. Qualified
+// identifiers and every construct outside the comparison/logical grammar are
+// rejected explicitly so catalog inspection never claims a routine it cannot
+// execute. The supported WHERE grammar is the honest subset documented in
+// FIX-B4-REPORT.md: comparisons and logical composition against columns,
+// parameters and literals.
+func routineCatalogWhereExpression(expression Expression, parameters map[string]struct{}) (Expression, error) {
+	switch expression.Kind {
+	case "column":
+		if strings.Contains(expression.Value, ".") {
+			return Expression{}, fmt.Errorf("routine WHERE column %q is outside the canonical grammar", expression.Value)
+		}
+		if _, exists := parameters[expression.Value]; exists {
+			return Expression{Kind: "parameter", Value: expression.Value}, nil
+		}
+		return expression, nil
+	case "parameter":
+		return expression, nil
+	case "null", "string", "integer", "decimal", "boolean":
+		return expression, nil
+	case "and", "or", "eq", "ne", "lt", "lte", "gt", "gte", "like":
+		if len(expression.Args) != 2 {
+			return Expression{}, fmt.Errorf("routine WHERE expression %q requires two arguments", expression.Kind)
+		}
+		left, err := routineCatalogWhereExpression(expression.Args[0], parameters)
+		if err != nil {
+			return Expression{}, err
+		}
+		right, err := routineCatalogWhereExpression(expression.Args[1], parameters)
+		if err != nil {
+			return Expression{}, err
+		}
+		return Expression{Kind: expression.Kind, Args: []Expression{left, right}}, nil
+	case "not", "is_null", "is_not_null":
+		if len(expression.Args) != 1 {
+			return Expression{}, fmt.Errorf("routine WHERE expression %q requires one argument", expression.Kind)
+		}
+		argument, err := routineCatalogWhereExpression(expression.Args[0], parameters)
+		if err != nil {
+			return Expression{}, err
+		}
+		return Expression{Kind: expression.Kind, Args: []Expression{argument}}, nil
+	default:
+		return Expression{}, fmt.Errorf("routine WHERE expression %q is outside the canonical grammar", expression.Kind)
+	}
 }
 
 func routineCatalogExpression(expression Expression, parameters map[string]struct{}) (Expression, error) {
