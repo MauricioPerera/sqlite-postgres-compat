@@ -234,7 +234,16 @@ func compileReferentialAction(action ReferentialAction) string {
 	}
 }
 
+// compileExpression compiles an expression outside a trigger context, where
+// the identifiers new/old are ordinary columns and must be quoted like any
+// other. Trigger bodies (WHEN clauses and action statements) call
+// compileExpressionIn with inTrigger=true so that a leading new/old segment
+// resolves to the trigger's NEW/OLD transition variable instead.
 func compileExpression(engine Engine, expression Expression) (string, error) {
+	return compileExpressionIn(engine, expression, false)
+}
+
+func compileExpressionIn(engine Engine, expression Expression, inTrigger bool) (string, error) {
 	switch expression.Kind {
 	case "null":
 		return "NULL", nil
@@ -258,7 +267,13 @@ func compileExpression(engine Engine, expression Expression) (string, error) {
 			if part == "" {
 				return "", fmt.Errorf("invalid column %q", expression.Value)
 			}
-			if i == 0 && (strings.EqualFold(part, "new") || strings.EqualFold(part, "old")) {
+			// Only inside a trigger does a leading new/old segment denote the
+			// NEW/OLD transition variable, emitted unquoted and uppercased as
+			// the dialect expects. Everywhere else (CHECK, index WHERE, column
+			// DEFAULT, views) new/old are ordinary column names and must be
+			// quoted, so a column literally named "New" is not folded to the
+			// nonexistent "new" by PostgreSQL's identifier casing rules.
+			if inTrigger && i == 0 && (strings.EqualFold(part, "new") || strings.EqualFold(part, "old")) {
 				parts[i] = strings.ToUpper(part)
 			} else {
 				parts[i] = quoteIdentifier(part)
@@ -271,11 +286,11 @@ func compileExpression(engine Engine, expression Expression) (string, error) {
 		if len(expression.Args) != 2 {
 			return "", fmt.Errorf("expression %q requires two arguments", expression.Kind)
 		}
-		left, err := compileExpression(engine, expression.Args[0])
+		left, err := compileExpressionIn(engine, expression.Args[0], inTrigger)
 		if err != nil {
 			return "", err
 		}
-		right, err := compileExpression(engine, expression.Args[1])
+		right, err := compileExpressionIn(engine, expression.Args[1], inTrigger)
 		if err != nil {
 			return "", err
 		}
@@ -300,7 +315,7 @@ func compileExpression(engine Engine, expression Expression) (string, error) {
 		if len(expression.Args) != 1 {
 			return "", fmt.Errorf("expression %q requires one argument", expression.Kind)
 		}
-		argument, err := compileExpression(engine, expression.Args[0])
+		argument, err := compileExpressionIn(engine, expression.Args[0], inTrigger)
 		if err != nil {
 			return "", err
 		}
@@ -316,7 +331,7 @@ func compileExpression(engine Engine, expression Expression) (string, error) {
 		if len(expression.Args) != 1 {
 			return "", fmt.Errorf("function %q requires one argument", expression.Kind)
 		}
-		argument, err := compileExpression(engine, expression.Args[0])
+		argument, err := compileExpressionIn(engine, expression.Args[0], inTrigger)
 		if err != nil {
 			return "", err
 		}
@@ -325,7 +340,7 @@ func compileExpression(engine Engine, expression Expression) (string, error) {
 		if len(expression.Args) < 1 {
 			return "", fmt.Errorf("function %q requires at least one argument", expression.Kind)
 		}
-		compiled, err := compileExpressionArgs(engine, expression.Args)
+		compiled, err := compileExpressionArgs(engine, expression.Args, inTrigger)
 		if err != nil {
 			return "", err
 		}
@@ -334,7 +349,7 @@ func compileExpression(engine Engine, expression Expression) (string, error) {
 		if len(expression.Args) != 3 {
 			return "", fmt.Errorf("function %q requires three arguments", expression.Kind)
 		}
-		compiled, err := compileExpressionArgs(engine, expression.Args)
+		compiled, err := compileExpressionArgs(engine, expression.Args, inTrigger)
 		if err != nil {
 			return "", err
 		}
@@ -345,11 +360,13 @@ func compileExpression(engine Engine, expression Expression) (string, error) {
 }
 
 // compileExpressionArgs compiles each argument expression, returning the
-// compiled fragments in order. Variadic scalar functions share it.
-func compileExpressionArgs(engine Engine, args []Expression) ([]string, error) {
+// compiled fragments in order. Variadic scalar functions share it. The
+// inTrigger flag is propagated so a nested new/old column resolves to the
+// trigger transition variable when the enclosing expression is a trigger body.
+func compileExpressionArgs(engine Engine, args []Expression, inTrigger bool) ([]string, error) {
 	compiled := make([]string, len(args))
 	for i, argument := range args {
-		value, err := compileExpression(engine, argument)
+		value, err := compileExpressionIn(engine, argument, inTrigger)
 		if err != nil {
 			return nil, err
 		}
@@ -473,7 +490,7 @@ func compileTrigger(engine Engine, trigger Trigger) ([]string, error) {
 	if engine == SQLite {
 		statement := "CREATE TRIGGER " + quoteIdentifier(trigger.Name) + " " + timing + " " + event + " ON " + quoteIdentifier(trigger.Table) + " FOR EACH ROW"
 		if trigger.When != nil {
-			condition, err := compileExpression(engine, *trigger.When)
+			condition, err := compileExpressionIn(engine, *trigger.When, true)
 			if err != nil {
 				return nil, err
 			}
@@ -492,7 +509,7 @@ func compileTrigger(engine Engine, trigger Trigger) ([]string, error) {
 	function := "CREATE FUNCTION " + quoteIdentifier(functionName) + "() RETURNS TRIGGER LANGUAGE plpgsql AS '" + strings.ReplaceAll(body, "'", "''") + "'"
 	statement := "CREATE TRIGGER " + quoteIdentifier(trigger.Name) + " " + timing + " " + event + " ON " + quoteIdentifier(trigger.Table) + " FOR EACH ROW"
 	if trigger.When != nil {
-		condition, err := compileExpression(engine, *trigger.When)
+		condition, err := compileExpressionIn(engine, *trigger.When, true)
 		if err != nil {
 			return nil, err
 		}
@@ -513,7 +530,7 @@ func compileTriggerAction(engine Engine, action TriggerAction) (string, error) {
 			if assignment.Column == "" {
 				return nil, nil, fmt.Errorf("trigger assignment column is required")
 			}
-			value, err := compileExpression(engine, assignment.Value)
+			value, err := compileExpressionIn(engine, assignment.Value, true)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -544,7 +561,7 @@ func compileTriggerAction(engine Engine, action TriggerAction) (string, error) {
 		for i := range columns {
 			sets[i] = columns[i] + " = " + values[i]
 		}
-		where, err := compileExpression(engine, *action.Where)
+		where, err := compileExpressionIn(engine, *action.Where, true)
 		if err != nil {
 			return "", err
 		}
@@ -553,7 +570,7 @@ func compileTriggerAction(engine Engine, action TriggerAction) (string, error) {
 		if action.Where == nil {
 			return "", fmt.Errorf("delete trigger action requires predicate")
 		}
-		where, err := compileExpression(engine, *action.Where)
+		where, err := compileExpressionIn(engine, *action.Where, true)
 		if err != nil {
 			return "", err
 		}

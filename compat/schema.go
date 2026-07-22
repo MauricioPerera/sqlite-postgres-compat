@@ -49,6 +49,34 @@ const (
 	VectorType    TypeFamily = "vector"
 )
 
+// knownTypeFamilies is the single source of truth for the type families the
+// canonical schema accepts. compileType (ddl.go) maps each family to a
+// concrete SQL type per engine; an unknown family (a typo such as "nope") is
+// rejected here at validation time with a clear, table/column-qualified error
+// instead of surfacing later as an opaque compile error after both databases
+// have already been contacted.
+var knownTypeFamilies = map[TypeFamily]struct{}{
+	BooleanType:   {},
+	IntegerType:   {},
+	DecimalType:   {},
+	FloatType:     {},
+	TextType:      {},
+	BinaryType:    {},
+	DateType:      {},
+	TimestampType: {},
+	JSONType:      {},
+	UUIDType:      {},
+	VectorType:    {},
+}
+
+// knownTypeFamily reports whether family is one of the supported type
+// families. The empty family is intentionally not known; callers check it
+// separately to produce a distinct "no type" error.
+func knownTypeFamily(family TypeFamily) bool {
+	_, ok := knownTypeFamilies[family]
+	return ok
+}
+
 type Constraint struct {
 	Kind       ConstraintKind `json:"kind"`
 	Columns    []string       `json:"columns"`
@@ -204,6 +232,9 @@ func (s Schema) Validate() error {
 			if column.Type.Family == "" {
 				return fmt.Errorf("column %q.%q has no type", table.Name, column.Name)
 			}
+			if !knownTypeFamily(column.Type.Family) {
+				return fmt.Errorf("column %q.%q has unsupported type family %q", table.Name, column.Name, column.Type.Family)
+			}
 			if column.Type.Family == VectorType {
 				// A vector is declared as vector(N); the single argument is the
 				// fixed dimension and must be positive. Without it the canonical
@@ -303,6 +334,9 @@ func (s Schema) Validate() error {
 		for _, parameter := range routine.Parameters {
 			if parameter.Name == "" || parameter.Type.Family == "" {
 				return fmt.Errorf("routine %q has an invalid parameter", routine.Name)
+			}
+			if !knownTypeFamily(parameter.Type.Family) {
+				return fmt.Errorf("routine %q parameter %q has unsupported type family %q", routine.Name, parameter.Name, parameter.Type.Family)
 			}
 			if _, exists := parameters[parameter.Name]; exists {
 				return fmt.Errorf("routine %q has duplicate parameter %q", routine.Name, parameter.Name)

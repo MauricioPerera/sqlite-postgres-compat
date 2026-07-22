@@ -384,3 +384,169 @@ func TestCompileCanonicalTriggerUpdateAndDeleteActions(t *testing.T) {
 		}
 	}
 }
+
+// TestCompileTriggerNewOldStillMagic verifies that inside a trigger context a
+// leading new/old segment still resolves to the unquoted NEW/OLD transition
+// variable (no regression from gating the behavior behind inTrigger).
+func TestCompileTriggerNewOldStillMagic(t *testing.T) {
+	cases := []struct {
+		name    string
+		expr    Expression
+		wantAll map[Engine]string // substring every engine must contain
+	}{
+		{
+			name: "new.column in WHEN",
+			expr: Expression{Kind: "gt", Args: []Expression{
+				{Kind: "column", Value: "new.amount"},
+				{Kind: "integer", Value: "0"},
+			}},
+			wantAll: map[Engine]string{SQLite: `NEW."amount"`, Postgres: `NEW."amount"`},
+		},
+		{
+			name: "old.column in WHEN",
+			expr: Expression{Kind: "ne", Args: []Expression{
+				{Kind: "column", Value: "old.code"},
+				{Kind: "string", Value: "x"},
+			}},
+			wantAll: map[Engine]string{SQLite: `OLD."code"`, Postgres: `OLD."code"`},
+		},
+		{
+			name: "case-insensitive NEW prefix stays magic",
+			expr: Expression{Kind: "gt", Args: []Expression{
+				{Kind: "column", Value: "NEW.amount"},
+				{Kind: "integer", Value: "0"},
+			}},
+			wantAll: map[Engine]string{SQLite: `NEW."amount"`, Postgres: `NEW."amount"`},
+		},
+		{
+			name: "nested new.column inside coalesce in action value",
+			expr: Expression{Kind: "coalesce", Args: []Expression{
+				{Kind: "column", Value: "new.amount"},
+				{Kind: "integer", Value: "0"},
+			}},
+			wantAll: map[Engine]string{SQLite: `COALESCE(NEW."amount", 0)`, Postgres: `COALESCE(NEW."amount", 0)`},
+		},
+	}
+	for _, tc := range cases {
+		when := tc.expr
+		trigger := Trigger{
+			Name: "trg", Table: "entries", Timing: "before", Event: "update", When: &when,
+			Actions: []TriggerAction{{Kind: "update", Table: "entries",
+				Assignments: []Assignment{{Column: "amount", Value: Expression{Kind: "column", Value: "new.amount"}}},
+				Where: &Expression{Kind: "eq", Args: []Expression{{Kind: "column", Value: "new.amount"}, {Kind: "integer", Value: "0"}}}}},
+		}
+		for _, engine := range []Engine{SQLite, Postgres} {
+			statements, err := CompileDDL(Target{Engine: engine, Version: Version{Major: 17}}, Schema{Triggers: []Trigger{trigger}})
+			if err != nil {
+				t.Fatalf("%s/%s: %v", engine, tc.name, err)
+			}
+			joined := strings.Join(statements, "\n")
+			if !strings.Contains(joined, tc.wantAll[engine]) {
+				t.Fatalf("%s/%s: want %q in trigger DDL, got:\n%s", engine, tc.name, tc.wantAll[engine], joined)
+			}
+			// A column named new must never be quoted inside a trigger body.
+			if strings.Contains(joined, `"new"`) || strings.Contains(joined, `"old"`) || strings.Contains(joined, `"NEW"`) || strings.Contains(joined, `"OLD"`) {
+				t.Fatalf("%s/%s: new/old leaked as quoted identifier in trigger DDL:\n%s", engine, tc.name, joined)
+			}
+		}
+	}
+}
+
+// TestCompileNonTriggerNewOldColumnIsQuoted verifies that outside a trigger
+// (CHECK constraint, partial index WHERE, and view) a column literally named
+// new/old — quoted "New" or unquoted — compiles to a quoted identifier, not to
+// the bare NEW/OLD transition variable. This is the AUDIT2-A MEDIA #2 fix.
+func TestCompileNonTriggerNewOldColumnIsQuoted(t *testing.T) {
+	// Each case is built around a table whose column is literally named with a
+	// new/old-ish identifier, and the expression referencing it.
+	cases := []struct {
+		name     string
+		schema   Schema
+		find     func(statements []string) string
+		wantSubs []string // substrings the located statement must contain
+		badSubs  []string // substrings it must NOT contain
+	}{
+		{
+			name: "CHECK with unquoted column named new",
+			schema: Schema{Tables: []Table{{
+				Name: "t",
+				Columns: []Column{
+					{Name: "new", Type: Type{Family: IntegerType}},
+				},
+				Constraints: []Constraint{{Kind: Check, Expression: &Expression{Kind: "gt", Args: []Expression{
+					{Kind: "column", Value: "new"}, {Kind: "integer", Value: "0"},
+				}}}},
+			}}},
+			find:     func(s []string) string { return s[0] },
+			wantSubs: []string{`CHECK (("new" > 0))`},
+			badSubs:  []string{`(NEW > 0)`, `(new > 0)`},
+		},
+		{
+			name: "CHECK with quoted column named New (case-sensitive)",
+			schema: Schema{Tables: []Table{{
+				Name: "t",
+				Columns: []Column{
+					{Name: "New", Type: Type{Family: IntegerType}},
+				},
+				Constraints: []Constraint{{Kind: Check, Expression: &Expression{Kind: "gt", Args: []Expression{
+					{Kind: "column", Value: "New"}, {Kind: "integer", Value: "0"},
+				}}}},
+			}}},
+			find:     func(s []string) string { return s[0] },
+			wantSubs: []string{`CHECK (("New" > 0))`},
+			badSubs:  []string{`(NEW > 0)`, `(new > 0)`, `("new" > 0)`},
+		},
+		{
+			name: "partial index WHERE with column named old",
+			schema: Schema{
+				Tables: []Table{{Name: "t", Columns: []Column{
+					{Name: "id", Type: Type{Family: IntegerType}},
+					{Name: "old", Type: Type{Family: BooleanType}},
+				}}},
+				Indexes: []Index{{Name: "idx", Table: "t", Columns: []IndexColumn{{Column: "id"}}, Where: &Expression{Kind: "eq", Args: []Expression{
+					{Kind: "column", Value: "old"}, {Kind: "boolean", Value: "true"},
+				}}}},
+			},
+			find:     func(s []string) string { return s[1] },
+			wantSubs: []string{`WHERE ("old" = TRUE)`},
+			badSubs:  []string{`(OLD = TRUE)`, `(old = TRUE)`},
+		},
+		{
+			name: "view projection+where with column named new",
+			schema: Schema{
+				Tables: []Table{{Name: "t", Columns: []Column{
+					{Name: "new", Type: Type{Family: IntegerType}},
+				}}},
+				Views: []View{{Name: "v", Query: SelectQuery{
+					Columns: []Projection{{Expression: Expression{Kind: "column", Value: "new"}, Alias: "new"}},
+					From:    TableSource{Table: "t"},
+					Where: &Expression{Kind: "gt", Args: []Expression{
+						{Kind: "column", Value: "new"}, {Kind: "integer", Value: "0"},
+					}},
+				}}},
+			},
+			find:     func(s []string) string { return s[1] },
+			wantSubs: []string{`SELECT "new" AS "new"`, `WHERE ("new" > 0)`},
+			badSubs:  []string{`SELECT NEW`, `(NEW > 0)`, `(new > 0)`},
+		},
+	}
+	for _, engine := range []Engine{SQLite, Postgres} {
+		for _, tc := range cases {
+			statements, err := CompileDDL(Target{Engine: engine, Version: Version{Major: 17}}, tc.schema)
+			if err != nil {
+				t.Fatalf("%s/%s: %v", engine, tc.name, err)
+			}
+			target := tc.find(statements)
+			for _, want := range tc.wantSubs {
+				if !strings.Contains(target, want) {
+					t.Fatalf("%s/%s: want %q in %s", engine, tc.name, want, target)
+				}
+			}
+			for _, bad := range tc.badSubs {
+				if strings.Contains(target, bad) {
+					t.Fatalf("%s/%s: forbidden %q in %s", engine, tc.name, bad, target)
+				}
+			}
+		}
+	}
+}
