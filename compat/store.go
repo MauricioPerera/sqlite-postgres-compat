@@ -264,7 +264,11 @@ func canonicalValue(kind TypeFamily, source any) (Value, error) {
 	case DecimalType:
 		return Value{Kind: DecimalValue, Value: text}, nil
 	case FloatType:
-		return Value{Kind: FloatValue, Value: text}, nil
+		canonical, err := normalizeFloat(text)
+		if err != nil {
+			return Value{}, fmt.Errorf("invalid float %q: %w", text, err)
+		}
+		return Value{Kind: FloatValue, Value: canonical}, nil
 	case DateType:
 		return Value{Kind: DateValue, Value: text}, nil
 	case TimestampType:
@@ -320,6 +324,19 @@ func stringify(value any) string {
 	default:
 		return fmt.Sprint(typed)
 	}
+}
+
+// normalizeFloat parses a float's textual representation and re-formats it in a
+// single canonical form. The capture journal (SQLite CAST(col AS TEXT), e.g.
+// "1.0") and the reconstructed current row (fmt.Sprint on float64, e.g. "1")
+// produce different text for the same float; canonicalizing here lets both
+// producers compare equal without weakening rowsEqual.
+func normalizeFloat(text string) (string, error) {
+	parsed, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return "", err
+	}
+	return strconv.FormatFloat(parsed, 'g', -1, 64), nil
 }
 
 func normalizeBoolean(value string) string {

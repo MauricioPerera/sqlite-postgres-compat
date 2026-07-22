@@ -74,6 +74,50 @@ func TestCanonicalJSONAndTimestampNormalization(t *testing.T) {
 	}
 }
 
+func TestCanonicalFloatNormalization(t *testing.T) {
+	// The capture journal and the reconstructed current row produce different
+	// text for the same float ("1.0" vs "1"); canonicalValue must map both to a
+	// single canonical form so rowsEqual stays byte-strict.
+	onePointZero, err := canonicalValue(FloatType, "1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	one, err := canonicalValue(FloatType, "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if onePointZero.Value != one.Value {
+		t.Fatalf("expected canonical equality for 1.0 and 1, got %q vs %q", onePointZero.Value, one.Value)
+	}
+	if onePointZero.Kind != FloatValue {
+		t.Fatalf("unexpected kind %q", onePointZero.Kind)
+	}
+	if onePointZero.Value != "1" {
+		t.Fatalf("unexpected canonical form %q", onePointZero.Value)
+	}
+
+	half, err := canonicalValue(FloatType, "1.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if half.Value != "1.5" {
+		t.Fatalf("expected 1.5 to be preserved, got %q", half.Value)
+	}
+
+	// A driver-supplied float64 must canonicalize identically to the captured text.
+	fromFloat, err := canonicalValue(FloatType, float64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromFloat.Value != one.Value {
+		t.Fatalf("expected float64(1) to match canonical 1, got %q vs %q", fromFloat.Value, one.Value)
+	}
+
+	if _, err := canonicalValue(FloatType, "not-a-number"); err == nil {
+		t.Fatal("expected error for non-numeric float text")
+	}
+}
+
 func TestSQLiteForeignKeysAreEnabled(t *testing.T) {
 	store, err := OpenSQLite(Version{Major: 3}, ":memory:")
 	if err != nil {

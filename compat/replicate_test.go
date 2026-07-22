@@ -76,6 +76,136 @@ func TestApplyChangesDetectsConflictAndRollsBack(t *testing.T) {
 	}
 }
 
+func TestApplyChangesReplicatesFloatColumn(t *testing.T) {
+	ctx := context.Background()
+	schema := floatTestSchema("float_items")
+
+	source, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.InstallChangeCapture(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+
+	destination, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destination.Close()
+	if err := destination.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := destination.InstallChangeCapture(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+
+	// SQLite stores REAL values; CAST(1.0 AS TEXT) yields "1.0" in the journal
+	// while the reconstructed row formats as "1", which previously caused
+	// spurious conflicts on update/delete and left deletes un-applied.
+	if _, err := source.DB.Exec(`INSERT INTO float_items (id, flt) VALUES (1, 1.0)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.Exec(`UPDATE float_items SET flt = 1.5 WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.Exec(`DELETE FROM float_items WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+
+	changes, err := source.ReadCapturedChanges(ctx, schema, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 3 {
+		t.Fatalf("expected 3 captured changes, got %d", len(changes))
+	}
+	if err := destination.ApplyChanges(ctx, schema, changes); err != nil {
+		t.Fatalf("float replication must not conflict: %v", err)
+	}
+
+	var count int
+	if err := destination.DB.QueryRow(`SELECT count(*) FROM float_items WHERE id = 1`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("expected row removed after delete, found %d", count)
+	}
+
+	// Replaying the same stream must stay idempotent once the row is gone.
+	if err := destination.ApplyChanges(ctx, schema, changes); err != nil {
+		t.Fatalf("reapplying float stream must be idempotent: %v", err)
+	}
+}
+
+func TestApplyChangesReplicatesFloatUpdateApplied(t *testing.T) {
+	ctx := context.Background()
+	schema := floatTestSchema("float_update_items")
+
+	source, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.InstallChangeCapture(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+
+	destination, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destination.Close()
+	if err := destination.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := destination.InstallChangeCapture(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := source.DB.Exec(`INSERT INTO float_update_items (id, flt) VALUES (1, 1.0)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.Exec(`UPDATE float_update_items SET flt = 2.5 WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+
+	changes, err := source.ReadCapturedChanges(ctx, schema, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Apply only insert+update so the row survives and the update is observable.
+	if err := destination.ApplyChanges(ctx, schema, changes[:2]); err != nil {
+		t.Fatalf("float update must not conflict: %v", err)
+	}
+
+	var flt float64
+	if err := destination.DB.QueryRow(`SELECT flt FROM float_update_items WHERE id = 1`).Scan(&flt); err != nil {
+		t.Fatal(err)
+	}
+	if flt != 2.5 {
+		t.Fatalf("expected updated float 2.5, got %v", flt)
+	}
+}
+
+func floatTestSchema(name string) Schema {
+	return Schema{Tables: []Table{{
+		Name: name,
+		Columns: []Column{
+			{Name: "id", Type: Type{Family: IntegerType}},
+			{Name: "flt", Type: Type{Family: FloatType}},
+		},
+		Constraints: []Constraint{{Kind: PrimaryKey, Columns: []string{"id"}}},
+	}}}
+}
+
 func replicationTestSchema(name string) Schema {
 	return Schema{Tables: []Table{{
 		Name: name,
