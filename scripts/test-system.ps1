@@ -5,11 +5,11 @@ param(
 $ErrorActionPreference = 'Stop'
 $env:COMPAT_POSTGRES_DSN = $PostgresDsn
 
-go test ./...
+go test ./... -timeout 60s
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 go vet ./...
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-go test -tags=e2e ./e2e -v -count=1
+go test -tags=e2e ./e2e -v -count=1 -timeout 60s
 exit $LASTEXITCODE

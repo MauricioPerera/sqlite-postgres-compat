@@ -22,6 +22,8 @@ type Store struct {
 	DB     *sql.DB
 }
 
+const schemaMetadataTable = "__compat_schema"
+
 func OpenStore(target Target, dsn string) (*Store, error) {
 	if err := target.Validate(); err != nil {
 		return nil, err
@@ -81,6 +83,9 @@ func (store *Store) ApplySchema(ctx context.Context, schema Schema) error {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
 		}
+	}
+	if err := writeSchemaMetadata(ctx, tx, store.Target.Engine, schema); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -180,7 +185,29 @@ func (store *Store) ImportSnapshot(ctx context.Context, snapshot Snapshot) error
 			return fmt.Errorf("apply triggers: %w", err)
 		}
 	}
+	if err := writeSchemaMetadata(ctx, tx, store.Target.Engine, snapshot.Schema); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+func writeSchemaMetadata(ctx context.Context, tx *sql.Tx, engine Engine, schema Schema) error {
+	payload, err := json.Marshal(schema)
+	if err != nil {
+		return err
+	}
+	create := "CREATE TABLE IF NOT EXISTS " + quoteIdentifier(schemaMetadataTable) + " (" +
+		quoteIdentifier("key") + " TEXT PRIMARY KEY, " + quoteIdentifier("value") + " TEXT NOT NULL)"
+	if _, err := tx.ExecContext(ctx, create); err != nil {
+		return fmt.Errorf("create schema metadata: %w", err)
+	}
+	upsert := "INSERT INTO " + quoteIdentifier(schemaMetadataTable) + " (" + quoteIdentifier("key") + ", " + quoteIdentifier("value") + ") VALUES (" +
+		placeholder(engine, 1) + ", " + placeholder(engine, 2) + ") ON CONFLICT (" + quoteIdentifier("key") + ") DO UPDATE SET " +
+		quoteIdentifier("value") + " = EXCLUDED." + quoteIdentifier("value")
+	if _, err := tx.ExecContext(ctx, upsert, "canonical_schema", string(payload)); err != nil {
+		return fmt.Errorf("write schema metadata: %w", err)
+	}
+	return nil
 }
 
 func insertRow(ctx context.Context, tx *sql.Tx, engine Engine, table Table, row Row) error {

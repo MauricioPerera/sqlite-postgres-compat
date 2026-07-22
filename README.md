@@ -4,7 +4,7 @@ Base de un motor de compatibilidad bidireccional SQLite ↔ PostgreSQL.
 
 El proyecto no usa una aplicación concreta como modelo. Su contrato de entrada declara las versiones de los motores y las capacidades que deben preservarse. El motor no debe degradar una capacidad sin reportarla explícitamente.
 
-Las capas implementadas son el contrato de compatibilidad, la representación canónica de esquemas, la auditoría de capacidades, compiladores DDL SQLite/PostgreSQL, un diario canónico de mutaciones, adaptadores para exportar/importar snapshots y un runtime común para vistas, triggers, rutinas y búsqueda textual canónicos. Las siguientes capas son el análisis completo de dialectos, captura de cambios y replicación continua.
+Las capas implementadas son el contrato de compatibilidad, la representación canónica de esquemas, persistencia e inspección exacta del contrato, auditoría de capacidades, compiladores DDL SQLite/PostgreSQL, un diario canónico de mutaciones, adaptadores para exportar/importar snapshots y un runtime común para vistas, triggers, rutinas y búsqueda textual canónicos. Las siguientes capas son el análisis completo de dialectos externos, captura de cambios y replicación continua.
 
 ## Auditoría
 

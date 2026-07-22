@@ -21,6 +21,7 @@ La batería se ejecutó contra SQLite real y PostgreSQL 17.5 real proporcionado 
 - Triggers canónicos con efectos equivalentes.
 - Rutinas transaccionales ejecutadas por el runtime común.
 - Búsqueda textual Unicode determinista ejecutada por el runtime común.
+- Reconstrucción exacta del esquema canónico persistido desde SQLite y PostgreSQL.
 - Eliminación de las bases PostgreSQL temporales después de la prueba.
 
 ## Incumplimiento que permanece
@@ -32,7 +33,7 @@ La prueba de cobertura integral falla porque el sistema aún no proporciona equi
 - Rutinas almacenadas.
 - Búsqueda de texto completo.
 
-El resultado de la batería es 10 pruebas superiores superadas y 1 fallida. Esta proporción no representa un porcentaje de compatibilidad total; el fallo significa que el objetivo del 100% no está cumplido.
+El resultado de la batería es 11 pruebas superiores superadas y 1 fallida. Esta proporción no representa un porcentaje de compatibilidad total; el fallo significa que el objetivo del 100% no está cumplido.
 
 ## Defectos detectados y corregidos durante la ejecución
 
@@ -40,6 +41,7 @@ El resultado de la batería es 10 pruebas superiores superadas y 1 fallida. Esta
 - Redondeo de timestamps PostgreSQL de nanosegundos a microsegundos; ahora conserva la representación canónica completa.
 - Diferencias de normalización JSON; ahora se normaliza antes de comparar.
 - Claves foráneas desactivadas en conexiones SQLite; ahora se habilitan en todas las conexiones del adaptador.
+- Bloqueo al inspeccionar el catálogo SQLite con una sola conexión; ahora el catálogo se materializa antes de consultar columnas.
 
 ## Ejecución
 

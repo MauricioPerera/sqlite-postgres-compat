@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -458,6 +459,49 @@ func TestSystemCanonicalFullTextReturnsEquivalentResults(t *testing.T) {
 	}
 	if fmt.Sprint(sqliteResults) != fmt.Sprint(postgresResults) || len(sqliteResults) != 2 {
 		t.Fatalf("search results differ: sqlite=%v postgres=%v", sqliteResults, postgresResults)
+	}
+}
+
+func TestSystemReconstructsExactCanonicalSchemaFromBothEngines(t *testing.T) {
+	ctx := context.Background()
+	schema := compat.Schema{
+		Tables: []compat.Table{{
+			Name: "inspection_entries",
+			Columns: []compat.Column{
+				{Name: "id", Type: compat.Type{Family: compat.UUIDType}},
+				{Name: "payload", Type: compat.Type{Family: compat.JSONType}},
+			},
+			Constraints: []compat.Constraint{{Kind: compat.PrimaryKey, Columns: []string{"id"}}},
+		}},
+		Routines: []compat.Routine{{
+			Name: "inspection_insert",
+			Parameters: []compat.RoutineParameter{
+				{Name: "id", Type: compat.Type{Family: compat.UUIDType}},
+				{Name: "payload", Type: compat.Type{Family: compat.JSONType}},
+			},
+			Actions: []compat.RoutineAction{{
+				Kind:  "insert",
+				Table: "inspection_entries",
+				Assignments: []compat.Assignment{
+					{Column: "id", Value: compat.Expression{Kind: "parameter", Value: "id"}},
+					{Column: "payload", Value: compat.Expression{Kind: "parameter", Value: "payload"}},
+				},
+			}},
+		}},
+	}
+	sqlite := openSQLite(t, filepath.Join(t.TempDir(), "inspection.db"))
+	postgres := openPostgres(t)
+	for _, store := range []*compat.Store{sqlite, postgres} {
+		if err := store.ApplySchema(ctx, schema); err != nil {
+			t.Fatal(err)
+		}
+		inspection, err := store.InspectSchema(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !inspection.Exact || inspection.Source != "canonical_metadata" || !reflect.DeepEqual(schema, inspection.Schema) {
+			t.Fatalf("schema was not reconstructed exactly: %+v", inspection)
+		}
 	}
 }
 
