@@ -19,13 +19,13 @@ Las capas implementadas son el contrato de compatibilidad, la representación ca
 ```powershell
 go test ./...
 go vet ./...
-go run ./cmd/compat-audit .\contract.example.json
+go run ./cmd/compat-audit .\examples\contract.example.json
 ```
 
-Para copiar un snapshot, edita `migration.example.json` con DSN reales y ejecuta:
+Para copiar un snapshot, edita `examples/migration.example.json` con DSN reales y ejecuta:
 
 ```powershell
-go run ./cmd/compat-copy .\migration.example.json
+go run ./cmd/compat-copy .\examples\migration.example.json
 ```
 
 ## Auditoría
@@ -67,7 +67,7 @@ La suite comprueba el núcleo portable, CLI completa, precisión decimal, JSON, 
 - [Matriz de compatibilidad](docs/COMPATIBILITY.md)
 - [Operación, concurrencia y recuperación](docs/OPERATIONS.md)
 - [Pruebas y criterios de aceptación](docs/TESTING.md)
-- [Informe de la última validación](VALIDATION_REPORT.md)
+- [Informe de la última validación](docs/reports/VALIDATION_REPORT.md)
 
 Ejemplo de `contract.json`:
 

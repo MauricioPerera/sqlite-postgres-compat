@@ -319,7 +319,7 @@ func sqliteTypeFamily(declared string) TypeFamily {
 	case strings.Contains(typ, "F32_BLOB"):
 		// libSQL/sqld declares native vectors as F32_BLOB(N). It must be matched
 		// before the generic BLOB affinity below, otherwise a vector column is
-		// silently misread as binary (see VECTOR-COMPAT-REPORT.md §B).
+		// silently misread as binary (see docs/reports/VECTOR-COMPAT-REPORT.md §B).
 		return VectorType
 	case strings.Contains(typ, "BOOL"):
 		return BooleanType

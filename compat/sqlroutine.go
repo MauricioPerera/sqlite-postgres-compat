@@ -100,7 +100,7 @@ func parsePostgresCatalogRoutine(name, body, arguments, resultType, language, ki
 // identifiers and every construct outside the comparison/logical grammar are
 // rejected explicitly so catalog inspection never claims a routine it cannot
 // execute. The supported WHERE grammar is the honest subset documented in
-// FIX-B4-REPORT.md: comparisons and logical composition against columns,
+// docs/reports/FIX-B4-REPORT.md: comparisons and logical composition against columns,
 // parameters and literals.
 func routineCatalogWhereExpression(expression Expression, parameters map[string]struct{}) (Expression, error) {
 	switch expression.Kind {

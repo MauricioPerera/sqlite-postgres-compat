@@ -43,7 +43,7 @@ Hay dos niveles distintos:
 
 La segunda prueba falla intencionalmente mientras haya capacidades `unknown`. El código distinto de cero evita presentar una suite parcialmente exitosa como prueba de compatibilidad total.
 
-El conteo vigente y las familias restantes se registran en [VALIDATION_REPORT.md](../VALIDATION_REPORT.md).
+El conteo vigente y las familias restantes se registran en [VALIDATION_REPORT.md](reports/VALIDATION_REPORT.md).
 
 ## Qué valida extremo a extremo
 

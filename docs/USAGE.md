@@ -3,7 +3,7 @@
 ## Auditar un contrato
 
 ```powershell
-go run ./cmd/compat-audit .\contract.example.json
+go run ./cmd/compat-audit .\examples\contract.example.json
 ```
 
 La salida es JSON. El proceso termina con código `1` si cualquier capacidad requerida no es exacta, y con código de salida 2 si el número de argumentos no es exactamente uno.
@@ -20,7 +20,7 @@ Usa capacidades `canonical_*` cuando el objeto procede del AST del proyecto. No 
 
 ## Copiar un snapshot con la CLI
 
-Configura `migration.example.json`:
+Configura `examples/migration.example.json`:
 
 ```json
 {
@@ -46,7 +46,7 @@ Configura `migration.example.json`:
 Ejecuta:
 
 ```powershell
-go run ./cmd/compat-copy .\migration.example.json
+go run ./cmd/compat-copy .\examples\migration.example.json
 ```
 
 El flujo audita las capacidades inferidas, exporta el origen, importa el destino y vuelve a exportarlo para verificar su hash canónico. El destino debe estar vacío para los objetos descritos. El proceso termina con código `1` ante cualquier error o falta de equivalencia exacta, y con código de salida 2 si el número de argumentos no es exactamente uno.
@@ -160,7 +160,7 @@ if err := postgres.ApplyChangesTolerant(ctx, schema, changes); err != nil {
 
 ## Cutover sin ventana con la CLI
 
-`compat-cutover` orquesta un cutover SQLite → PostgreSQL sin ventana de corte: audita el contrato, instala captura en el origen, importa el snapshot en el destino, drena el journal con `ApplyChangesTolerant` (resolviendo el solapamiento inherente) y verifica equivalencia. Configura `cutover.example.json`:
+`compat-cutover` orquesta un cutover SQLite → PostgreSQL sin ventana de corte: audita el contrato, instala captura en el origen, importa el snapshot en el destino, drena el journal con `ApplyChangesTolerant` (resolviendo el solapamiento inherente) y verifica equivalencia. Configura `examples/cutover.example.json`:
 
 ```json
 {

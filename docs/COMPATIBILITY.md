@@ -57,4 +57,4 @@ Las familias genéricas `foreign_keys`, `check_constraints`, `indexes`, `views`,
 
 ## Límite del 100 %
 
-El sistema no declara compatibilidad total. La aceptación global seguirá fallando mientras exista al menos una familia genérica requerida con estado diferente de `exact`. El detalle actualizado está en [VALIDATION_REPORT.md](../VALIDATION_REPORT.md).
+El sistema no declara compatibilidad total. La aceptación global seguirá fallando mientras exista al menos una familia genérica requerida con estado diferente de `exact`. El detalle actualizado está en [VALIDATION_REPORT.md](reports/VALIDATION_REPORT.md).

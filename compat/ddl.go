@@ -133,7 +133,7 @@ func compileType(engine Engine, typ Type) (string, error) {
 		case VectorType:
 			// The default SQLite engine (modernc) has no native vector functions,
 			// so the interoperable carrier is canonical text '[1,2,3]'. This was
-			// validated against libSQL/sqld and pgvector in VECTOR-COMPAT-REPORT.md:
+			// validated against libSQL/sqld and pgvector in docs/reports/VECTOR-COMPAT-REPORT.md:
 			// text crosses both engines, while the native F32_BLOB/bytea binary
 			// route is not usable as a pgvector vector. TEXT preserves the
 			// canonical value byte-for-byte without requiring a vector extension.
