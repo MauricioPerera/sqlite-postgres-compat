@@ -32,6 +32,33 @@ func (err *ConflictError) Error() string {
 // same stream is safe: committed source sequences are recorded in the target
 // transaction and skipped on subsequent attempts.
 func (store *Store) ApplyChanges(ctx context.Context, schema Schema, changes []Change) error {
+	return store.applyChanges(ctx, schema, changes, false)
+}
+
+// ApplyChangesTolerant applies one ordered source stream atomically with an
+// opt-in, catch-up conflict policy. It exists for zero-window migrations whose
+// capture-install → snapshot → catch-up sequence inherently overlaps: a change
+// journaled after capture was installed may already have traveled inside the
+// snapshot, so re-applying it would trip a spurious ConflictError even though
+// the destination already reflects the change's final state.
+//
+// The only difference from ApplyChanges is conflict resolution. A change is
+// treated as already applied — and recorded in __compat_applied_changes as if
+// it had just been applied — when the destination's CURRENT state already
+// equals the change's FINAL state:
+//
+//   - insert: the row already exists and rowsEqual(after, actual);
+//   - update: the row exists and rowsEqual(after, actual) even though Before no
+//     longer matches (the snapshot already carried the after state);
+//   - delete: the row no longer exists.
+//
+// Any other divergence remains a strict ConflictError: the tolerant mode is a
+// catch-up convenience, not a bypass. ApplyChanges is unchanged.
+func (store *Store) ApplyChangesTolerant(ctx context.Context, schema Schema, changes []Change) error {
+	return store.applyChanges(ctx, schema, changes, true)
+}
+
+func (store *Store) applyChanges(ctx context.Context, schema Schema, changes []Change, tolerant bool) error {
 	ordered, err := OrderedChanges(changes)
 	if err != nil {
 		return err
@@ -67,7 +94,7 @@ func (store *Store) ApplyChanges(ctx context.Context, schema Schema, changes []C
 		if err != nil {
 			return err
 		}
-		if err := applyChange(ctx, tx, store.Target.Engine, table, change); err != nil {
+		if err := applyChange(ctx, tx, store.Target.Engine, table, change, tolerant); err != nil {
 			return err
 		}
 		if err := markChangeApplied(ctx, tx, store.Target.Engine, change); err != nil {
@@ -156,14 +183,40 @@ func markChangeApplied(ctx context.Context, tx *sql.Tx, engine Engine, change Ch
 	return err
 }
 
-func applyChange(ctx context.Context, tx *sql.Tx, engine Engine, table Table, change Change) error {
+func applyChange(ctx context.Context, tx *sql.Tx, engine Engine, table Table, change Change, tolerant bool) error {
 	switch change.Kind {
 	case Insert:
+		// In tolerant mode a row that already matches the change's final state
+		// was carried inside the snapshot (the overlap window): treat it as
+		// already applied. A row that exists but diverges is a genuine conflict.
+		if tolerant {
+			actual, found, err := loadRow(ctx, tx, engine, table, change.PrimaryKey)
+			if err != nil {
+				return err
+			}
+			if found {
+				if rowsEqual(change.After, actual) {
+					return nil
+				}
+				return &ConflictError{Table: table.Name, PrimaryKey: change.PrimaryKey, Expected: change.After, Actual: actual}
+			}
+		}
 		return insertRow(ctx, tx, engine, table, change.After)
 	case Update, Delete:
 		actual, found, err := loadRow(ctx, tx, engine, table, change.PrimaryKey)
 		if err != nil {
 			return err
+		}
+		if tolerant {
+			// Update whose final state already matches the destination was
+			// carried inside the snapshot even though Before no longer matches.
+			if change.Kind == Update && found && rowsEqual(change.After, actual) {
+				return nil
+			}
+			// Delete whose row is already gone was carried inside the snapshot.
+			if change.Kind == Delete && !found {
+				return nil
+			}
 		}
 		if !found || !rowsEqual(change.Before, actual) {
 			return &ConflictError{Table: table.Name, PrimaryKey: change.PrimaryKey, Expected: change.Before, Actual: actual}

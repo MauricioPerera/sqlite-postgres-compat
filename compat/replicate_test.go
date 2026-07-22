@@ -259,6 +259,150 @@ func replicationTestSchema(name string) Schema {
 	}}}
 }
 
+// TestApplyChangesTolerantSkipsInsertAlreadyPresent covers the overlap window
+// where an insert journaled after capture-install already traveled inside the
+// snapshot: the row exists and equals the change's after state, so the tolerant
+// mode treats it as already applied instead of failing on the unique constraint.
+func TestApplyChangesTolerantSkipsInsertAlreadyPresent(t *testing.T) {
+	ctx := context.Background()
+	schema := replicationTestSchema("tolerant_insert_items")
+	store, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB.Exec(`INSERT INTO tolerant_insert_items (id, title) VALUES (1, 'first')`); err != nil {
+		t.Fatal(err)
+	}
+	change := Change{
+		Source:     Target{Engine: Postgres, Version: Version{Major: 17}},
+		Sequence:   1,
+		Kind:       Insert,
+		Table:      "tolerant_insert_items",
+		PrimaryKey: Row{"id": {Kind: IntegerValue, Value: "1"}},
+		After:      Row{"id": {Kind: IntegerValue, Value: "1"}, "title": {Kind: TextValue, Value: "first"}},
+	}
+	if err := store.ApplyChangesTolerant(ctx, schema, []Change{change}); err != nil {
+		t.Fatalf("tolerant insert of an already-present identical row must succeed: %v", err)
+	}
+	var title string
+	if err := store.DB.QueryRow(`SELECT title FROM tolerant_insert_items WHERE id = 1`).Scan(&title); err != nil {
+		t.Fatal(err)
+	}
+	if title != "first" {
+		t.Fatalf("unexpected title %q", title)
+	}
+}
+
+// TestApplyChangesTolerantSkipsUpdateWhenAfterMatchesActual covers an update
+// whose Before no longer matches the destination (the snapshot already carried
+// the after state) but whose after state equals the current row: the tolerant
+// mode treats it as already applied rather than raising a ConflictError.
+func TestApplyChangesTolerantSkipsUpdateWhenAfterMatchesActual(t *testing.T) {
+	ctx := context.Background()
+	schema := replicationTestSchema("tolerant_update_items")
+	store, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB.Exec(`INSERT INTO tolerant_update_items (id, title) VALUES (1, 'updated')`); err != nil {
+		t.Fatal(err)
+	}
+	change := Change{
+		Source:     Target{Engine: Postgres, Version: Version{Major: 17}},
+		Sequence:   1,
+		Kind:       Update,
+		Table:      "tolerant_update_items",
+		PrimaryKey: Row{"id": {Kind: IntegerValue, Value: "1"}},
+		Before:     Row{"id": {Kind: IntegerValue, Value: "1"}, "title": {Kind: TextValue, Value: "stale-before"}},
+		After:      Row{"id": {Kind: IntegerValue, Value: "1"}, "title": {Kind: TextValue, Value: "updated"}},
+	}
+	if err := store.ApplyChangesTolerant(ctx, schema, []Change{change}); err != nil {
+		t.Fatalf("tolerant update whose after state matches actual must succeed: %v", err)
+	}
+	var title string
+	if err := store.DB.QueryRow(`SELECT title FROM tolerant_update_items WHERE id = 1`).Scan(&title); err != nil {
+		t.Fatal(err)
+	}
+	if title != "updated" {
+		t.Fatalf("unexpected title %q", title)
+	}
+}
+
+// TestApplyChangesTolerantStillDetectsGenuineConflict confirms the tolerant mode
+// is not a bypass: when the destination diverges from the change's final state
+// and Before no longer matches either, a strict ConflictError is raised.
+func TestApplyChangesTolerantStillDetectsGenuineConflict(t *testing.T) {
+	ctx := context.Background()
+	schema := replicationTestSchema("tolerant_conflict_items")
+	store, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB.Exec(`INSERT INTO tolerant_conflict_items (id, title) VALUES (1, 'local')`); err != nil {
+		t.Fatal(err)
+	}
+	change := Change{
+		Source:     Target{Engine: Postgres, Version: Version{Major: 17}},
+		Sequence:   1,
+		Kind:       Update,
+		Table:      "tolerant_conflict_items",
+		PrimaryKey: Row{"id": {Kind: IntegerValue, Value: "1"}},
+		Before:     Row{"id": {Kind: IntegerValue, Value: "1"}, "title": {Kind: TextValue, Value: "remote-before"}},
+		After:      Row{"id": {Kind: IntegerValue, Value: "1"}, "title": {Kind: TextValue, Value: "remote-after"}},
+	}
+	err = store.ApplyChangesTolerant(ctx, schema, []Change{change})
+	var conflict *ConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("expected ConflictError for genuine divergence, got %v", err)
+	}
+}
+
+// TestApplyChangesTolerantDedupStillIdempotent confirms the per-source dedup
+// table still governs reapplication in tolerant mode: a stream applied twice
+// does not reprocess changes the first pass recorded.
+func TestApplyChangesTolerantDedupStillIdempotent(t *testing.T) {
+	ctx := context.Background()
+	schema := replicationTestSchema("tolerant_dedup_items")
+	store, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	source := Target{Engine: Postgres, Version: Version{Major: 17}}
+	changes := []Change{
+		{Source: source, Sequence: 1, Kind: Insert, Table: "tolerant_dedup_items", PrimaryKey: Row{"id": {Kind: IntegerValue, Value: "1"}}, After: Row{"id": {Kind: IntegerValue, Value: "1"}, "title": {Kind: TextValue, Value: "first"}}},
+		{Source: source, Sequence: 2, Kind: Update, Table: "tolerant_dedup_items", PrimaryKey: Row{"id": {Kind: IntegerValue, Value: "1"}}, Before: Row{"id": {Kind: IntegerValue, Value: "1"}, "title": {Kind: TextValue, Value: "first"}}, After: Row{"id": {Kind: IntegerValue, Value: "1"}, "title": {Kind: TextValue, Value: "updated"}}},
+	}
+	if err := store.ApplyChangesTolerant(ctx, schema, changes); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyChangesTolerant(ctx, schema, changes); err != nil {
+		t.Fatal("reapplying a tolerant stream must be idempotent:", err)
+	}
+	var title string
+	if err := store.DB.QueryRow(`SELECT title FROM tolerant_dedup_items WHERE id = 1`).Scan(&title); err != nil {
+		t.Fatal(err)
+	}
+	if title != "updated" {
+		t.Fatalf("unexpected title %q", title)
+	}
+}
+
 // TestApplyChangesRejectsDestinationVectorDimensionMismatch exercises the
 // loadRow path: when the destination already holds a vector whose component
 // count does not match the declared dimension, reconstructing that row for a
