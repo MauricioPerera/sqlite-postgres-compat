@@ -55,7 +55,7 @@ El conteo vigente y las familias restantes se registran en [VALIDATION_REPORT.md
 - vistas, triggers y rutinas canónicas y externas traducibles;
 - inspección sin metadatos propios;
 - captura automática y replicación en ambas direcciones;
-- idempotencia, conflictos y supresión de ecos;
+- idempotencia y supresión de ecos;
 - limpieza de la base PostgreSQL temporal.
 
 ## Interpretación de fallos

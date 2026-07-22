@@ -6,7 +6,7 @@
 go run ./cmd/compat-audit .\contract.example.json
 ```
 
-La salida es JSON. El proceso termina con código `1` si cualquier capacidad requerida no es exacta.
+La salida es JSON. El proceso termina con código `1` si cualquier capacidad requerida no es exacta, y con código de salida 2 si el número de argumentos no es exactamente uno.
 
 ```json
 {
@@ -49,7 +49,7 @@ Ejecuta:
 go run ./cmd/compat-copy .\migration.example.json
 ```
 
-El flujo audita las capacidades inferidas, exporta el origen, importa el destino y vuelve a exportarlo para verificar su hash canónico. El destino debe estar vacío para los objetos descritos.
+El flujo audita las capacidades inferidas, exporta el origen, importa el destino y vuelve a exportarlo para verificar su hash canónico. El destino debe estar vacío para los objetos descritos. El proceso termina con código `1` ante cualquier error o falta de equivalencia exacta, y con código de salida 2 si el número de argumentos no es exactamente uno.
 
 ## Usar el paquete Go
 

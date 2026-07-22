@@ -454,7 +454,6 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 	if err != nil {
 		return Inspection{}, err
 	}
-	defer objects.Close()
 	for objects.Next() {
 		var kind, name string
 		var definition sql.NullString

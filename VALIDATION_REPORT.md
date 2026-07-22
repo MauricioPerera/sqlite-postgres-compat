@@ -40,7 +40,7 @@ La batería se ejecutó contra SQLite real y PostgreSQL 17.5 real proporcionado 
 - Lectura ordenada por cursor y supresión transaccional de ecos al aplicar cambios remotos.
 - Preservación de datos binarios en el journal automático.
 - Reintentos idempotentes de secuencias ya aplicadas.
-- Detección de conflictos antes de sobrescribir cambios divergentes.
+- Detección de conflictos antes de sobrescribir cambios divergentes (cubierta por la suite unitaria, no por la batería E2E).
 - Eliminación de las bases PostgreSQL temporales después de la prueba.
 
 ## Incumplimiento que permanece
