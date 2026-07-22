@@ -21,31 +21,26 @@ type migrationConfig struct {
 }
 
 func main() {
-	_, positional, unexpected, ok := cliout.SplitArgs(nil, os.Args[1:])
-	if !ok {
-		fmt.Fprintln(os.Stderr, "uso: compat-copy <migration.json>")
-		os.Exit(cliout.EmitError(cliout.ErrUsage, fmt.Sprintf("compat-copy: unexpected flag %q", unexpected)))
-	}
-	if len(positional) != 1 {
-		fmt.Fprintln(os.Stderr, "uso: compat-copy <migration.json>")
-		os.Exit(cliout.EmitError(cliout.ErrUsage, "compat-copy requires exactly one migration JSON argument"))
-	}
+	_, positional := cliout.ParseArgsStrict(nil, os.Args[1:], 1,
+		"uso: compat-copy <migration.json>",
+		"compat-copy: unexpected flag %q",
+		"compat-copy requires exactly one migration JSON argument")
 	var config migrationConfig
 	if err := cliout.DecodeFileStrict(positional[0], &config); err != nil {
-		fail(cliout.ErrConfig, err)
+		cliout.Die(cliout.ErrConfig, err)
 	}
 	schema, err := cliout.ResolveSchema(positional[0], config.SchemaRef, config.Schema)
 	if err != nil {
-		fail(cliout.ErrConfig, err)
+		cliout.Die(cliout.ErrConfig, err)
 	}
 	config.Schema = schema
 	if err := config.Schema.Validate(); err != nil {
-		fail(cliout.ErrSchema, err)
+		cliout.Die(cliout.ErrSchema, err)
 	}
 	config.Contract.RequiredFeatures = append(config.Contract.RequiredFeatures, compat.InferFeatures(config.Schema)...)
 	findings, err := compat.Audit(config.Contract)
 	if err != nil {
-		fail(cliout.ErrConfig, err)
+		cliout.Die(cliout.ErrConfig, err)
 	}
 	if err := compat.RequireExact(findings); err != nil {
 		// The full findings array is emitted to stderr before the typed error
@@ -55,41 +50,41 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		encoded, _ := json.Marshal(findings)
 		fmt.Fprintln(os.Stderr, string(encoded))
-		fail(cliout.ErrAuditNotExact, err)
+		cliout.Die(cliout.ErrAuditNotExact, err)
 	}
 
 	ctx := context.Background()
 	source, err := compat.OpenStore(config.Contract.Source, config.SourceDSN)
 	if err != nil {
-		fail(cliout.ErrConnectSource, err)
+		cliout.Die(cliout.ErrConnectSource, err)
 	}
 	defer source.Close()
 	if err := source.DB.PingContext(ctx); err != nil {
-		fail(cliout.ErrConnectSource, err)
+		cliout.Die(cliout.ErrConnectSource, err)
 	}
 	destination, err := compat.OpenStore(config.Contract.Destination, config.DestinationDSN)
 	if err != nil {
-		fail(cliout.ErrConnectDestination, err)
+		cliout.Die(cliout.ErrConnectDestination, err)
 	}
 	defer destination.Close()
 	if err := destination.DB.PingContext(ctx); err != nil {
-		fail(cliout.ErrConnectDestination, err)
+		cliout.Die(cliout.ErrConnectDestination, err)
 	}
 
 	snapshot, err := source.ExportSnapshot(ctx, config.Schema)
 	if err != nil {
-		fail(cliout.ErrSnapshot, err)
+		cliout.Die(cliout.ErrSnapshot, err)
 	}
 	if err := destination.ImportSnapshot(ctx, snapshot); err != nil {
-		fail(cliout.ErrSnapshot, err)
+		cliout.Die(cliout.ErrSnapshot, err)
 	}
 	destinationSnapshot, err := destination.ExportSnapshot(ctx, config.Schema)
 	if err != nil {
-		fail(cliout.ErrSnapshot, err)
+		cliout.Die(cliout.ErrSnapshot, err)
 	}
 	report, err := compat.VerifySnapshots(snapshot, destinationSnapshot)
 	if err != nil {
-		fail(cliout.ErrInternal, err)
+		cliout.Die(cliout.ErrInternal, err)
 	}
 	if err := compat.RequireEquivalent(report); err != nil {
 		// The structured VerificationReport (carrying both digests) is emitted to
@@ -99,16 +94,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		encoded, _ := json.Marshal(report)
 		fmt.Fprintln(os.Stderr, string(encoded))
-		fail(cliout.ErrVerifyDiverged, err)
+		cliout.Die(cliout.ErrVerifyDiverged, err)
 	}
 	if err := cliout.EmitJSON(report); err != nil {
-		fail(cliout.ErrInternal, err)
+		cliout.Die(cliout.ErrInternal, err)
 	}
-}
-
-// fail prints the error to stderr, emits the typed error JSON to stdout, and
-// exits with the code's canonical exit status. It does not return.
-func fail(code cliout.ErrorCode, err error) {
-	fmt.Fprintln(os.Stderr, err)
-	os.Exit(cliout.EmitErrorFrom(code, err))
 }

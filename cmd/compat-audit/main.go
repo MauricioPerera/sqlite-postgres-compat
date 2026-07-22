@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 
 	"example.com/sqlite-postgres-compat/cmd/internal/cliout"
@@ -9,34 +8,25 @@ import (
 )
 
 func main() {
-	_, positional, unexpected, ok := cliout.SplitArgs(nil, os.Args[1:])
-	if !ok {
-		fmt.Fprintln(os.Stderr, "uso: compat-audit <contract.json>")
-		os.Exit(cliout.EmitError(cliout.ErrUsage, fmt.Sprintf("compat-audit: unexpected flag %q", unexpected)))
-	}
-	if len(positional) != 1 {
-		fmt.Fprintln(os.Stderr, "uso: compat-audit <contract.json>")
-		os.Exit(cliout.EmitError(cliout.ErrUsage, "compat-audit requires exactly one contract JSON argument"))
-	}
+	_, positional := cliout.ParseArgsStrict(nil, os.Args[1:], 1,
+		"uso: compat-audit <contract.json>",
+		"compat-audit: unexpected flag %q",
+		"compat-audit requires exactly one contract JSON argument")
 
 	var contract compat.Contract
 	if err := cliout.DecodeFileStrict(positional[0], &contract); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(cliout.EmitError(cliout.ErrConfig, err.Error()))
+		cliout.Die(cliout.ErrConfig, err)
 	}
 	findings, err := compat.Audit(contract)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(cliout.EmitError(cliout.ErrConfig, err.Error()))
+		cliout.Die(cliout.ErrConfig, err)
 	}
 	// The feature findings are always emitted first so an agent can inspect the
 	// per-feature verdicts even when the audit is not exact.
 	if err := cliout.EmitJSON(findings); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(cliout.EmitError(cliout.ErrInternal, err.Error()))
+		cliout.Die(cliout.ErrInternal, err)
 	}
 	if err := compat.RequireExact(findings); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(cliout.EmitError(cliout.ErrAuditNotExact, err.Error()))
+		cliout.Die(cliout.ErrAuditNotExact, err)
 	}
 }

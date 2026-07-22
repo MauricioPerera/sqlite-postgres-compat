@@ -94,6 +94,21 @@ func EmitErrorFrom(code ErrorCode, err error) int {
 	return EmitError(code, err.Error())
 }
 
+// Die writes err to stderr, emits the typed error envelope for err on stdout, and
+// exits with the code's canonical process status. It is the non-returning
+// counterpart to EmitErrorFrom and centralizes the "log to stderr, emit envelope
+// to stdout, os.Exit" pattern shared by every compat CLI's error path. A nil err
+// is rendered as the code itself (mirroring EmitErrorFrom); callers always pass a
+// non-nil error in practice.
+//
+// Die does not return, so any code after a Die call is unreachable to the
+// compiler's flow analysis — there is no need for an explicit return statement
+// following it.
+func Die(code ErrorCode, err error) {
+	fmt.Fprintln(os.Stderr, err)
+	os.Exit(EmitErrorFrom(code, err))
+}
+
 // EmitJSON marshals v to compact, single-line JSON and writes it to stdout with
 // a trailing newline. It is the success-path counterpart to EmitError.
 func EmitJSON(v any) error {
@@ -133,6 +148,34 @@ func SplitArgs(knownFlags []string, args []string) (present map[string]bool, pos
 		positional = append(positional, a)
 	}
 	return present, positional, "", true
+}
+
+// ParseArgsStrict is the shared front-end of every compat CLI: it partitions
+// args into known boolean flags and positional arguments, rejects any unknown
+// leading-dash token as ERR_USAGE (exit 2), and requires exactly wantN
+// positional arguments. On a violation it prints hint to stderr, emits the
+// ERR_USAGE envelope to stdout, and exits — it never returns on a violation. On
+// success it returns the recognized flags that were seen and the positional
+// tokens in order; the caller owns any flag-specific logic (e.g. --dry-run).
+//
+// hint is the stderr usage hint printed before the envelope; unexpectedMsg is
+// the envelope message for an unexpected flag (formatted with %q and the
+// offending token); countMsg is the envelope message for a wrong positional
+// count. They are caller-supplied so each CLI keeps its existing, documented
+// usage strings and envelope messages byte-for-byte — this helper only removes
+// the duplicated SplitArgs + fmt.Fprintln + os.Exit plumbing, never the
+// observable text or exit codes.
+func ParseArgsStrict(knownFlags, args []string, wantN int, hint, unexpectedMsg, countMsg string) (present map[string]bool, positional []string) {
+	present, positional, unexpected, ok := SplitArgs(knownFlags, args)
+	if !ok {
+		fmt.Fprintln(os.Stderr, hint)
+		Die(ErrUsage, fmt.Errorf(unexpectedMsg, unexpected))
+	}
+	if len(positional) != wantN {
+		fmt.Fprintln(os.Stderr, hint)
+		Die(ErrUsage, errors.New(countMsg))
+	}
+	return present, positional
 }
 
 // DecodeFileStrict reads path and decodes it into v using a json.Decoder with

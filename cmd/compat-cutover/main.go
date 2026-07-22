@@ -80,27 +80,22 @@ type planTable struct {
 var cutoverPhases = []string{"install_capture", "snapshot", "catch_up", "verify"}
 
 func main() {
-	present, positional, unexpected, ok := cliout.SplitArgs([]string{"--dry-run"}, os.Args[1:])
-	if !ok {
-		usage()
-		os.Exit(cliout.EmitError(cliout.ErrUsage, fmt.Sprintf("compat-cutover: unexpected flag %q", unexpected)))
-	}
+	present, positional := cliout.ParseArgsStrict([]string{"--dry-run"}, os.Args[1:], 1,
+		"uso: compat-cutover [--dry-run] <cutover.json>\nel corte del DSN de la aplicación no es responsabilidad de esta herramienta: cortá la conexión de la app manualmente tras recibir status=ready.",
+		"compat-cutover: unexpected flag %q",
+		"usage: compat-cutover [--dry-run] <cutover.json>")
 	dryRun := present["--dry-run"]
-	if len(positional) != 1 {
-		usage()
-		os.Exit(cliout.EmitError(cliout.ErrUsage, "usage: compat-cutover [--dry-run] <cutover.json>"))
-	}
 	var config cutoverConfig
 	if err := cliout.DecodeFileStrict(positional[0], &config); err != nil {
-		fail(cliout.ErrConfig, err)
+		cliout.Die(cliout.ErrConfig, err)
 	}
 	schema, err := cliout.ResolveSchema(positional[0], config.SchemaRef, config.Schema)
 	if err != nil {
-		fail(cliout.ErrConfig, err)
+		cliout.Die(cliout.ErrConfig, err)
 	}
 	config.Schema = schema
 	if err := config.Schema.Validate(); err != nil {
-		fail(cliout.ErrSchema, err)
+		cliout.Die(cliout.ErrSchema, err)
 	}
 	options := config.Options.withDefaults()
 
@@ -109,13 +104,13 @@ func main() {
 	config.Contract.RequiredFeatures = append(config.Contract.RequiredFeatures, compat.InferFeatures(config.Schema)...)
 	findings, err := compat.Audit(config.Contract)
 	if err != nil {
-		fail(cliout.ErrConfig, err)
+		cliout.Die(cliout.ErrConfig, err)
 	}
 	if err := compat.RequireExact(findings); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		encoded, _ := json.Marshal(findings)
 		fmt.Fprintln(os.Stderr, string(encoded))
-		fail(cliout.ErrAuditNotExact, err)
+		cliout.Die(cliout.ErrAuditNotExact, err)
 	}
 	logf("audit: exact coverage for %d required features", len(findings))
 
@@ -128,19 +123,19 @@ func main() {
 
 	source, err := compat.OpenStore(config.Contract.Source, config.SourceDSN)
 	if err != nil {
-		fail(cliout.ErrConnectSource, err)
+		cliout.Die(cliout.ErrConnectSource, err)
 	}
 	defer source.Close()
 	if err := source.DB.PingContext(ctx); err != nil {
-		fail(cliout.ErrConnectSource, err)
+		cliout.Die(cliout.ErrConnectSource, err)
 	}
 	destination, err := compat.OpenStore(config.Contract.Destination, config.DestinationDSN)
 	if err != nil {
-		fail(cliout.ErrConnectDestination, err)
+		cliout.Die(cliout.ErrConnectDestination, err)
 	}
 	defer destination.Close()
 	if err := destination.DB.PingContext(ctx); err != nil {
-		fail(cliout.ErrConnectDestination, err)
+		cliout.Die(cliout.ErrConnectDestination, err)
 	}
 
 	// The destination schema and rows are brought up together by ImportSnapshot
@@ -150,36 +145,36 @@ func main() {
 	// and fail with "table already exists" on a fresh destination.
 
 	if err := source.InstallChangeCapture(ctx, config.Schema); err != nil {
-		fail(cliout.ErrCapture, err)
+		cliout.Die(cliout.ErrCapture, err)
 	}
 	logf("capture: change capture installed on source")
 
 	snapshot, err := source.ExportSnapshot(ctx, config.Schema)
 	if err != nil {
-		fail(cliout.ErrSnapshot, err)
+		cliout.Die(cliout.ErrSnapshot, err)
 	}
 	if err := destination.ImportSnapshot(ctx, snapshot); err != nil {
-		fail(cliout.ErrSnapshot, err)
+		cliout.Die(cliout.ErrSnapshot, err)
 	}
 	logf("snapshot: imported into destination")
 
 	applied, code, err := drainChanges(ctx, source, destination, config.Schema, options)
 	if err != nil {
-		fail(code, err)
+		cliout.Die(code, err)
 	}
 	logf("catch-up: drained after %d changes", applied)
 
 	sourceSnapshot, err := source.ExportSnapshot(ctx, config.Schema)
 	if err != nil {
-		fail(cliout.ErrSnapshot, err)
+		cliout.Die(cliout.ErrSnapshot, err)
 	}
 	destinationSnapshot, err := destination.ExportSnapshot(ctx, config.Schema)
 	if err != nil {
-		fail(cliout.ErrSnapshot, err)
+		cliout.Die(cliout.ErrSnapshot, err)
 	}
 	report, err := compat.VerifySnapshots(sourceSnapshot, destinationSnapshot)
 	if err != nil {
-		fail(cliout.ErrInternal, err)
+		cliout.Die(cliout.ErrInternal, err)
 	}
 	out := cutoverReport{
 		SourceDigest:      report.SourceDigest,
@@ -193,7 +188,7 @@ func main() {
 		out.Code = string(cliout.ErrVerifyDiverged)
 	}
 	if err := cliout.EmitJSON(out); err != nil {
-		fail(cliout.ErrInternal, err)
+		cliout.Die(cliout.ErrInternal, err)
 	}
 	if !report.Equivalent {
 		os.Exit(1)
@@ -207,26 +202,26 @@ func main() {
 func runDryRun(ctx context.Context, config cutoverConfig, findings []compat.Finding) {
 	source, err := compat.OpenStore(config.Contract.Source, config.SourceDSN)
 	if err != nil {
-		fail(cliout.ErrConnectSource, err)
+		cliout.Die(cliout.ErrConnectSource, err)
 	}
 	defer source.Close()
 	if err := source.DB.PingContext(ctx); err != nil {
-		fail(cliout.ErrConnectSource, err)
+		cliout.Die(cliout.ErrConnectSource, err)
 	}
 	destination, err := compat.OpenStore(config.Contract.Destination, config.DestinationDSN)
 	if err != nil {
-		fail(cliout.ErrConnectDestination, err)
+		cliout.Die(cliout.ErrConnectDestination, err)
 	}
 	defer destination.Close()
 	if err := destination.DB.PingContext(ctx); err != nil {
-		fail(cliout.ErrConnectDestination, err)
+		cliout.Die(cliout.ErrConnectDestination, err)
 	}
 
 	sourceTables := make([]planTable, 0, len(config.Schema.Tables))
 	for _, table := range config.Schema.Tables {
 		rows, err := countRows(ctx, source, table.Name)
 		if err != nil {
-			fail(cliout.ErrInternal, fmt.Errorf("inspect source %s: %w", table.Name, err))
+			cliout.Die(cliout.ErrInternal, fmt.Errorf("inspect source %s: %w", table.Name, err))
 		}
 		sourceTables = append(sourceTables, planTable{Name: table.Name, Rows: rows})
 	}
@@ -237,7 +232,7 @@ func runDryRun(ctx context.Context, config cutoverConfig, findings []compat.Find
 	for _, table := range config.Schema.Tables {
 		exists, err := tableExists(ctx, destination, table.Name)
 		if err != nil {
-			fail(cliout.ErrInternal, fmt.Errorf("inspect destination %s: %w", table.Name, err))
+			cliout.Die(cliout.ErrInternal, fmt.Errorf("inspect destination %s: %w", table.Name, err))
 		}
 		if !exists {
 			destinationHasTables = false
@@ -252,7 +247,7 @@ func runDryRun(ctx context.Context, config cutoverConfig, findings []compat.Find
 		Phases:               cutoverPhases,
 	}
 	if err := cliout.EmitJSON(plan); err != nil {
-		fail(cliout.ErrInternal, err)
+		cliout.Die(cliout.ErrInternal, err)
 	}
 }
 
@@ -320,18 +315,6 @@ func drainChanges(ctx context.Context, source, destination *compat.Store, schema
 		applied += len(changes)
 		cursor = changes[len(changes)-1].Sequence
 	}
-}
-
-func usage() {
-	fmt.Fprintln(os.Stderr, "uso: compat-cutover [--dry-run] <cutover.json>")
-	fmt.Fprintln(os.Stderr, "el corte del DSN de la aplicación no es responsabilidad de esta herramienta: cortá la conexión de la app manualmente tras recibir status=ready.")
-}
-
-// fail prints the error to stderr, emits the typed error JSON to stdout, and
-// exits with the code's canonical exit status. It does not return.
-func fail(code cliout.ErrorCode, err error) {
-	fmt.Fprintln(os.Stderr, err)
-	os.Exit(cliout.EmitErrorFrom(code, err))
 }
 
 func logf(format string, args ...any) {
