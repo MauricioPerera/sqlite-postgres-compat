@@ -262,80 +262,15 @@ func compileExpressionIn(engine Engine, expression Expression, inTrigger bool) (
 		}
 		return "", fmt.Errorf("invalid boolean %q", expression.Value)
 	case "column":
-		parts := strings.Split(expression.Value, ".")
-		for i, part := range parts {
-			if part == "" {
-				return "", fmt.Errorf("invalid column %q", expression.Value)
-			}
-			// Only inside a trigger does a leading new/old segment denote the
-			// NEW/OLD transition variable, emitted unquoted and uppercased as
-			// the dialect expects. Everywhere else (CHECK, index WHERE, column
-			// DEFAULT, views) new/old are ordinary column names and must be
-			// quoted, so a column literally named "New" is not folded to the
-			// nonexistent "new" by PostgreSQL's identifier casing rules.
-			if inTrigger && i == 0 && (strings.EqualFold(part, "new") || strings.EqualFold(part, "old")) {
-				parts[i] = strings.ToUpper(part)
-			} else {
-				parts[i] = quoteIdentifier(part)
-			}
-		}
-		return strings.Join(parts, "."), nil
+		return compileColumnExpression(expression.Value, inTrigger)
 	case "star":
 		return "*", nil
 	case "and", "or", "eq", "ne", "lt", "lte", "gt", "gte", "add", "sub", "mul", "div", "like", "concat":
-		if len(expression.Args) != 2 {
-			return "", fmt.Errorf("expression %q requires two arguments", expression.Kind)
-		}
-		left, err := compileExpressionIn(engine, expression.Args[0], inTrigger)
-		if err != nil {
-			return "", err
-		}
-		right, err := compileExpressionIn(engine, expression.Args[1], inTrigger)
-		if err != nil {
-			return "", err
-		}
-		operators := map[string]string{
-			"and": "AND", "or": "OR", "eq": "=", "ne": "<>", "lt": "<", "lte": "<=", "gt": ">", "gte": ">=",
-			"add": "+", "sub": "-", "mul": "*", "div": "/", "concat": "||",
-		}
-		// SQLite's LIKE is case-insensitive (ASCII) by default, while Postgres's
-		// LIKE is case-sensitive. Compile to ILIKE on Postgres to preserve the
-		// SQLite semantics. Note: ILIKE is case-insensitive across the full
-		// Unicode range, whereas SQLite only folds ASCII — this is the standard
-		// pragmatic mapping, accepted as a known trade-off.
-		if expression.Kind == "like" {
-			operator := "LIKE"
-			if engine == Postgres {
-				operator = "ILIKE"
-			}
-			return "(" + left + " " + operator + " " + right + ")", nil
-		}
-		return "(" + left + " " + operators[expression.Kind] + " " + right + ")", nil
+		return compileBinaryExpression(engine, expression, inTrigger)
 	case "not", "is_null", "is_not_null":
-		if len(expression.Args) != 1 {
-			return "", fmt.Errorf("expression %q requires one argument", expression.Kind)
-		}
-		argument, err := compileExpressionIn(engine, expression.Args[0], inTrigger)
-		if err != nil {
-			return "", err
-		}
-		switch expression.Kind {
-		case "not":
-			return "(NOT " + argument + ")", nil
-		case "is_null":
-			return "(" + argument + " IS NULL)", nil
-		default:
-			return "(" + argument + " IS NOT NULL)", nil
-		}
+		return compileUnaryExpression(engine, expression, inTrigger)
 	case "count", "sum", "avg", "min", "max", "lower", "upper", "length", "abs", "trim":
-		if len(expression.Args) != 1 {
-			return "", fmt.Errorf("function %q requires one argument", expression.Kind)
-		}
-		argument, err := compileExpressionIn(engine, expression.Args[0], inTrigger)
-		if err != nil {
-			return "", err
-		}
-		return strings.ToUpper(expression.Kind) + "(" + argument + ")", nil
+		return compileScalarFunction(engine, expression, inTrigger)
 	case "coalesce":
 		if len(expression.Args) < 1 {
 			return "", fmt.Errorf("function %q requires at least one argument", expression.Kind)
@@ -357,6 +292,96 @@ func compileExpressionIn(engine Engine, expression Expression, inTrigger bool) (
 	default:
 		return "", fmt.Errorf("expression %q has no compiler", expression.Kind)
 	}
+}
+
+// compileColumnExpression compiles a column reference, splitting on dots and
+// quoting each segment.
+//
+// Only inside a trigger does a leading new/old segment denote the NEW/OLD
+// transition variable, emitted unquoted and uppercased as the dialect
+// expects. Everywhere else (CHECK, index WHERE, column DEFAULT, views) new/old
+// are ordinary column names and must be quoted, so a column literally named
+// "New" is not folded to the nonexistent "new" by PostgreSQL's identifier
+// casing rules.
+func compileColumnExpression(value string, inTrigger bool) (string, error) {
+	parts := strings.Split(value, ".")
+	for i, part := range parts {
+		if part == "" {
+			return "", fmt.Errorf("invalid column %q", value)
+		}
+		if inTrigger && i == 0 && (strings.EqualFold(part, "new") || strings.EqualFold(part, "old")) {
+			parts[i] = strings.ToUpper(part)
+		} else {
+			parts[i] = quoteIdentifier(part)
+		}
+	}
+	return strings.Join(parts, "."), nil
+}
+
+// compileBinaryExpression compiles a two-argument operator expression.
+//
+// SQLite's LIKE is case-insensitive (ASCII) by default, while Postgres's LIKE
+// is case-sensitive. Compile to ILIKE on Postgres to preserve the SQLite
+// semantics. Note: ILIKE is case-insensitive across the full Unicode range,
+// whereas SQLite only folds ASCII — this is the standard pragmatic mapping,
+// accepted as a known trade-off.
+func compileBinaryExpression(engine Engine, expression Expression, inTrigger bool) (string, error) {
+	if len(expression.Args) != 2 {
+		return "", fmt.Errorf("expression %q requires two arguments", expression.Kind)
+	}
+	left, err := compileExpressionIn(engine, expression.Args[0], inTrigger)
+	if err != nil {
+		return "", err
+	}
+	right, err := compileExpressionIn(engine, expression.Args[1], inTrigger)
+	if err != nil {
+		return "", err
+	}
+	operators := map[string]string{
+		"and": "AND", "or": "OR", "eq": "=", "ne": "<>", "lt": "<", "lte": "<=", "gt": ">", "gte": ">=",
+		"add": "+", "sub": "-", "mul": "*", "div": "/", "concat": "||",
+	}
+	if expression.Kind == "like" {
+		operator := "LIKE"
+		if engine == Postgres {
+			operator = "ILIKE"
+		}
+		return "(" + left + " " + operator + " " + right + ")", nil
+	}
+	return "(" + left + " " + operators[expression.Kind] + " " + right + ")", nil
+}
+
+// compileUnaryExpression compiles a one-argument prefix expression (NOT,
+// IS NULL, IS NOT NULL).
+func compileUnaryExpression(engine Engine, expression Expression, inTrigger bool) (string, error) {
+	if len(expression.Args) != 1 {
+		return "", fmt.Errorf("expression %q requires one argument", expression.Kind)
+	}
+	argument, err := compileExpressionIn(engine, expression.Args[0], inTrigger)
+	if err != nil {
+		return "", err
+	}
+	switch expression.Kind {
+	case "not":
+		return "(NOT " + argument + ")", nil
+	case "is_null":
+		return "(" + argument + " IS NULL)", nil
+	default:
+		return "(" + argument + " IS NOT NULL)", nil
+	}
+}
+
+// compileScalarFunction compiles a single-argument scalar function such as
+// COUNT or LOWER, rendering the kind uppercased with its compiled argument.
+func compileScalarFunction(engine Engine, expression Expression, inTrigger bool) (string, error) {
+	if len(expression.Args) != 1 {
+		return "", fmt.Errorf("function %q requires one argument", expression.Kind)
+	}
+	argument, err := compileExpressionIn(engine, expression.Args[0], inTrigger)
+	if err != nil {
+		return "", err
+	}
+	return strings.ToUpper(expression.Kind) + "(" + argument + ")", nil
 }
 
 // compileExpressionArgs compiles each argument expression, returning the

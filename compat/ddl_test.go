@@ -550,3 +550,33 @@ func TestCompileNonTriggerNewOldColumnIsQuoted(t *testing.T) {
 		}
 	}
 }
+
+// TestCompileColumnExpressionGatesTriggerNewOld pins the inTrigger behavior of
+// the extracted column compiler directly: a leading new/old segment is the
+// trigger transition variable only when inTrigger is set, and every other
+// segment is quoted (preserving the case of a column literally named "New").
+func TestCompileColumnExpressionGatesTriggerNewOld(t *testing.T) {
+	cases := []struct {
+		value     string
+		inTrigger bool
+		want      string
+	}{
+		{"new.amount", true, `NEW."amount"`},
+		{"OLD.code", true, `OLD."code"`},
+		{"a.new", true, `"a"."new"`}, // only the leading segment is magic
+		{"New", false, `"New"`},      // case preserved, quoted, not folded to NEW
+		{"a.b", false, `"a"."b"`},
+	}
+	for _, tc := range cases {
+		got, err := compileColumnExpression(tc.value, tc.inTrigger)
+		if err != nil {
+			t.Fatalf("compileColumnExpression(%q,%v): %v", tc.value, tc.inTrigger, err)
+		}
+		if got != tc.want {
+			t.Fatalf("compileColumnExpression(%q,%v) = %q; want %q", tc.value, tc.inTrigger, got, tc.want)
+		}
+	}
+	if _, err := compileColumnExpression(".x", false); err == nil {
+		t.Fatal("expected error for empty leading segment, got nil")
+	}
+}

@@ -6,26 +6,27 @@ import (
 	"strings"
 )
 
+// catalogClause pairs a trailing SELECT keyword with the routine that applies
+// its text to the query being built.
+type catalogClause struct {
+	keyword string
+	apply   func(string) error
+}
+
+// locatedClause records where a trailing keyword was found and which clause it
+// belongs to, so clauses can be applied in source order regardless of the
+// order they were declared in.
+type locatedClause struct {
+	position int
+	index    int
+}
+
 // parseCatalogSelect parses the shared, deliberately bounded SELECT grammar
 // used for external views. Unsupported clauses are rejected explicitly.
 func parseCatalogSelect(definition string) (SelectQuery, error) {
-	text := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(definition), ";"))
-	upper := strings.ToUpper(text)
-	if strings.HasPrefix(upper, "CREATE ") {
-		position := strings.Index(upper, " AS SELECT ")
-		if position < 0 {
-			return SelectQuery{}, fmt.Errorf("view definition has no AS SELECT")
-		}
-		text = strings.TrimSpace(text[position+len(" AS "):])
-	}
-	if !strings.HasPrefix(strings.ToUpper(text), "SELECT ") {
-		return SelectQuery{}, fmt.Errorf("view definition is not SELECT")
-	}
-	body := strings.TrimSpace(text[len("SELECT "):])
-	query := SelectQuery{}
-	if strings.HasPrefix(strings.ToUpper(body), "DISTINCT ") {
-		query.Distinct = true
-		body = strings.TrimSpace(body[len("DISTINCT "):])
+	body, distinct, err := stripCatalogSelectHeader(definition)
+	if err != nil {
+		return SelectQuery{}, err
 	}
 	fromPosition := topLevelKeyword(body, "FROM")
 	if fromPosition < 0 {
@@ -34,10 +35,62 @@ func parseCatalogSelect(definition string) (SelectQuery, error) {
 	projectionText := strings.TrimSpace(body[:fromPosition])
 	remainder := strings.TrimSpace(body[fromPosition+len("FROM"):])
 
-	clauses := []struct {
-		keyword string
-		apply   func(string) error
-	}{
+	query := SelectQuery{Distinct: distinct}
+	clauses := catalogSelectClauses(&query)
+	located := locateCatalogClauses(remainder, clauses)
+
+	sourceEnd := len(remainder)
+	if len(located) > 0 {
+		sourceEnd = located[0].position
+	}
+	source, joins, err := parseCatalogFrom(strings.TrimSpace(remainder[:sourceEnd]))
+	if err != nil {
+		return SelectQuery{}, err
+	}
+	query.From = source
+	query.Joins = joins
+
+	if err := applyCatalogClauses(&query, remainder, clauses, located); err != nil {
+		return SelectQuery{}, err
+	}
+	if err := parseCatalogProjections(&query, projectionText); err != nil {
+		return SelectQuery{}, err
+	}
+	if len(query.Columns) == 0 {
+		return SelectQuery{}, fmt.Errorf("SELECT has no projections")
+	}
+	return query, nil
+}
+
+// stripCatalogSelectHeader trims the definition, strips an optional
+// "CREATE VIEW ... AS" prefix, and removes the leading SELECT/DISTINCT
+// keywords, returning the body to be parsed for FROM and projections and the
+// DISTINCT flag.
+func stripCatalogSelectHeader(definition string) (body string, distinct bool, err error) {
+	text := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(definition), ";"))
+	upper := strings.ToUpper(text)
+	if strings.HasPrefix(upper, "CREATE ") {
+		position := strings.Index(upper, " AS SELECT ")
+		if position < 0 {
+			return "", false, fmt.Errorf("view definition has no AS SELECT")
+		}
+		text = strings.TrimSpace(text[position+len(" AS "):])
+	}
+	if !strings.HasPrefix(strings.ToUpper(text), "SELECT ") {
+		return "", false, fmt.Errorf("view definition is not SELECT")
+	}
+	body = strings.TrimSpace(text[len("SELECT "):])
+	if strings.HasPrefix(strings.ToUpper(body), "DISTINCT ") {
+		distinct = true
+		body = strings.TrimSpace(body[len("DISTINCT "):])
+	}
+	return body, distinct, nil
+}
+
+// catalogSelectClauses returns the ordered set of trailing clauses the grammar
+// recognizes, each bound to the query being assembled.
+func catalogSelectClauses(query *SelectQuery) []catalogClause {
+	return []catalogClause{
 		{"WHERE", func(value string) error {
 			expression, err := parseCatalogExpression(value)
 			query.Where = &expression
@@ -58,58 +111,16 @@ func parseCatalogSelect(definition string) (SelectQuery, error) {
 			query.Having = &expression
 			return err
 		}},
-		{"ORDER BY", func(value string) error {
-			for _, item := range splitTopLevelComma(value) {
-				item = strings.TrimSpace(item)
-				descending := false
-				upperItem := strings.ToUpper(item)
-				if strings.HasSuffix(upperItem, " DESC") {
-					descending = true
-					item = strings.TrimSpace(item[:len(item)-len(" DESC")])
-				} else if strings.HasSuffix(upperItem, " ASC") {
-					item = strings.TrimSpace(item[:len(item)-len(" ASC")])
-				}
-				expression, err := parseCatalogExpression(item)
-				if err != nil {
-					return err
-				}
-				query.OrderBy = append(query.OrderBy, Ordering{Expression: expression, Descending: descending})
-			}
-			return nil
-		}},
-		{"LIMIT", func(value string) error {
-			number, err := strconv.Atoi(strings.TrimSpace(value))
-			if err != nil {
-				return err
-			}
-			// SQLite treats a negative LIMIT as "no limit", a semantics this
-			// compatibility layer cannot preserve. Reject it explicitly at
-			// parse time instead of accepting it silently.
-			if number < 0 {
-				return fmt.Errorf("unsupported negative LIMIT %d", number)
-			}
-			query.Limit = &number
-			return nil
-		}},
-		{"OFFSET", func(value string) error {
-			number, err := strconv.Atoi(strings.TrimSpace(value))
-			if err != nil {
-				return err
-			}
-			// A negative OFFSET has no portable meaning here; reject it
-			// explicitly at parse time rather than accepting it silently.
-			if number < 0 {
-				return fmt.Errorf("unsupported negative OFFSET %d", number)
-			}
-			query.Offset = &number
-			return nil
-		}},
+		{"ORDER BY", func(value string) error { return applyOrderByClause(query, value) }},
+		{"LIMIT", func(value string) error { return applyLimitClause(query, value) }},
+		{"OFFSET", func(value string) error { return applyOffsetClause(query, value) }},
 	}
+}
 
-	type locatedClause struct {
-		position int
-		index    int
-	}
+// locateCatalogClauses finds the position of each recognized keyword in the
+// remainder and returns the matches sorted by position so the source is split
+// left to right.
+func locateCatalogClauses(remainder string, clauses []catalogClause) []locatedClause {
 	var located []locatedClause
 	for i, clause := range clauses {
 		if position := topLevelKeyword(remainder, clause.keyword); position >= 0 {
@@ -123,16 +134,12 @@ func parseCatalogSelect(definition string) (SelectQuery, error) {
 			}
 		}
 	}
-	sourceEnd := len(remainder)
-	if len(located) > 0 {
-		sourceEnd = located[0].position
-	}
-	source, joins, err := parseCatalogFrom(strings.TrimSpace(remainder[:sourceEnd]))
-	if err != nil {
-		return SelectQuery{}, err
-	}
-	query.From = source
-	query.Joins = joins
+	return located
+}
+
+// applyCatalogClauses splits the remainder into per-clause spans (delimited by
+// the located keywords, in source order) and applies each clause's handler.
+func applyCatalogClauses(query *SelectQuery, remainder string, clauses []catalogClause, located []locatedClause) error {
 	for i, current := range located {
 		start := current.position + len(clauses[current.index].keyword)
 		end := len(remainder)
@@ -140,22 +147,76 @@ func parseCatalogSelect(definition string) (SelectQuery, error) {
 			end = located[i+1].position
 		}
 		if err := clauses[current.index].apply(strings.TrimSpace(remainder[start:end])); err != nil {
-			return SelectQuery{}, err
+			return err
 		}
 	}
+	return nil
+}
 
+// parseCatalogProjections splits the projection list and appends each parsed
+// projection (with its alias) to the query.
+func parseCatalogProjections(query *SelectQuery, projectionText string) error {
 	for _, item := range splitTopLevelComma(projectionText) {
 		expressionText, alias := splitProjectionAlias(item)
 		expression, err := parseCatalogExpression(expressionText)
 		if err != nil {
-			return SelectQuery{}, err
+			return err
 		}
 		query.Columns = append(query.Columns, Projection{Expression: expression, Alias: alias})
 	}
-	if len(query.Columns) == 0 {
-		return SelectQuery{}, fmt.Errorf("SELECT has no projections")
+	return nil
+}
+
+// applyOrderByClause parses a comma-separated ORDER BY list, stripping the
+// optional ASC/DESC suffix from each item.
+func applyOrderByClause(query *SelectQuery, value string) error {
+	for _, item := range splitTopLevelComma(value) {
+		item = strings.TrimSpace(item)
+		descending := false
+		upperItem := strings.ToUpper(item)
+		if strings.HasSuffix(upperItem, " DESC") {
+			descending = true
+			item = strings.TrimSpace(item[:len(item)-len(" DESC")])
+		} else if strings.HasSuffix(upperItem, " ASC") {
+			item = strings.TrimSpace(item[:len(item)-len(" ASC")])
+		}
+		expression, err := parseCatalogExpression(item)
+		if err != nil {
+			return err
+		}
+		query.OrderBy = append(query.OrderBy, Ordering{Expression: expression, Descending: descending})
 	}
-	return query, nil
+	return nil
+}
+
+// applyLimitClause parses a non-negative LIMIT value. SQLite treats a negative
+// LIMIT as "no limit", a semantics this compatibility layer cannot preserve;
+// reject it explicitly at parse time instead of accepting it silently.
+func applyLimitClause(query *SelectQuery, value string) error {
+	number, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return err
+	}
+	if number < 0 {
+		return fmt.Errorf("unsupported negative LIMIT %d", number)
+	}
+	query.Limit = &number
+	return nil
+}
+
+// applyOffsetClause parses a non-negative OFFSET value. A negative OFFSET has
+// no portable meaning here; reject it explicitly at parse time rather than
+// accepting it silently.
+func applyOffsetClause(query *SelectQuery, value string) error {
+	number, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return err
+	}
+	if number < 0 {
+		return fmt.Errorf("unsupported negative OFFSET %d", number)
+	}
+	query.Offset = &number
+	return nil
 }
 
 func topLevelKeyword(text, keyword string) int {

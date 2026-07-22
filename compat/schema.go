@@ -214,59 +214,95 @@ func (s Schema) Validate() error {
 	tables := make(map[string]struct{}, len(s.Tables))
 	tableColumns := make(map[string]map[string]struct{}, len(s.Tables))
 	for _, table := range s.Tables {
-		if table.Name == "" {
-			return fmt.Errorf("table name is required")
+		if err := validateTable(table, tables, tableColumns); err != nil {
+			return err
 		}
-		if table.Name == schemaMetadataTable || table.Name == appliedChangesTable || table.Name == captureStateTable || table.Name == changeJournalTable {
-			return fmt.Errorf("table name %q is reserved", table.Name)
-		}
-		if _, exists := tables[table.Name]; exists {
-			return fmt.Errorf("duplicate table %q", table.Name)
-		}
-		tables[table.Name] = struct{}{}
-		columns := make(map[string]struct{}, len(table.Columns))
-		for _, column := range table.Columns {
-			if column.Name == "" {
-				return fmt.Errorf("table %q has a column without a name", table.Name)
-			}
-			if column.Type.Family == "" {
-				return fmt.Errorf("column %q.%q has no type", table.Name, column.Name)
-			}
-			if !knownTypeFamily(column.Type.Family) {
-				return fmt.Errorf("column %q.%q has unsupported type family %q", table.Name, column.Name, column.Type.Family)
-			}
-			if column.Type.Family == VectorType {
-				// A vector is declared as vector(N); the single argument is the
-				// fixed dimension and must be positive. Without it the canonical
-				// type is meaningless and the DDL/value layers cannot compile.
-				if len(column.Type.Arguments) != 1 || column.Type.Arguments[0] <= 0 {
-					return fmt.Errorf("column %q.%q vector type requires a single positive dimension", table.Name, column.Name)
-				}
-			}
-			if _, exists := columns[column.Name]; exists {
-				return fmt.Errorf("duplicate column %q.%q", table.Name, column.Name)
-			}
-			columns[column.Name] = struct{}{}
-		}
-		for _, constraint := range table.Constraints {
-			if constraint.Kind != ForeignKey || constraint.References == nil {
-				continue
-			}
-			if !validReferentialAction(constraint.References.OnUpdate) || !validReferentialAction(constraint.References.OnDelete) {
-				return fmt.Errorf("foreign key on table %q has an invalid referential action", table.Name)
-			}
-		}
-		tableColumns[table.Name] = columns
 	}
-	indexes := make(map[string]struct{}, len(s.Indexes))
-	for _, index := range s.Indexes {
+	if err := validateIndexes(s.Indexes, tables, tableColumns); err != nil {
+		return err
+	}
+	if err := validateViews(s.Views, tables); err != nil {
+		return err
+	}
+	if err := validateTriggers(s.Triggers); err != nil {
+		return err
+	}
+	if err := validateRoutines(s.Routines); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateTable checks one table and registers it (and its column set) in the
+// provided maps so that later index validation can resolve references.
+func validateTable(table Table, tables map[string]struct{}, tableColumns map[string]map[string]struct{}) error {
+	if table.Name == "" {
+		return fmt.Errorf("table name is required")
+	}
+	if table.Name == schemaMetadataTable || table.Name == appliedChangesTable || table.Name == captureStateTable || table.Name == changeJournalTable {
+		return fmt.Errorf("table name %q is reserved", table.Name)
+	}
+	if _, exists := tables[table.Name]; exists {
+		return fmt.Errorf("duplicate table %q", table.Name)
+	}
+	tables[table.Name] = struct{}{}
+	columns := make(map[string]struct{}, len(table.Columns))
+	for _, column := range table.Columns {
+		if err := validateTableColumn(table.Name, column, columns); err != nil {
+			return err
+		}
+	}
+	for _, constraint := range table.Constraints {
+		if constraint.Kind != ForeignKey || constraint.References == nil {
+			continue
+		}
+		if !validReferentialAction(constraint.References.OnUpdate) || !validReferentialAction(constraint.References.OnDelete) {
+			return fmt.Errorf("foreign key on table %q has an invalid referential action", table.Name)
+		}
+	}
+	tableColumns[table.Name] = columns
+	return nil
+}
+
+// validateTableColumn checks a single column and, when valid, registers it in
+// the column set for duplicate detection.
+func validateTableColumn(tableName string, column Column, columns map[string]struct{}) error {
+	if column.Name == "" {
+		return fmt.Errorf("table %q has a column without a name", tableName)
+	}
+	if column.Type.Family == "" {
+		return fmt.Errorf("column %q.%q has no type", tableName, column.Name)
+	}
+	if !knownTypeFamily(column.Type.Family) {
+		return fmt.Errorf("column %q.%q has unsupported type family %q", tableName, column.Name, column.Type.Family)
+	}
+	if column.Type.Family == VectorType {
+		// A vector is declared as vector(N); the single argument is the
+		// fixed dimension and must be positive. Without it the canonical
+		// type is meaningless and the DDL/value layers cannot compile.
+		if len(column.Type.Arguments) != 1 || column.Type.Arguments[0] <= 0 {
+			return fmt.Errorf("column %q.%q vector type requires a single positive dimension", tableName, column.Name)
+		}
+	}
+	if _, exists := columns[column.Name]; exists {
+		return fmt.Errorf("duplicate column %q.%q", tableName, column.Name)
+	}
+	columns[column.Name] = struct{}{}
+	return nil
+}
+
+// validateIndexes checks name uniqueness and that every indexed column
+// references a known table and column.
+func validateIndexes(indexes []Index, tables map[string]struct{}, tableColumns map[string]map[string]struct{}) error {
+	indexNames := make(map[string]struct{}, len(indexes))
+	for _, index := range indexes {
 		if index.Name == "" || index.Table == "" || len(index.Columns) == 0 {
 			return fmt.Errorf("index name, table and columns are required")
 		}
-		if _, exists := indexes[index.Name]; exists {
+		if _, exists := indexNames[index.Name]; exists {
 			return fmt.Errorf("duplicate index %q", index.Name)
 		}
-		indexes[index.Name] = struct{}{}
+		indexNames[index.Name] = struct{}{}
 		if _, exists := tables[index.Table]; !exists {
 			return fmt.Errorf("index %q references unknown table %q", index.Name, index.Table)
 		}
@@ -279,18 +315,24 @@ func (s Schema) Validate() error {
 			}
 		}
 	}
-	views := make(map[string]struct{}, len(s.Views))
-	for _, view := range s.Views {
+	return nil
+}
+
+// validateViews checks name uniqueness, conflicts with tables, and that each
+// view has a source table and projections.
+func validateViews(views []View, tables map[string]struct{}) error {
+	viewNames := make(map[string]struct{}, len(views))
+	for _, view := range views {
 		if view.Name == "" {
 			return fmt.Errorf("view name is required")
 		}
 		if _, exists := tables[view.Name]; exists {
 			return fmt.Errorf("view %q conflicts with a table", view.Name)
 		}
-		if _, exists := views[view.Name]; exists {
+		if _, exists := viewNames[view.Name]; exists {
 			return fmt.Errorf("duplicate view %q", view.Name)
 		}
-		views[view.Name] = struct{}{}
+		viewNames[view.Name] = struct{}{}
 		if view.Query.From.Table == "" {
 			return fmt.Errorf("view %q has no source table", view.Name)
 		}
@@ -298,15 +340,21 @@ func (s Schema) Validate() error {
 			return fmt.Errorf("view %q has no projections", view.Name)
 		}
 	}
-	triggers := make(map[string]struct{}, len(s.Triggers))
-	for _, trigger := range s.Triggers {
+	return nil
+}
+
+// validateTriggers checks name uniqueness and that timing/event/actions are
+// well formed.
+func validateTriggers(triggers []Trigger) error {
+	triggerNames := make(map[string]struct{}, len(triggers))
+	for _, trigger := range triggers {
 		if trigger.Name == "" || trigger.Table == "" {
 			return fmt.Errorf("trigger name and table are required")
 		}
-		if _, exists := triggers[trigger.Name]; exists {
+		if _, exists := triggerNames[trigger.Name]; exists {
 			return fmt.Errorf("duplicate trigger %q", trigger.Name)
 		}
-		triggers[trigger.Name] = struct{}{}
+		triggerNames[trigger.Name] = struct{}{}
 		switch trigger.Timing {
 		case "before", "after":
 		default:
@@ -321,15 +369,21 @@ func (s Schema) Validate() error {
 			return fmt.Errorf("trigger %q has no actions", trigger.Name)
 		}
 	}
-	routines := make(map[string]struct{}, len(s.Routines))
-	for _, routine := range s.Routines {
+	return nil
+}
+
+// validateRoutines checks name uniqueness, that actions are present, and that
+// every parameter has a supported type family.
+func validateRoutines(routines []Routine) error {
+	routineNames := make(map[string]struct{}, len(routines))
+	for _, routine := range routines {
 		if routine.Name == "" || len(routine.Actions) == 0 {
 			return fmt.Errorf("routine name and actions are required")
 		}
-		if _, exists := routines[routine.Name]; exists {
+		if _, exists := routineNames[routine.Name]; exists {
 			return fmt.Errorf("duplicate routine %q", routine.Name)
 		}
-		routines[routine.Name] = struct{}{}
+		routineNames[routine.Name] = struct{}{}
 		parameters := make(map[string]struct{}, len(routine.Parameters))
 		for _, parameter := range routine.Parameters {
 			if parameter.Name == "" || parameter.Type.Family == "" {
