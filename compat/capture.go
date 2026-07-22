@@ -135,11 +135,40 @@ func captureJSONExpression(engine Engine, alias string, columns []Column) string
 		arguments = append(arguments, sqlString(column.Name))
 		value := alias + "." + quoteIdentifier(column.Name)
 		encoded := "CAST(" + value + " AS TEXT)"
-		if column.Type.Family == BinaryType {
+		switch column.Type.Family {
+		case BinaryType:
 			if engine == SQLite {
 				encoded = "hex(" + value + ")"
 			} else {
 				encoded = "encode(" + value + ", 'hex')"
+			}
+		case FloatType:
+			// SQLite's CAST(REAL AS TEXT) renders with ~15 significant digits and
+			// silently loses precision: CAST(1.2345678901234567e+14 AS TEXT) yields
+			// "123456789012346.0", so the journal would store a different float64
+			// than the source and the destination driver would later reconstruct.
+			// printf('%!.17g', x) emits the 17-significant-digit form that round-trips
+			// a float64 (the IEEE-754 double round-trip bound); canonicalValue's
+			// normalizeFloat then maps both the capture text and the destination
+			// driver's float64 to the same shortest form. PostgreSQL's float8-to-text
+			// already emits the shortest form that round-trips, so CAST is sufficient
+			// there (verified by reading PostgreSQL's float8out; no live Postgres was
+			// available in this environment to execute it).
+			if engine == SQLite {
+				encoded = "printf('%!.17g', " + value + ")"
+			}
+		case DecimalType:
+			// A DECIMAL column on a native SQLite table with NUMERIC affinity stores
+			// fractional values as REAL, so CAST(col AS TEXT) truncates to ~15
+			// significant digits while the destination driver reconstructs the full
+			// float64, raising a spurious ConflictError. Emit the round-trip
+			// 17-significant-digit form ONLY when the storage is REAL (typeof(col) =
+			// 'real'); arbitrary-precision values stored as TEXT or INTEGER pass
+			// through CAST verbatim, preserving every digit (e.g. a 38-digit
+			// decimal). PostgreSQL NUMERIC preserves arbitrary precision in CAST, so
+			// no special-casing is needed there.
+			if engine == SQLite {
+				encoded = "CASE typeof(" + value + ") WHEN 'real' THEN printf('%!.17g', " + value + ") ELSE CAST(" + value + " AS TEXT) END"
 			}
 		}
 		arguments = append(arguments, "CASE WHEN "+value+" IS NULL THEN NULL ELSE "+encoded+" END")

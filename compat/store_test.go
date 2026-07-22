@@ -182,6 +182,65 @@ func TestCanonicalFloatNormalization(t *testing.T) {
 	}
 }
 
+func TestCanonicalDecimalReconcilesFloatStorage(t *testing.T) {
+	// A DECIMAL value that SQLite stored as REAL surfaces two ways: as a Go
+	// float64 from the destination driver, and as the capture trigger's
+	// printf('%!.17g') text. canonicalValue must map both to one shortest form so
+	// rowsEqual does not raise a spurious ConflictError.
+	fromFloat, err := canonicalValue(DecimalType, 1.2345678901234567e+14)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromText, err := canonicalValue(DecimalType, "123456789012345.67")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromFloat.Value != fromText.Value {
+		t.Fatalf("expected driver float64 and capture text to converge, got %q vs %q", fromFloat.Value, fromText.Value)
+	}
+	if fromFloat.Kind != DecimalValue {
+		t.Fatalf("unexpected kind %q", fromFloat.Kind)
+	}
+	if fromFloat.Value != "1.2345678901234567e+14" {
+		t.Fatalf("unexpected canonical decimal %q", fromFloat.Value)
+	}
+
+	// Arbitrary-precision decimals (18+ significant digits) never round-trip
+	// through a single float64 and must be preserved verbatim.
+	long := "12345678901234567890.123456789012345678"
+	preserved, err := canonicalValue(DecimalType, long)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preserved.Value != long {
+		t.Fatalf("arbitrary-precision decimal was altered: want %q, got %q", long, preserved.Value)
+	}
+
+	// A high-magnitude decimal that SQLite would render with a rounded CAST
+	// ("99999999999999.984") is reconciled to the same form as the driver float64,
+	// not left as a divergent raw string.
+	fromRounded, err := canonicalValue(DecimalType, "99999999999999.984")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromDriver, err := canonicalValue(DecimalType, 9.999999999999998e+13)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromRounded.Value != fromDriver.Value {
+		t.Fatalf("expected rounded text and driver float64 to converge, got %q vs %q", fromRounded.Value, fromDriver.Value)
+	}
+
+	// Pure-integer decimals are preserved exactly (not rewritten as a float).
+	integer, err := canonicalValue(DecimalType, "1234567890123456789")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if integer.Value != "1234567890123456789" {
+		t.Fatalf("integer-valued decimal must be preserved, got %q", integer.Value)
+	}
+}
+
 func TestSQLiteForeignKeysAreEnabled(t *testing.T) {
 	store, err := OpenSQLite(Version{Major: 3}, ":memory:")
 	if err != nil {

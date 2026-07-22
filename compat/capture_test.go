@@ -161,3 +161,42 @@ func TestCompileCaptureTriggersUsesTransactionLocalGUCOnPostgres(t *testing.T) {
 		t.Fatalf("sqlite capture trigger must keep the state-table condition:\n%s", sqliteJoined)
 	}
 }
+
+// TestCompileCaptureTriggersUsesRoundTripFloatEncodingOnSQLite guards the
+// lossless capture encoding for FLOAT and REAL-stored DECIMAL columns. SQLite's
+// CAST(REAL AS TEXT) truncates to ~15 significant digits, so the journal must
+// emit the 17-significant-digit round-trip form via printf('%!.17g'). DECIMAL
+// columns gate that on typeof(col) = 'real' so arbitrary-precision TEXT and
+// INTEGER storage still pass through CAST verbatim. Postgres must keep the
+// plain CAST, since its float8/numeric text already round-trips.
+func TestCompileCaptureTriggersUsesRoundTripFloatEncodingOnSQLite(t *testing.T) {
+	schema := Schema{Tables: []Table{{
+		Name: "encoding_items",
+		Columns: []Column{
+			{Name: "id", Type: Type{Family: IntegerType}},
+			{Name: "flt", Type: Type{Family: FloatType}},
+			{Name: "amt", Type: Type{Family: DecimalType, Arguments: []int{38, 18}}},
+		},
+		Constraints: []Constraint{{Kind: PrimaryKey, Columns: []string{"id"}}},
+	}}}
+	primary, err := primaryKeyColumns(schema.Tables[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sqliteJoined := strings.Join(compileCaptureTriggers(SQLite, schema.Tables[0], primary), "\n")
+	if !strings.Contains(sqliteJoined, "printf('%!.17g', ") {
+		t.Fatalf("sqlite capture trigger must encode floats with printf('%%!.17g'):\n%s", sqliteJoined)
+	}
+	if !strings.Contains(sqliteJoined, "CASE typeof(") || !strings.Contains(sqliteJoined, "WHEN 'real' THEN printf('%!.17g', ") {
+		t.Fatalf("sqlite capture trigger must gate decimal printf on typeof 'real':\n%s", sqliteJoined)
+	}
+
+	postgresJoined := strings.Join(compileCaptureTriggers(Postgres, schema.Tables[0], primary), "\n")
+	if strings.Contains(postgresJoined, "printf('%!.17g'") {
+		t.Fatalf("postgres capture trigger must not use sqlite printf:\n%s", postgresJoined)
+	}
+	if !strings.Contains(postgresJoined, "CAST(") {
+		t.Fatalf("postgres capture trigger must keep CAST for float/decimal text:\n%s", postgresJoined)
+	}
+}

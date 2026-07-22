@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -278,6 +279,37 @@ func canonicalValue(kind TypeFamily, source any, dimension ...int) (Value, error
 	case IntegerType:
 		return Value{Kind: IntegerValue, Value: text}, nil
 	case DecimalType:
+		// Arbitrary-precision decimals are preserved byte-for-byte. Only genuine
+		// float64 storage representations are reconciled through normalizeFloat so
+		// that a REAL-affinity DECIMAL column (whose fractional value SQLite stores
+		// as a float64) does not raise a spurious ConflictError: the capture trigger
+		// journals the value as printf('%!.17g', col) and the destination driver
+		// surfaces it as a Go float64, and both must converge on the same canonical
+		// form instead of comparing "123456789012345.67" against "1.2345678901234567e+14".
+		//
+		// A value is treated as a float64 storage representation when it arrives as a
+		// Go float64/float32 from the driver (a REAL column read back through
+		// database/sql), or as a compact float text carrying at most 17 significant
+		// digits — the IEEE-754 double round-trip bound, which is exactly what
+		// printf('%!.17g') emits. Decimals carrying 18+ significant digits are
+		// arbitrary-precision text (e.g. a 38-digit value) that never round-trips
+		// through a single float64, so they are passed through verbatim. Pure-integer
+		// text is also passed through verbatim so an INTEGER-stored decimal keeps its
+		// exact digits instead of being rewritten in exponential notation.
+		if f, ok := float64Value(source); ok {
+			canonical, err := normalizeFloat(strconv.FormatFloat(f, 'g', -1, 64))
+			if err != nil {
+				return Value{}, fmt.Errorf("invalid decimal %v: %w", f, err)
+			}
+			return Value{Kind: DecimalValue, Value: canonical}, nil
+		}
+		if isCompactFloatText(text) {
+			canonical, err := normalizeFloat(text)
+			if err != nil {
+				return Value{}, fmt.Errorf("invalid decimal %q: %w", text, err)
+			}
+			return Value{Kind: DecimalValue, Value: canonical}, nil
+		}
 		return Value{Kind: DecimalValue, Value: text}, nil
 	case FloatType:
 		canonical, err := normalizeFloat(text)
@@ -366,6 +398,56 @@ func normalizeFloat(text string) (string, error) {
 		return "", err
 	}
 	return strconv.FormatFloat(parsed, 'g', -1, 64), nil
+}
+
+// float64Value reports whether source is a driver-supplied float64/float32 —
+// the shape a REAL-affinity column takes when scanned back through database/sql.
+// Integer kinds are deliberately excluded: an INTEGER-stored decimal is exact
+// and is preserved as its own text rather than being rewritten as a float.
+func float64Value(source any) (float64, bool) {
+	switch v := source.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	}
+	return 0, false
+}
+
+// isCompactFloatText reports whether text is a compact float64 storage
+// representation that is safe to reconcile through normalizeFloat. It must look
+// like a float (a decimal point or exponent, which excludes pure-integer text),
+// parse as a finite float64, and carry at most 17 significant digits — the
+// IEEE-754 double round-trip bound, which is exactly what the capture trigger's
+// printf('%!.17g') emits for a REAL column. Decimals with 18+ significant digits
+// are arbitrary-precision text that never round-trips through a single float64;
+// the caller preserves them verbatim.
+func isCompactFloatText(text string) bool {
+	if !strings.ContainsAny(text, ".eE") {
+		return false
+	}
+	parsed, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return false
+	}
+	if math.IsInf(parsed, 0) || math.IsNaN(parsed) {
+		return false
+	}
+	return significantDigits(text) <= 17
+}
+
+// significantDigits counts the significant decimal digits in text, ignoring an
+// optional sign, the exponent, and leading zeros that carry no precision.
+// Trailing zeros are kept because they are significant in a decimal text
+// (e.g. "1.50" has 3 significant digits).
+func significantDigits(text string) int {
+	if i := strings.IndexAny(text, "eE"); i >= 0 {
+		text = text[:i]
+	}
+	text = strings.TrimPrefix(text, "+")
+	text = strings.TrimPrefix(text, "-")
+	digits := strings.TrimLeft(strings.ReplaceAll(text, ".", ""), "0")
+	return len(digits)
 }
 
 // canonicalVectorValue parses a textual vector '[c1, c2, ...]' (optional

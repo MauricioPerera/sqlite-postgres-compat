@@ -259,6 +259,196 @@ func replicationTestSchema(name string) Schema {
 	}}}
 }
 
+// decimalTestSchema declares a DECIMAL column so the capture trigger uses the
+// typeof-gated printf path for REAL storage and the raw CAST path for TEXT.
+func decimalTestSchema(name string) Schema {
+	return Schema{Tables: []Table{{
+		Name: name,
+		Columns: []Column{
+			{Name: "id", Type: Type{Family: IntegerType}},
+			{Name: "amount", Type: Type{Family: DecimalType, Arguments: []int{38, 18}}},
+		},
+		Constraints: []Constraint{{Kind: PrimaryKey, Columns: []string{"id"}}},
+	}}}
+}
+
+// TestApplyChangesPreservesHighPrecisionFloat guards against the silent float
+// precision loss of AUDIT2-B Hallazgo 1: a FLOAT value whose decimal form needs
+// more than 15 significant digits must reach the destination with its exact
+// canonical value, without conflict, across insert and update.
+func TestApplyChangesPreservesHighPrecisionFloat(t *testing.T) {
+	ctx := context.Background()
+	schema := floatTestSchema("float_precision_items")
+
+	source, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.InstallChangeCapture(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	destination, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destination.Close()
+	if err := destination.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := destination.InstallChangeCapture(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+
+	const value = 1.2345678901234567e+14
+	if _, err := source.DB.Exec(`INSERT INTO float_precision_items (id, flt) VALUES (1, ?)`, value); err != nil {
+		t.Fatal(err)
+	}
+	// An update to the same high-precision value exercises the Before/After
+	// comparison path that previously diverged on capture-vs-driver formatting.
+	if _, err := source.DB.Exec(`UPDATE float_precision_items SET flt = ? WHERE id = 1`, value); err != nil {
+		t.Fatal(err)
+	}
+
+	changes, err := source.ReadCapturedChanges(ctx, schema, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := destination.ApplyChanges(ctx, schema, changes); err != nil {
+		t.Fatalf("high-precision float replication must not conflict: %v", err)
+	}
+
+	// The canonical value arriving at the destination must equal the canonical
+	// value of the source's own stored float, byte-for-byte, with no precision
+	// loss.
+	sourceSnapshot, err := source.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationSnapshot, err := destination.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceCanonical := sourceSnapshot.Rows["float_precision_items"][0]["flt"].Value
+	destinationCanonical := destinationSnapshot.Rows["float_precision_items"][0]["flt"].Value
+	if sourceCanonical != destinationCanonical {
+		t.Fatalf("silent float precision loss: source %q != destination %q", sourceCanonical, destinationCanonical)
+	}
+	if destinationCanonical != "1.2345678901234567e+14" {
+		t.Fatalf("expected exact canonical 1.2345678901234567e+14, got %q", destinationCanonical)
+	}
+
+	// Replaying the stream must stay idempotent once the row matches.
+	if err := destination.ApplyChanges(ctx, schema, changes); err != nil {
+		t.Fatalf("reapplying high-precision float stream must be idempotent: %v", err)
+	}
+}
+
+// TestApplyChangesDecimalRealStorageNoSpuriousConflict guards against the
+// spurious ConflictError of AUDIT2-B Hallazgo 2. A native NUMERIC-affinity table
+// stores fractional decimals as REAL, so the old CAST(col AS TEXT) capture
+// truncated the journal while the destination driver reconstructed the full
+// float64. With the typeof-gated printf capture and the float reconciliation in
+// canonicalValue, replication must apply without a spurious conflict.
+func TestApplyChangesDecimalRealStorageNoSpuriousConflict(t *testing.T) {
+	ctx := context.Background()
+	schema := decimalTestSchema("decimal_real_items")
+
+	openNumeric := func() *Store {
+		store, err := OpenSQLite(Version{Major: 3}, ":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Native NUMERIC affinity: fractional values store as REAL, reproducing
+		// the AUDIT2-B scenario. The capture is installed from the DecimalType
+		// schema so the trigger emits the typeof-gated printf form.
+		if _, err := store.DB.Exec(`CREATE TABLE decimal_real_items (id INTEGER PRIMARY KEY, amount NUMERIC(38,18))`); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.InstallChangeCapture(ctx, schema); err != nil {
+			t.Fatal(err)
+		}
+		return store
+	}
+	source := openNumeric()
+	defer source.Close()
+	destination := openNumeric()
+	defer destination.Close()
+
+	if _, err := source.DB.Exec(`INSERT INTO decimal_real_items (id, amount) VALUES (1, ?)`, 123456789012345.6789); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.Exec(`UPDATE decimal_real_items SET amount = ? WHERE id = 1`, 99999999999999.99); err != nil {
+		t.Fatal(err)
+	}
+
+	changes, err := source.ReadCapturedChanges(ctx, schema, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 2 {
+		t.Fatalf("expected 2 captured changes, got %d", len(changes))
+	}
+	if err := destination.ApplyChanges(ctx, schema, changes); err != nil {
+		t.Fatalf("REAL-stored decimal replication must not raise a spurious conflict: %v", err)
+	}
+	// Replaying the stream must stay idempotent.
+	if err := destination.ApplyChanges(ctx, schema, changes); err != nil {
+		t.Fatalf("reapplying REAL-stored decimal stream must be idempotent: %v", err)
+	}
+}
+
+// TestApplyChangesPreservesArbitraryPrecisionDecimal is the non-regression
+// guard for the arbitrary-precision guarantee: a DECIMAL value stored as TEXT
+// (the canonical DDL mapping) must arrive at the destination byte-identical,
+// even though the DecimalType branch now reconciles float storage.
+func TestApplyChangesPreservesArbitraryPrecisionDecimal(t *testing.T) {
+	ctx := context.Background()
+	schema := decimalTestSchema("decimal_text_items")
+
+	source, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.InstallChangeCapture(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	destination, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destination.Close()
+	if err := destination.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+
+	want := "12345678901234567890.123456789012345678"
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO decimal_text_items (id, amount) VALUES (?, ?)`, 1, want); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := source.ReadCapturedChanges(ctx, schema, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := destination.ApplyChanges(ctx, schema, changes); err != nil {
+		t.Fatalf("arbitrary-precision decimal replication must apply: %v", err)
+	}
+	var got string
+	if err := destination.DB.QueryRow(`SELECT amount FROM decimal_text_items WHERE id = 1`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("arbitrary-precision decimal was not preserved byte-identical: want %q, got %q", want, got)
+	}
+}
+
 // TestApplyChangesTolerantSkipsInsertAlreadyPresent covers the overlap window
 // where an insert journaled after capture-install already traveled inside the
 // snapshot: the row exists and equals the change's after state, so the tolerant
