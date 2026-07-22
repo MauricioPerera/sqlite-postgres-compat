@@ -4,7 +4,7 @@ Base de un motor de compatibilidad bidireccional SQLite ↔ PostgreSQL.
 
 El proyecto no usa una aplicación concreta como modelo. Su contrato de entrada declara las versiones de los motores y las capacidades que deben preservarse. El motor no debe degradar una capacidad sin reportarla explícitamente.
 
-Las capas implementadas son el contrato de compatibilidad, la representación canónica de esquemas, persistencia e inspección exacta del contrato, auditoría de capacidades, compiladores DDL SQLite/PostgreSQL, restricciones `CHECK` e índices canónicos, adaptadores para snapshots, replicación incremental transaccional e idempotente con detección de conflictos y un runtime común para vistas, triggers, rutinas y búsqueda textual canónicos. Las siguientes capas son el análisis completo de dialectos externos y captura automática de cambios externos.
+Las capas implementadas son el contrato de compatibilidad, la representación canónica de esquemas, persistencia e inspección exacta del contrato, traducción de catálogos externos para expresiones `CHECK` e índices dentro de la gramática SQL común, auditoría de capacidades, compiladores DDL SQLite/PostgreSQL, adaptadores para snapshots, replicación incremental transaccional e idempotente con detección de conflictos y un runtime común para vistas, triggers, rutinas y búsqueda textual canónicos. Las siguientes capas son completar el análisis de dialectos externos y la captura automática de cambios externos.
 
 ## Auditoría
 
@@ -28,7 +28,7 @@ La batería integral usa instancias reales de SQLite y PostgreSQL. Crea una base
 .\scripts\test-system.ps1
 ```
 
-La suite comprueba el núcleo portable, CLI completa, precisión decimal, JSON, UUID, timestamps, claves foráneas, restricciones `CHECK`, índices únicos/parciales/descendentes, vistas, triggers, rutinas, búsqueda textual y la cobertura declarada de familias arbitrarias avanzadas. Una prueba fallida representa una capacidad del objetivo total que el sistema todavía no cumple.
+La suite comprueba el núcleo portable, CLI completa, precisión decimal, JSON, UUID, timestamps, claves foráneas, restricciones `CHECK`, índices únicos/parciales/descendentes, inspección de objetos creados con SQL nativo sin metadatos, vistas, triggers, rutinas, búsqueda textual y la cobertura declarada de familias arbitrarias avanzadas. Una prueba fallida representa una capacidad del objetivo total que el sistema todavía no cumple.
 
 Ejemplo de `contract.json`:
 

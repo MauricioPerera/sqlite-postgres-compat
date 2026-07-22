@@ -696,6 +696,64 @@ func TestSystemEnforcesCanonicalChecksAndIndexesEqually(t *testing.T) {
 	assertStoreSnapshotsEquivalent(t, ctx, schema, stores[0], stores[1])
 }
 
+func TestSystemInspectsNativeChecksAndIndexesWithoutMetadata(t *testing.T) {
+	ctx := context.Background()
+	sqlite := openSQLite(t, filepath.Join(t.TempDir(), "native-catalog.db"))
+	postgres := openPostgres(t)
+	// This case must inspect an external catalog without canonical metadata or
+	// objects left by earlier tests in the suite's disposable database.
+	if _, err := postgres.DB.ExecContext(ctx, `DROP SCHEMA public CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := postgres.DB.ExecContext(ctx, `CREATE SCHEMA public`); err != nil {
+		t.Fatal(err)
+	}
+	statements := map[compat.Engine][]string{
+		compat.SQLite: {
+			`CREATE TABLE native_products (code TEXT NOT NULL, price INTEGER NOT NULL, active BOOLEAN NOT NULL, CHECK (price >= 0))`,
+			`CREATE UNIQUE INDEX native_products_code ON native_products (code ASC)`,
+			`CREATE INDEX native_products_active_price ON native_products (price DESC) WHERE active = TRUE`,
+		},
+		compat.Postgres: {
+			`CREATE TABLE native_products (code TEXT NOT NULL, price BIGINT NOT NULL, active BOOLEAN NOT NULL, CHECK (price >= 0))`,
+			`CREATE UNIQUE INDEX native_products_code ON native_products (code ASC)`,
+			`CREATE INDEX native_products_active_price ON native_products (price DESC) WHERE active = TRUE`,
+		},
+	}
+	for _, store := range []*compat.Store{sqlite, postgres} {
+		for _, statement := range statements[store.Target.Engine] {
+			if _, err := store.DB.ExecContext(ctx, statement); err != nil {
+				t.Fatalf("%s native DDL: %v", store.Target.Engine, err)
+			}
+		}
+		inspection, err := store.InspectSchema(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !inspection.Exact || len(inspection.Unresolved) != 0 {
+			t.Fatalf("%s native catalog was not translated exactly: %+v", store.Target.Engine, inspection)
+		}
+		if len(inspection.Schema.Tables) != 1 || len(inspection.Schema.Tables[0].Constraints) != 1 || inspection.Schema.Tables[0].Constraints[0].Kind != compat.Check {
+			t.Fatalf("%s missing native CHECK: %+v", store.Target.Engine, inspection.Schema)
+		}
+		if len(inspection.Schema.Indexes) != 2 {
+			t.Fatalf("%s missing native indexes: %+v", store.Target.Engine, inspection.Schema.Indexes)
+		}
+		var foundUnique, foundPartial bool
+		for _, index := range inspection.Schema.Indexes {
+			switch index.Name {
+			case "native_products_code":
+				foundUnique = index.Unique && len(index.Columns) == 1 && index.Columns[0].Column == "code"
+			case "native_products_active_price":
+				foundPartial = index.Where != nil && len(index.Columns) == 1 && index.Columns[0].Column == "price" && index.Columns[0].Descending
+			}
+		}
+		if !foundUnique || !foundPartial {
+			t.Fatalf("%s native index semantics lost: %+v", store.Target.Engine, inspection.Schema.Indexes)
+		}
+	}
+}
+
 func TestSystemClaimsExactCoverageForRequiredFeatureFamilies(t *testing.T) {
 	contract := compat.Contract{
 		Source:      compat.Target{Engine: compat.SQLite, Version: compat.Version{Major: 3}},
