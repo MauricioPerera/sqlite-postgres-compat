@@ -316,6 +316,38 @@ func TestParseCatalogExpressionHexLiteral(t *testing.T) {
 			}},
 		},
 		{
+			name:  "all bits set is negative one in two's complement",
+			input: "x = 0xFFFFFFFFFFFFFFFF",
+			want: Expression{Kind: "eq", Args: []Expression{
+				column("x"),
+				{Kind: "integer", Value: "-1"},
+			}},
+		},
+		{
+			name:  "high bit set is the minimum int64",
+			input: "x = 0x8000000000000000",
+			want: Expression{Kind: "eq", Args: []Expression{
+				column("x"),
+				{Kind: "integer", Value: "-9223372036854775808"},
+			}},
+		},
+		{
+			name:  "max positive int64 value",
+			input: "x = 0x7FFFFFFFFFFFFFFF",
+			want: Expression{Kind: "eq", Args: []Expression{
+				column("x"),
+				{Kind: "integer", Value: "9223372036854775807"},
+			}},
+		},
+		{
+			name:  "small hex value is unchanged by sign interpretation",
+			input: "x = 0x10",
+			want: Expression{Kind: "eq", Args: []Expression{
+				column("x"),
+				{Kind: "integer", Value: "16"},
+			}},
+		},
+		{
 			name:      "hex literal beyond 64 bits is rejected",
 			input:     "0xFFFFFFFFFFFFFFFFF",
 			wantError: "unsupported",

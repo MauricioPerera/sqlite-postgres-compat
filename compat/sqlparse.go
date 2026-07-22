@@ -420,6 +420,10 @@ func parseCatalogIdentifier(text string) (string, bool) {
 // rules), and an error when the literal exceeds the 64-bit range that SQLite
 // supports. The decimal value is emitted so the expression compiles to
 // PostgreSQL as a plain integer instead of a quoted identifier.
+//
+// The hex digits are parsed as an unsigned 64-bit value and then reinterpreted
+// as a signed two's-complement int64, matching how SQLite evaluates hex
+// literals: 0xFFFFFFFFFFFFFFFF is -1, not 18446744073709551615.
 func catalogHexLiteral(text string) (value string, handled bool, err error) {
 	if len(text) < 3 || text[0] != '0' || (text[1] != 'x' && text[1] != 'X') {
 		return "", false, nil
@@ -433,11 +437,11 @@ func catalogHexLiteral(text string) (value string, handled bool, err error) {
 			return "", false, nil
 		}
 	}
-	decimal, parseErr := strconv.ParseUint(digits, 16, 64)
+	parsed, parseErr := strconv.ParseUint(digits, 16, 64)
 	if parseErr != nil {
 		return "", true, fmt.Errorf("unsupported catalog hexadecimal literal %q", text)
 	}
-	return strconv.FormatUint(decimal, 10), true, nil
+	return strconv.FormatInt(int64(parsed), 10), true, nil
 }
 
 func isHexDigit(character rune) bool {
