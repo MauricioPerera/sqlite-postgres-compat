@@ -24,3 +24,17 @@ func TestParseCatalogExpressionRejectsUnknownSQL(t *testing.T) {
 		t.Fatal("expected unsupported SQL to be rejected")
 	}
 }
+
+func TestParsePostgresCatalogDefaultRemovesKnownLiteralCast(t *testing.T) {
+	got, err := parsePostgresCatalogDefault(`'new'::text`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Expression{Kind: "string", Value: "new"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+	if _, err := parsePostgresCatalogDefault(`nextval('items_id_seq'::regclass)`); err == nil {
+		t.Fatal("expected sequence default to remain unsupported")
+	}
+}

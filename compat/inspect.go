@@ -50,7 +50,7 @@ func (store *Store) InspectSchema(ctx context.Context) (Inspection, error) {
 }
 
 func (store *Store) inspectSQLite(ctx context.Context) (Inspection, error) {
-	rows, err := store.DB.QueryContext(ctx, `SELECT type, name, COALESCE(sql, '') FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name <> ? ORDER BY type, name`, schemaMetadataTable)
+	rows, err := store.DB.QueryContext(ctx, `SELECT type, name, COALESCE(sql, '') FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT IN (?, ?) ORDER BY type, name`, schemaMetadataTable, appliedChangesTable)
 	if err != nil {
 		return Inspection{}, err
 	}
@@ -103,19 +103,33 @@ func (store *Store) inspectSQLite(ctx context.Context) (Inspection, error) {
 }
 
 func (store *Store) inspectSQLiteTable(ctx context.Context, name, definition string) (Table, []CatalogObject, error) {
-	rows, err := store.DB.QueryContext(ctx, `SELECT name, type, "notnull", pk FROM pragma_table_info(?) ORDER BY cid`, name)
+	rows, err := store.DB.QueryContext(ctx, `SELECT name, type, "notnull", dflt_value, pk, hidden FROM pragma_table_xinfo(?) ORDER BY cid`, name)
 	if err != nil {
 		return Table{}, nil, err
 	}
 	table := Table{Name: name}
 	var primary []string
+	var unresolved []CatalogObject
 	for rows.Next() {
 		var columnName, declaredType string
-		var notNull, pk int
-		if err := rows.Scan(&columnName, &declaredType, &notNull, &pk); err != nil {
+		var defaultSQL sql.NullString
+		var notNull, pk, hidden int
+		if err := rows.Scan(&columnName, &declaredType, &notNull, &defaultSQL, &pk, &hidden); err != nil {
 			return Table{}, nil, err
 		}
-		table.Columns = append(table.Columns, Column{Name: columnName, Type: Type{Family: sqliteTypeFamily(declaredType)}, Nullable: notNull == 0 && pk == 0})
+		column := Column{Name: columnName, Type: Type{Family: sqliteTypeFamily(declaredType)}, Nullable: notNull == 0 && pk == 0}
+		if defaultSQL.Valid {
+			expression, err := parseCatalogExpression(defaultSQL.String)
+			if err != nil {
+				unresolved = append(unresolved, CatalogObject{Kind: "default", Name: name + "." + columnName, Definition: defaultSQL.String, Reason: err.Error()})
+			} else {
+				column.Default = &expression
+			}
+		}
+		if hidden != 0 {
+			unresolved = append(unresolved, CatalogObject{Kind: "generated_column", Name: name + "." + columnName, Reason: "generated and hidden columns require canonical generation semantics"})
+		}
+		table.Columns = append(table.Columns, column)
 		if pk > 0 {
 			primary = append(primary, columnName)
 		}
@@ -129,7 +143,6 @@ func (store *Store) inspectSQLiteTable(ctx context.Context, name, definition str
 	if err := rows.Close(); err != nil {
 		return Table{}, nil, err
 	}
-	var unresolved []CatalogObject
 	for _, source := range extractCheckExpressions(definition) {
 		expression, err := parseCatalogExpression(source)
 		if err != nil {
@@ -294,10 +307,11 @@ func sqliteTypeFamily(declared string) TypeFamily {
 }
 
 func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
-	rows, err := store.DB.QueryContext(ctx, `SELECT table_name, column_name, data_type, is_nullable
+	rows, err := store.DB.QueryContext(ctx, `SELECT table_name, column_name, data_type, is_nullable, column_default, is_identity, is_generated
 		FROM information_schema.columns
-		WHERE table_schema = current_schema() AND table_name <> $1
-		ORDER BY table_name, ordinal_position`, schemaMetadataTable)
+		WHERE table_schema = current_schema() AND table_name NOT IN ($1, $2)
+		AND table_name IN (SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE')
+		ORDER BY table_name, ordinal_position`, schemaMetadataTable, appliedChangesTable)
 	if err != nil {
 		return Inspection{}, err
 	}
@@ -305,8 +319,9 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 	tables := make(map[string]*Table)
 	var order []string
 	for rows.Next() {
-		var tableName, columnName, dataType, nullable string
-		if err := rows.Scan(&tableName, &columnName, &dataType, &nullable); err != nil {
+		var tableName, columnName, dataType, nullable, identity, generated string
+		var defaultSQL sql.NullString
+		if err := rows.Scan(&tableName, &columnName, &dataType, &nullable, &defaultSQL, &identity, &generated); err != nil {
 			return Inspection{}, err
 		}
 		table := tables[tableName]
@@ -315,7 +330,19 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 			tables[tableName] = table
 			order = append(order, tableName)
 		}
-		table.Columns = append(table.Columns, Column{Name: columnName, Type: Type{Family: postgresTypeFamily(dataType)}, Nullable: nullable == "YES"})
+		column := Column{Name: columnName, Type: Type{Family: postgresTypeFamily(dataType)}, Nullable: nullable == "YES"}
+		if defaultSQL.Valid {
+			expression, err := parsePostgresCatalogDefault(defaultSQL.String)
+			if err != nil {
+				inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "default", Name: tableName + "." + columnName, Definition: defaultSQL.String, Reason: err.Error()})
+			} else {
+				column.Default = &expression
+			}
+		}
+		if identity == "YES" || generated != "NEVER" {
+			inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "generated_column", Name: tableName + "." + columnName, Reason: "identity and generated columns require canonical generation semantics"})
+		}
+		table.Columns = append(table.Columns, column)
 	}
 	if err := rows.Err(); err != nil {
 		return Inspection{}, err

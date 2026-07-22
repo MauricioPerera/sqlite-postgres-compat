@@ -75,6 +75,57 @@ func parseCatalogExpression(input string) (Expression, error) {
 	return Expression{}, fmt.Errorf("unsupported catalog expression %q", input)
 }
 
+func parsePostgresCatalogDefault(input string) (Expression, error) {
+	text := strings.TrimSpace(input)
+	for hasOuterParentheses(text) {
+		text = strings.TrimSpace(text[1 : len(text)-1])
+	}
+	if position := topLevelPostgresCast(text); position >= 0 {
+		cast := strings.ToLower(strings.TrimSpace(text[position+2:]))
+		switch cast {
+		case "text", "character varying", "character", "boolean", "smallint", "integer", "bigint", "numeric", "real", "double precision", "date", "timestamp without time zone", "timestamp with time zone", "uuid", "json", "jsonb":
+			text = strings.TrimSpace(text[:position])
+		default:
+			return Expression{}, fmt.Errorf("unsupported PostgreSQL default cast %q", cast)
+		}
+	}
+	return parseCatalogExpression(text)
+}
+
+func topLevelPostgresCast(text string) int {
+	depth := 0
+	inSingle, inDouble := false, false
+	for i := 0; i+1 < len(text); i++ {
+		switch text[i] {
+		case '\'':
+			if !inDouble {
+				if inSingle && i+1 < len(text) && text[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+		case '(':
+			if !inSingle && !inDouble {
+				depth++
+			}
+		case ')':
+			if !inSingle && !inDouble {
+				depth--
+			}
+		case ':':
+			if !inSingle && !inDouble && depth == 0 && text[i+1] == ':' {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 type catalogOperator struct {
 	token string
 	kind  string

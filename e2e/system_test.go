@@ -710,14 +710,14 @@ func TestSystemInspectsNativeConstraintsAndIndexesWithoutMetadata(t *testing.T) 
 	}
 	statements := map[compat.Engine][]string{
 		compat.SQLite: {
-			`CREATE TABLE native_products (code TEXT NOT NULL, price INTEGER NOT NULL, active BOOLEAN NOT NULL, CHECK (price >= 0))`,
+			`CREATE TABLE native_products (code TEXT NOT NULL, price INTEGER NOT NULL DEFAULT 3, active BOOLEAN NOT NULL DEFAULT TRUE, status TEXT NOT NULL DEFAULT 'new', CHECK (price >= 0))`,
 			`CREATE UNIQUE INDEX native_products_code ON native_products (code ASC)`,
 			`CREATE INDEX native_products_active_price ON native_products (price DESC) WHERE active = TRUE`,
 			`CREATE TABLE native_parents (id INTEGER PRIMARY KEY, tenant INTEGER NOT NULL, code TEXT NOT NULL, UNIQUE (tenant, code))`,
 			`CREATE TABLE native_children (id INTEGER PRIMARY KEY, parent_tenant INTEGER NOT NULL, parent_code TEXT NOT NULL, FOREIGN KEY (parent_tenant, parent_code) REFERENCES native_parents (tenant, code))`,
 		},
 		compat.Postgres: {
-			`CREATE TABLE native_products (code TEXT NOT NULL, price BIGINT NOT NULL, active BOOLEAN NOT NULL, CHECK (price >= 0))`,
+			`CREATE TABLE native_products (code TEXT NOT NULL, price BIGINT NOT NULL DEFAULT 3, active BOOLEAN NOT NULL DEFAULT TRUE, status TEXT NOT NULL DEFAULT 'new', CHECK (price >= 0))`,
 			`CREATE UNIQUE INDEX native_products_code ON native_products (code ASC)`,
 			`CREATE INDEX native_products_active_price ON native_products (price DESC) WHERE active = TRUE`,
 			`CREATE TABLE native_parents (id BIGINT PRIMARY KEY, tenant BIGINT NOT NULL, code TEXT NOT NULL, UNIQUE (tenant, code))`,
@@ -751,6 +751,9 @@ func TestSystemInspectsNativeConstraintsAndIndexesWithoutMetadata(t *testing.T) 
 		if products == nil || len(products.Constraints) != 1 || products.Constraints[0].Kind != compat.Check {
 			t.Fatalf("%s missing native CHECK: %+v", store.Target.Engine, inspection.Schema)
 		}
+		if !hasColumnDefault(*products, "price", "integer", "3") || !hasColumnDefault(*products, "active", "boolean", "true") || !hasColumnDefault(*products, "status", "string", "new") {
+			t.Fatalf("%s native defaults were not reconstructed: %+v", store.Target.Engine, products.Columns)
+		}
 		if parents == nil || children == nil || !hasConstraint(*parents, compat.PrimaryKey, 1) || !hasConstraint(*parents, compat.UniqueKey, 2) || !hasConstraint(*children, compat.PrimaryKey, 1) || !hasConstraint(*children, compat.ForeignKey, 2) {
 			t.Fatalf("%s native key constraints were not reconstructed: %+v", store.Target.Engine, inspection.Schema.Tables)
 		}
@@ -776,6 +779,15 @@ func hasConstraint(table compat.Table, kind compat.ConstraintKind, columnCount i
 	for _, constraint := range table.Constraints {
 		if constraint.Kind == kind && len(constraint.Columns) == columnCount {
 			return true
+		}
+	}
+	return false
+}
+
+func hasColumnDefault(table compat.Table, columnName, kind, value string) bool {
+	for _, column := range table.Columns {
+		if column.Name == columnName {
+			return column.Default != nil && column.Default.Kind == kind && column.Default.Value == value
 		}
 	}
 	return false
