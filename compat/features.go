@@ -5,18 +5,22 @@ import "fmt"
 type Feature string
 
 const (
-	Tables         Feature = "tables"
-	PrimaryKeys    Feature = "primary_keys"
-	ForeignKeys    Feature = "foreign_keys"
-	CheckRules     Feature = "check_constraints"
-	Transactions   Feature = "transactions"
-	Indexes        Feature = "indexes"
-	JSONValues     Feature = "json"
-	UUIDValues     Feature = "uuid"
-	Triggers       Feature = "triggers"
-	Views          Feature = "views"
-	StoredRoutines Feature = "stored_routines"
-	FullText       Feature = "full_text"
+	Tables            Feature = "tables"
+	PrimaryKeys       Feature = "primary_keys"
+	ForeignKeys       Feature = "foreign_keys"
+	CheckRules        Feature = "check_constraints"
+	Transactions      Feature = "transactions"
+	Indexes           Feature = "indexes"
+	JSONValues        Feature = "json"
+	UUIDValues        Feature = "uuid"
+	Triggers          Feature = "triggers"
+	CanonicalTriggers Feature = "canonical_triggers"
+	Views             Feature = "views"
+	CanonicalViews    Feature = "canonical_views"
+	StoredRoutines    Feature = "stored_routines"
+	CanonicalRoutines Feature = "canonical_routines"
+	FullText          Feature = "full_text"
+	CanonicalFullText Feature = "canonical_full_text"
 )
 
 type MappingStatus string
@@ -50,7 +54,7 @@ func Audit(contract Contract) ([]Finding, error) {
 
 func assess(feature Feature) Finding {
 	switch feature {
-	case Tables, PrimaryKeys, ForeignKeys, CheckRules, Transactions, Indexes:
+	case Tables, PrimaryKeys, ForeignKeys, CheckRules, Transactions, Indexes, CanonicalViews, CanonicalTriggers, CanonicalRoutines, CanonicalFullText:
 		return Finding{Feature: feature, Status: Exact}
 	case JSONValues, UUIDValues:
 		return Finding{Feature: feature, Status: Exact, Reason: "lossless canonical text representation"}
@@ -75,6 +79,15 @@ func RequireExact(findings []Finding) error {
 // exact plan while omitting its difficult capabilities from the contract.
 func InferFeatures(schema Schema) []Feature {
 	seen := map[Feature]struct{}{Tables: {}}
+	if len(schema.Views) > 0 {
+		seen[CanonicalViews] = struct{}{}
+	}
+	if len(schema.Triggers) > 0 {
+		seen[CanonicalTriggers] = struct{}{}
+	}
+	if len(schema.Routines) > 0 {
+		seen[CanonicalRoutines] = struct{}{}
+	}
 	for _, table := range schema.Tables {
 		for _, column := range table.Columns {
 			switch column.Type.Family {

@@ -225,6 +225,242 @@ func TestSystemPreservesArbitraryPrecisionDecimals(t *testing.T) {
 	assertEquivalent(t, snapshot, postgresSnapshot)
 }
 
+func TestSystemCanonicalViewProducesEquivalentResults(t *testing.T) {
+	ctx := context.Background()
+	joinCondition := compat.Expression{Kind: "eq", Args: []compat.Expression{
+		{Kind: "column", Value: "s.product_id"},
+		{Kind: "column", Value: "p.id"},
+	}}
+	activeCondition := compat.Expression{Kind: "eq", Args: []compat.Expression{
+		{Kind: "column", Value: "p.active"},
+		{Kind: "boolean", Value: "true"},
+	}}
+	schema := compat.Schema{
+		Tables: []compat.Table{
+			{
+				Name: "view_products",
+				Columns: []compat.Column{
+					{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+					{Name: "name", Type: compat.Type{Family: compat.TextType}},
+					{Name: "active", Type: compat.Type{Family: compat.BooleanType}},
+				},
+				Constraints: []compat.Constraint{{Kind: compat.PrimaryKey, Columns: []string{"id"}}},
+			},
+			{
+				Name: "view_sales",
+				Columns: []compat.Column{
+					{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+					{Name: "product_id", Type: compat.Type{Family: compat.IntegerType}},
+					{Name: "amount", Type: compat.Type{Family: compat.IntegerType}},
+				},
+				Constraints: []compat.Constraint{
+					{Kind: compat.PrimaryKey, Columns: []string{"id"}},
+					{Kind: compat.ForeignKey, Columns: []string{"product_id"}, References: &compat.Reference{Table: "view_products", Columns: []string{"id"}}},
+				},
+			},
+		},
+		Views: []compat.View{{
+			Name: "active_sales",
+			Query: compat.SelectQuery{
+				Columns: []compat.Projection{
+					{Expression: compat.Expression{Kind: "column", Value: "p.name"}, Alias: "name"},
+					{Expression: compat.Expression{Kind: "sum", Args: []compat.Expression{{Kind: "column", Value: "s.amount"}}}, Alias: "total"},
+				},
+				From:  compat.TableSource{Table: "view_sales", Alias: "s"},
+				Joins: []compat.Join{{Kind: "inner", Table: compat.TableSource{Table: "view_products", Alias: "p"}, On: joinCondition}},
+				Where: &activeCondition,
+				GroupBy: []compat.Expression{
+					{Kind: "column", Value: "p.name"},
+				},
+			},
+		}},
+	}
+
+	source := openSQLite(t, filepath.Join(t.TempDir(), "views.db"))
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO view_products (id, name, active) VALUES (1, 'alpha', 1), (2, 'beta', 0)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO view_sales (id, product_id, amount) VALUES (1, 1, 10), (2, 1, 15), (3, 2, 100)`); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := source.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postgres := openPostgres(t)
+	if err := postgres.ImportSnapshot(ctx, snapshot); err != nil {
+		t.Fatal(err)
+	}
+
+	sqliteRows := queryNameTotals(t, source.DB)
+	postgresRows := queryNameTotals(t, postgres.DB)
+	if fmt.Sprint(sqliteRows) != fmt.Sprint(postgresRows) {
+		t.Fatalf("view results differ: sqlite=%v postgres=%v", sqliteRows, postgresRows)
+	}
+}
+
+func TestSystemCanonicalTriggerProducesEquivalentEffects(t *testing.T) {
+	ctx := context.Background()
+	schema := compat.Schema{
+		Tables: []compat.Table{
+			{
+				Name: "trigger_entries",
+				Columns: []compat.Column{
+					{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+					{Name: "title", Type: compat.Type{Family: compat.TextType}},
+				},
+				Constraints: []compat.Constraint{{Kind: compat.PrimaryKey, Columns: []string{"id"}}},
+			},
+			{
+				Name: "trigger_audit",
+				Columns: []compat.Column{
+					{Name: "entry_id", Type: compat.Type{Family: compat.IntegerType}},
+					{Name: "copied_title", Type: compat.Type{Family: compat.TextType}},
+				},
+			},
+		},
+		Triggers: []compat.Trigger{{
+			Name:   "capture_entry_insert",
+			Table:  "trigger_entries",
+			Timing: "after",
+			Event:  "insert",
+			Actions: []compat.TriggerAction{{
+				Kind:  "insert",
+				Table: "trigger_audit",
+				Assignments: []compat.Assignment{
+					{Column: "entry_id", Value: compat.Expression{Kind: "column", Value: "new.id"}},
+					{Column: "copied_title", Value: compat.Expression{Kind: "column", Value: "new.title"}},
+				},
+			}},
+		}},
+	}
+
+	sqlite := openSQLite(t, filepath.Join(t.TempDir(), "triggers.db"))
+	if err := sqlite.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	postgres := openPostgres(t)
+	if err := postgres.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	for _, store := range []*compat.Store{sqlite, postgres} {
+		if _, err := store.DB.ExecContext(ctx, `INSERT INTO trigger_entries (id, title) VALUES (1, 'captured')`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	query := func(db *sql.DB) string {
+		var value string
+		if err := db.QueryRow(`SELECT CAST(entry_id AS TEXT) || ':' || copied_title FROM trigger_audit`).Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	sqliteValue := query(sqlite.DB)
+	postgresValue := query(postgres.DB)
+	if sqliteValue != "1:captured" || postgresValue != sqliteValue {
+		t.Fatalf("trigger effects differ: sqlite=%q postgres=%q", sqliteValue, postgresValue)
+	}
+}
+
+func TestSystemCanonicalRoutineExecutesEqually(t *testing.T) {
+	ctx := context.Background()
+	schema := compat.Schema{
+		Tables: []compat.Table{{
+			Name: "routine_entries",
+			Columns: []compat.Column{
+				{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+				{Name: "title", Type: compat.Type{Family: compat.TextType}},
+			},
+			Constraints: []compat.Constraint{{Kind: compat.PrimaryKey, Columns: []string{"id"}}},
+		}},
+		Routines: []compat.Routine{{
+			Name: "create_entry",
+			Parameters: []compat.RoutineParameter{
+				{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+				{Name: "title", Type: compat.Type{Family: compat.TextType}},
+			},
+			Actions: []compat.RoutineAction{{
+				Kind:  "insert",
+				Table: "routine_entries",
+				Assignments: []compat.Assignment{
+					{Column: "id", Value: compat.Expression{Kind: "parameter", Value: "id"}},
+					{Column: "title", Value: compat.Expression{Kind: "parameter", Value: "title"}},
+				},
+			}},
+		}},
+	}
+
+	sqlite := openSQLite(t, filepath.Join(t.TempDir(), "routines.db"))
+	postgres := openPostgres(t)
+	for _, store := range []*compat.Store{sqlite, postgres} {
+		if err := store.ApplySchema(ctx, schema); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.CallRoutine(ctx, schema, "create_entry", map[string]compat.Value{
+			"id":    {Kind: compat.IntegerValue, Value: "1"},
+			"title": {Kind: compat.TextValue, Value: "created by routine"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sqliteSnapshot, err := sqlite.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postgresSnapshot, err := postgres.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEquivalent(t, sqliteSnapshot, postgresSnapshot)
+}
+
+func TestSystemCanonicalFullTextReturnsEquivalentResults(t *testing.T) {
+	ctx := context.Background()
+	schema := compat.Schema{Tables: []compat.Table{{
+		Name: "search_documents",
+		Columns: []compat.Column{
+			{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+			{Name: "title", Type: compat.Type{Family: compat.TextType}},
+			{Name: "body", Type: compat.Type{Family: compat.TextType}},
+		},
+		Constraints: []compat.Constraint{{Kind: compat.PrimaryKey, Columns: []string{"id"}}},
+	}}}
+	sqlite := openSQLite(t, filepath.Join(t.TempDir(), "search.db"))
+	if err := sqlite.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlite.DB.ExecContext(ctx, `INSERT INTO search_documents (id, title, body) VALUES
+		(1, 'Árboles del mundo', 'Una guía sobre árboles y bosques'),
+		(2, 'Bases de datos', 'SQLite y PostgreSQL'),
+		(3, 'Bosques', 'Árboles antiguos')`); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := sqlite.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postgres := openPostgres(t)
+	if err := postgres.ImportSnapshot(ctx, snapshot); err != nil {
+		t.Fatal(err)
+	}
+
+	sqliteResults, err := sqlite.SearchText(ctx, "search_documents", "id", []string{"title", "body"}, "árboles bosques")
+	if err != nil {
+		t.Fatal(err)
+	}
+	postgresResults, err := postgres.SearchText(ctx, "search_documents", "id", []string{"title", "body"}, "árboles bosques")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(sqliteResults) != fmt.Sprint(postgresResults) || len(sqliteResults) != 2 {
+		t.Fatalf("search results differ: sqlite=%v postgres=%v", sqliteResults, postgresResults)
+	}
+}
+
 func TestSystemPreservesJSONUUIDAndTimestampSemantics(t *testing.T) {
 	ctx := context.Background()
 	schema := compat.Schema{Tables: []compat.Table{{
@@ -363,6 +599,28 @@ func assertEquivalent(t *testing.T, source, destination compat.Snapshot) {
 	if err := compat.RequireEquivalent(report); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func queryNameTotals(t *testing.T, db *sql.DB) []string {
+	t.Helper()
+	rows, err := db.Query(`SELECT name, total FROM active_sales ORDER BY name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var result []string
+	for rows.Next() {
+		var name string
+		var total int64
+		if err := rows.Scan(&name, &total); err != nil {
+			t.Fatal(err)
+		}
+		result = append(result, fmt.Sprintf("%s:%d", name, total))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return result
 }
 
 func TestDatabaseDSNPreservesConnectionParameters(t *testing.T) {

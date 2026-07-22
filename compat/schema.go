@@ -6,7 +6,10 @@ import "fmt"
 // PostgreSQL DDL. Every engine-specific construct must be represented as an
 // explicit capability rather than hidden in a raw SQL string.
 type Schema struct {
-	Tables []Table `json:"tables"`
+	Tables   []Table   `json:"tables"`
+	Views    []View    `json:"views,omitempty"`
+	Triggers []Trigger `json:"triggers,omitempty"`
+	Routines []Routine `json:"routines,omitempty"`
 }
 
 type Table struct {
@@ -68,8 +71,86 @@ type Reference struct {
 // this layer because exact compatibility requires the expression to be parsed
 // and compiled separately for each target dialect.
 type Expression struct {
-	Kind  string `json:"kind"`
-	Value string `json:"value,omitempty"`
+	Kind  string       `json:"kind"`
+	Value string       `json:"value,omitempty"`
+	Args  []Expression `json:"args,omitempty"`
+}
+
+type View struct {
+	Name  string      `json:"name"`
+	Query SelectQuery `json:"query"`
+}
+
+type SelectQuery struct {
+	Distinct bool         `json:"distinct,omitempty"`
+	Columns  []Projection `json:"columns"`
+	From     TableSource  `json:"from"`
+	Joins    []Join       `json:"joins,omitempty"`
+	Where    *Expression  `json:"where,omitempty"`
+	GroupBy  []Expression `json:"group_by,omitempty"`
+	Having   *Expression  `json:"having,omitempty"`
+	OrderBy  []Ordering   `json:"order_by,omitempty"`
+	Limit    *int         `json:"limit,omitempty"`
+	Offset   *int         `json:"offset,omitempty"`
+}
+
+type Projection struct {
+	Expression Expression `json:"expression"`
+	Alias      string     `json:"alias,omitempty"`
+}
+
+type TableSource struct {
+	Table string `json:"table"`
+	Alias string `json:"alias,omitempty"`
+}
+
+type Join struct {
+	Kind  string      `json:"kind"`
+	Table TableSource `json:"table"`
+	On    Expression  `json:"on"`
+}
+
+type Ordering struct {
+	Expression Expression `json:"expression"`
+	Descending bool       `json:"descending,omitempty"`
+}
+
+type Trigger struct {
+	Name    string          `json:"name"`
+	Table   string          `json:"table"`
+	Timing  string          `json:"timing"`
+	Event   string          `json:"event"`
+	When    *Expression     `json:"when,omitempty"`
+	Actions []TriggerAction `json:"actions"`
+}
+
+type TriggerAction struct {
+	Kind        string       `json:"kind"`
+	Table       string       `json:"table"`
+	Assignments []Assignment `json:"assignments,omitempty"`
+	Where       *Expression  `json:"where,omitempty"`
+}
+
+type Assignment struct {
+	Column string     `json:"column"`
+	Value  Expression `json:"value"`
+}
+
+type Routine struct {
+	Name       string             `json:"name"`
+	Parameters []RoutineParameter `json:"parameters,omitempty"`
+	Actions    []RoutineAction    `json:"actions"`
+}
+
+type RoutineParameter struct {
+	Name string `json:"name"`
+	Type Type   `json:"type"`
+}
+
+type RoutineAction struct {
+	Kind        string       `json:"kind"`
+	Table       string       `json:"table"`
+	Assignments []Assignment `json:"assignments"`
 }
 
 func (s Schema) Validate() error {
@@ -94,6 +175,68 @@ func (s Schema) Validate() error {
 				return fmt.Errorf("duplicate column %q.%q", table.Name, column.Name)
 			}
 			columns[column.Name] = struct{}{}
+		}
+	}
+	views := make(map[string]struct{}, len(s.Views))
+	for _, view := range s.Views {
+		if view.Name == "" {
+			return fmt.Errorf("view name is required")
+		}
+		if _, exists := tables[view.Name]; exists {
+			return fmt.Errorf("view %q conflicts with a table", view.Name)
+		}
+		if _, exists := views[view.Name]; exists {
+			return fmt.Errorf("duplicate view %q", view.Name)
+		}
+		views[view.Name] = struct{}{}
+		if view.Query.From.Table == "" {
+			return fmt.Errorf("view %q has no source table", view.Name)
+		}
+		if len(view.Query.Columns) == 0 {
+			return fmt.Errorf("view %q has no projections", view.Name)
+		}
+	}
+	triggers := make(map[string]struct{}, len(s.Triggers))
+	for _, trigger := range s.Triggers {
+		if trigger.Name == "" || trigger.Table == "" {
+			return fmt.Errorf("trigger name and table are required")
+		}
+		if _, exists := triggers[trigger.Name]; exists {
+			return fmt.Errorf("duplicate trigger %q", trigger.Name)
+		}
+		triggers[trigger.Name] = struct{}{}
+		switch trigger.Timing {
+		case "before", "after":
+		default:
+			return fmt.Errorf("trigger %q has invalid timing %q", trigger.Name, trigger.Timing)
+		}
+		switch trigger.Event {
+		case "insert", "update", "delete":
+		default:
+			return fmt.Errorf("trigger %q has invalid event %q", trigger.Name, trigger.Event)
+		}
+		if len(trigger.Actions) == 0 {
+			return fmt.Errorf("trigger %q has no actions", trigger.Name)
+		}
+	}
+	routines := make(map[string]struct{}, len(s.Routines))
+	for _, routine := range s.Routines {
+		if routine.Name == "" || len(routine.Actions) == 0 {
+			return fmt.Errorf("routine name and actions are required")
+		}
+		if _, exists := routines[routine.Name]; exists {
+			return fmt.Errorf("duplicate routine %q", routine.Name)
+		}
+		routines[routine.Name] = struct{}{}
+		parameters := make(map[string]struct{}, len(routine.Parameters))
+		for _, parameter := range routine.Parameters {
+			if parameter.Name == "" || parameter.Type.Family == "" {
+				return fmt.Errorf("routine %q has an invalid parameter", routine.Name)
+			}
+			if _, exists := parameters[parameter.Name]; exists {
+				return fmt.Errorf("routine %q has duplicate parameter %q", routine.Name, parameter.Name)
+			}
+			parameters[parameter.Name] = struct{}{}
 		}
 	}
 	return nil

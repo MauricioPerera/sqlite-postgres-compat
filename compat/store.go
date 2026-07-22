@@ -147,7 +147,15 @@ func (store *Store) ImportSnapshot(ctx context.Context, snapshot Snapshot) error
 	if err := snapshot.Schema.Validate(); err != nil {
 		return err
 	}
-	if err := store.ApplySchema(ctx, snapshot.Schema); err != nil {
+	baseSchema := snapshot.Schema
+	baseSchema.Triggers = nil
+	baseStatements, err := CompileDDL(store.Target, baseSchema)
+	if err != nil {
+		return err
+	}
+	triggerSchema := Schema{Triggers: snapshot.Schema.Triggers}
+	triggerStatements, err := CompileDDL(store.Target, triggerSchema)
+	if err != nil {
 		return err
 	}
 	tx, err := store.DB.BeginTx(ctx, nil)
@@ -155,11 +163,21 @@ func (store *Store) ImportSnapshot(ctx context.Context, snapshot Snapshot) error
 		return err
 	}
 	defer tx.Rollback()
+	for _, statement := range baseStatements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("apply base schema: %w", err)
+		}
+	}
 	for _, table := range snapshot.Schema.Tables {
 		for _, row := range snapshot.Rows[table.Name] {
 			if err := insertRow(ctx, tx, store.Target.Engine, table, row); err != nil {
 				return err
 			}
+		}
+	}
+	for _, statement := range triggerStatements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("apply triggers: %w", err)
 		}
 	}
 	return tx.Commit()

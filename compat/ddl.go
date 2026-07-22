@@ -16,13 +16,27 @@ func CompileDDL(target Target, schema Schema) ([]string, error) {
 		return nil, err
 	}
 
-	statements := make([]string, 0, len(schema.Tables))
+	statements := make([]string, 0, len(schema.Tables)+len(schema.Views)+len(schema.Triggers)*2)
 	for _, table := range schema.Tables {
 		statement, err := compileTable(target.Engine, table)
 		if err != nil {
 			return nil, err
 		}
 		statements = append(statements, statement)
+	}
+	for _, view := range schema.Views {
+		query, err := compileSelect(target.Engine, view.Query)
+		if err != nil {
+			return nil, fmt.Errorf("view %s: %w", view.Name, err)
+		}
+		statements = append(statements, "CREATE VIEW "+quoteIdentifier(view.Name)+" AS "+query)
+	}
+	for _, trigger := range schema.Triggers {
+		compiled, err := compileTrigger(target.Engine, trigger)
+		if err != nil {
+			return nil, fmt.Errorf("trigger %s: %w", trigger.Name, err)
+		}
+		statements = append(statements, compiled...)
 	}
 	return statements, nil
 }
@@ -144,7 +158,7 @@ func compileConstraint(constraint Constraint) (string, error) {
 	}
 }
 
-func compileExpression(_ Engine, expression Expression) (string, error) {
+func compileExpression(engine Engine, expression Expression) (string, error) {
 	switch expression.Kind {
 	case "null":
 		return "NULL", nil
@@ -154,9 +168,239 @@ func compileExpression(_ Engine, expression Expression) (string, error) {
 		return "'" + strings.ReplaceAll(expression.Value, "'", "''") + "'", nil
 	case "integer", "decimal":
 		return expression.Value, nil
+	case "boolean":
+		if expression.Value == "true" {
+			return "TRUE", nil
+		}
+		if expression.Value == "false" {
+			return "FALSE", nil
+		}
+		return "", fmt.Errorf("invalid boolean %q", expression.Value)
+	case "column":
+		parts := strings.Split(expression.Value, ".")
+		for i, part := range parts {
+			if part == "" {
+				return "", fmt.Errorf("invalid column %q", expression.Value)
+			}
+			if i == 0 && (strings.EqualFold(part, "new") || strings.EqualFold(part, "old")) {
+				parts[i] = strings.ToUpper(part)
+			} else {
+				parts[i] = quoteIdentifier(part)
+			}
+		}
+		return strings.Join(parts, "."), nil
+	case "and", "or", "eq", "ne", "lt", "lte", "gt", "gte", "add", "sub", "mul", "div", "like":
+		if len(expression.Args) != 2 {
+			return "", fmt.Errorf("expression %q requires two arguments", expression.Kind)
+		}
+		left, err := compileExpression(engine, expression.Args[0])
+		if err != nil {
+			return "", err
+		}
+		right, err := compileExpression(engine, expression.Args[1])
+		if err != nil {
+			return "", err
+		}
+		operators := map[string]string{
+			"and": "AND", "or": "OR", "eq": "=", "ne": "<>", "lt": "<", "lte": "<=", "gt": ">", "gte": ">=",
+			"add": "+", "sub": "-", "mul": "*", "div": "/", "like": "LIKE",
+		}
+		return "(" + left + " " + operators[expression.Kind] + " " + right + ")", nil
+	case "not", "is_null", "is_not_null":
+		if len(expression.Args) != 1 {
+			return "", fmt.Errorf("expression %q requires one argument", expression.Kind)
+		}
+		argument, err := compileExpression(engine, expression.Args[0])
+		if err != nil {
+			return "", err
+		}
+		switch expression.Kind {
+		case "not":
+			return "(NOT " + argument + ")", nil
+		case "is_null":
+			return "(" + argument + " IS NULL)", nil
+		default:
+			return "(" + argument + " IS NOT NULL)", nil
+		}
+	case "count", "sum", "avg", "min", "max", "lower", "upper":
+		if len(expression.Args) != 1 {
+			return "", fmt.Errorf("function %q requires one argument", expression.Kind)
+		}
+		argument, err := compileExpression(engine, expression.Args[0])
+		if err != nil {
+			return "", err
+		}
+		return strings.ToUpper(expression.Kind) + "(" + argument + ")", nil
 	default:
 		return "", fmt.Errorf("expression %q has no compiler", expression.Kind)
 	}
+}
+
+func compileSelect(engine Engine, query SelectQuery) (string, error) {
+	if len(query.Columns) == 0 || query.From.Table == "" {
+		return "", fmt.Errorf("select requires projections and a source table")
+	}
+	projections := make([]string, len(query.Columns))
+	for i, projection := range query.Columns {
+		expression, err := compileExpression(engine, projection.Expression)
+		if err != nil {
+			return "", err
+		}
+		if projection.Alias != "" {
+			expression += " AS " + quoteIdentifier(projection.Alias)
+		}
+		projections[i] = expression
+	}
+	statement := "SELECT "
+	if query.Distinct {
+		statement += "DISTINCT "
+	}
+	statement += strings.Join(projections, ", ") + " FROM " + compileTableSource(query.From)
+	for _, join := range query.Joins {
+		kind := strings.ToUpper(join.Kind)
+		switch kind {
+		case "INNER", "LEFT", "CROSS":
+		default:
+			return "", fmt.Errorf("unsupported join kind %q", join.Kind)
+		}
+		statement += " " + kind + " JOIN " + compileTableSource(join.Table)
+		if kind != "CROSS" {
+			on, err := compileExpression(engine, join.On)
+			if err != nil {
+				return "", err
+			}
+			statement += " ON " + on
+		}
+	}
+	if query.Where != nil {
+		where, err := compileExpression(engine, *query.Where)
+		if err != nil {
+			return "", err
+		}
+		statement += " WHERE " + where
+	}
+	if len(query.GroupBy) > 0 {
+		group := make([]string, len(query.GroupBy))
+		for i, expression := range query.GroupBy {
+			compiled, err := compileExpression(engine, expression)
+			if err != nil {
+				return "", err
+			}
+			group[i] = compiled
+		}
+		statement += " GROUP BY " + strings.Join(group, ", ")
+	}
+	if query.Having != nil {
+		having, err := compileExpression(engine, *query.Having)
+		if err != nil {
+			return "", err
+		}
+		statement += " HAVING " + having
+	}
+	if len(query.OrderBy) > 0 {
+		order := make([]string, len(query.OrderBy))
+		for i, ordering := range query.OrderBy {
+			compiled, err := compileExpression(engine, ordering.Expression)
+			if err != nil {
+				return "", err
+			}
+			if ordering.Descending {
+				compiled += " DESC"
+			} else {
+				compiled += " ASC"
+			}
+			order[i] = compiled
+		}
+		statement += " ORDER BY " + strings.Join(order, ", ")
+	}
+	if query.Limit != nil {
+		if *query.Limit < 0 {
+			return "", fmt.Errorf("limit must be non-negative")
+		}
+		statement += " LIMIT " + fmt.Sprint(*query.Limit)
+	}
+	if query.Offset != nil {
+		if *query.Offset < 0 {
+			return "", fmt.Errorf("offset must be non-negative")
+		}
+		statement += " OFFSET " + fmt.Sprint(*query.Offset)
+	}
+	return statement, nil
+}
+
+func compileTableSource(source TableSource) string {
+	compiled := quoteIdentifier(source.Table)
+	if source.Alias != "" {
+		compiled += " AS " + quoteIdentifier(source.Alias)
+	}
+	return compiled
+}
+
+func compileTrigger(engine Engine, trigger Trigger) ([]string, error) {
+	actions := make([]string, len(trigger.Actions))
+	for i, action := range trigger.Actions {
+		compiled, err := compileTriggerAction(engine, action)
+		if err != nil {
+			return nil, err
+		}
+		actions[i] = compiled + ";"
+	}
+	timing := strings.ToUpper(trigger.Timing)
+	event := strings.ToUpper(trigger.Event)
+
+	if engine == SQLite {
+		statement := "CREATE TRIGGER " + quoteIdentifier(trigger.Name) + " " + timing + " " + event + " ON " + quoteIdentifier(trigger.Table) + " FOR EACH ROW"
+		if trigger.When != nil {
+			condition, err := compileExpression(engine, *trigger.When)
+			if err != nil {
+				return nil, err
+			}
+			statement += " WHEN " + condition
+		}
+		statement += " BEGIN " + strings.Join(actions, " ") + " END"
+		return []string{statement}, nil
+	}
+
+	functionName := "__compat_trigger_" + trigger.Name
+	returnValue := "NEW"
+	if trigger.Event == "delete" {
+		returnValue = "OLD"
+	}
+	body := "BEGIN " + strings.Join(actions, " ") + " RETURN " + returnValue + "; END"
+	function := "CREATE FUNCTION " + quoteIdentifier(functionName) + "() RETURNS TRIGGER LANGUAGE plpgsql AS '" + strings.ReplaceAll(body, "'", "''") + "'"
+	statement := "CREATE TRIGGER " + quoteIdentifier(trigger.Name) + " " + timing + " " + event + " ON " + quoteIdentifier(trigger.Table) + " FOR EACH ROW"
+	if trigger.When != nil {
+		condition, err := compileExpression(engine, *trigger.When)
+		if err != nil {
+			return nil, err
+		}
+		statement += " WHEN (" + condition + ")"
+	}
+	statement += " EXECUTE FUNCTION " + quoteIdentifier(functionName) + "()"
+	return []string{function, statement}, nil
+}
+
+func compileTriggerAction(engine Engine, action TriggerAction) (string, error) {
+	if action.Kind != "insert" {
+		return "", fmt.Errorf("unsupported trigger action %q", action.Kind)
+	}
+	if action.Table == "" || len(action.Assignments) == 0 {
+		return "", fmt.Errorf("insert trigger action requires table and assignments")
+	}
+	columns := make([]string, len(action.Assignments))
+	values := make([]string, len(action.Assignments))
+	for i, assignment := range action.Assignments {
+		if assignment.Column == "" {
+			return "", fmt.Errorf("trigger assignment column is required")
+		}
+		value, err := compileExpression(engine, assignment.Value)
+		if err != nil {
+			return "", err
+		}
+		columns[i] = quoteIdentifier(assignment.Column)
+		values[i] = value
+	}
+	return "INSERT INTO " + quoteIdentifier(action.Table) + " (" + strings.Join(columns, ", ") + ") VALUES (" + strings.Join(values, ", ") + ")", nil
 }
 
 func quoteIdentifier(identifier string) string {
