@@ -272,7 +272,7 @@ func canonicalValue(kind TypeFamily, source any) (Value, error) {
 	case DateType:
 		return Value{Kind: DateValue, Value: text}, nil
 	case TimestampType:
-		timestamp, err := time.Parse(time.RFC3339Nano, text)
+		timestamp, err := parseTimestamp(text)
 		if err != nil {
 			return Value{}, fmt.Errorf("invalid timestamp %q: %w", text, err)
 		}
@@ -291,7 +291,18 @@ func canonicalValue(kind TypeFamily, source any) (Value, error) {
 			}
 			return Value{}, fmt.Errorf("invalid JSON trailing data: %w", err)
 		}
-		return Value{Kind: JSONValue, Value: text}, nil
+		// Re-serialize the decoded document so every logically-equal JSON value
+		// converges on a single canonical byte form (sorted keys, compact, no
+		// extra spacing). The capture journal and the snapshot may emit the same
+		// object with differing key order or whitespace; storing the verbatim text
+		// made SnapshotDigest flag them as non-equivalent. UseNumber keeps numbers
+		// as json.Number, so json.Marshal reproduces the original digits without
+		// float64 precision loss.
+		canonical, err := json.Marshal(document)
+		if err != nil {
+			return Value{}, fmt.Errorf("canonicalize JSON: %w", err)
+		}
+		return Value{Kind: JSONValue, Value: string(canonical)}, nil
 	case UUIDType:
 		return Value{Kind: UUIDValue, Value: text}, nil
 	default:
@@ -337,6 +348,28 @@ func normalizeFloat(text string) (string, error) {
 		return "", err
 	}
 	return strconv.FormatFloat(parsed, 'g', -1, 64), nil
+}
+
+// timestampFormats are the text layouts canonicalValue accepts for a timestamp
+// column. The first entry is the canonical RFC 3339 form used by snapshots; the
+// remaining entries cover the text Postgres emits via CAST(column AS TEXT) when
+// the capture layer journals a Postgres source — a space separator, a short or
+// long numeric offset (or none, interpreted as UTC), and an optional fractional
+// seconds component.
+var timestampFormats = []string{
+	time.RFC3339Nano,
+	"2006-01-02 15:04:05.999999999Z07:00",
+	"2006-01-02 15:04:05.999999999Z07",
+	"2006-01-02 15:04:05.999999999",
+}
+
+func parseTimestamp(text string) (time.Time, error) {
+	for _, layout := range timestampFormats {
+		if timestamp, err := time.Parse(layout, text); err == nil {
+			return timestamp, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unrecognized timestamp format")
 }
 
 func normalizeBoolean(value string) string {

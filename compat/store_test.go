@@ -56,13 +56,38 @@ func TestSQLiteSnapshotRoundTrip(t *testing.T) {
 }
 
 func TestCanonicalJSONAndTimestampNormalization(t *testing.T) {
-	rawJSON := `{ "b": 123456789012345678901234567890, "a": 1 }`
-	jsonValue, err := canonicalValue(JSONType, rawJSON)
+	// Two logically-equal JSON documents with different key order and spacing
+	// must canonicalize to the same compact, key-sorted byte form. The previous
+	// implementation stored the verbatim text, so SnapshotDigest flagged these as
+	// non-equivalent (audit BUG 1).
+	loose := `{ "b": 123456789012345678901234567890, "a": 1 }`
+	tight := `{"a":1,"b":123456789012345678901234567890}`
+	looseValue, err := canonicalValue(JSONType, loose)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if jsonValue.Value != rawJSON {
-		t.Fatalf("unexpected JSON %s", jsonValue.Value)
+	tightValue, err := canonicalValue(JSONType, tight)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if looseValue.Value != tightValue.Value {
+		t.Fatalf("expected canonical equality, got %q vs %q", looseValue.Value, tightValue.Value)
+	}
+	if looseValue.Value != tight {
+		t.Fatalf("unexpected canonical JSON %q", looseValue.Value)
+	}
+	// High-precision numbers must survive canonicalization unchanged: UseNumber
+	// keeps json.Number, so json.Marshal re-emits the original digits.
+	precise, err := canonicalValue(JSONType, `{"pi":3.141592653589793238}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if precise.Value != `{"pi":3.141592653589793238}` {
+		t.Fatalf("high-precision number lost digits: %q", precise.Value)
+	}
+	// Invalid JSON must still error.
+	if _, err := canonicalValue(JSONType, `{bad`); err == nil {
+		t.Fatal("expected error for invalid JSON")
 	}
 
 	timestamp, err := canonicalValue(TimestampType, "2026-07-22T12:34:56.123456789-06:00")
@@ -71,6 +96,45 @@ func TestCanonicalJSONAndTimestampNormalization(t *testing.T) {
 	}
 	if timestamp.Value != "2026-07-22T18:34:56.123456789Z" {
 		t.Fatalf("unexpected timestamp %s", timestamp.Value)
+	}
+}
+
+func TestCanonicalTimestampPostgresFormats(t *testing.T) {
+	// Postgres journals timestamp columns via CAST(col AS TEXT), which emits a
+	// space separator, a short or long numeric offset (or none, read as UTC), and
+	// an optional fractional component. canonicalValue must accept all of them
+	// and normalize to RFC 3339 Nano UTC (audit BUG 2).
+	wholeSecond := []string{
+		"2026-07-22 16:06:34+00",
+		"2026-07-22 16:06:34+00:00",
+		"2026-07-22T16:06:34Z",
+	}
+	var first string
+	for _, raw := range wholeSecond {
+		value, err := canonicalValue(TimestampType, raw)
+		if err != nil {
+			t.Fatalf("canonicalValue(%q): %v", raw, err)
+		}
+		if value.Value != "2026-07-22T16:06:34Z" {
+			t.Fatalf("canonicalValue(%q) = %q, want 2026-07-22T16:06:34Z", raw, value.Value)
+		}
+		if first == "" {
+			first = value.Value
+		} else if value.Value != first {
+			t.Fatalf("canonicalValue(%q) = %q, want %q", raw, value.Value, first)
+		}
+	}
+
+	fractional, err := canonicalValue(TimestampType, "2026-07-22 16:06:34.123456+00")
+	if err != nil {
+		t.Fatalf("canonicalValue(fractional): %v", err)
+	}
+	if fractional.Value != "2026-07-22T16:06:34.123456Z" {
+		t.Fatalf("fractional = %q, want 2026-07-22T16:06:34.123456Z", fractional.Value)
+	}
+
+	if _, err := canonicalValue(TimestampType, "not-a-date"); err == nil {
+		t.Fatal("expected error for non-timestamp text")
 	}
 }
 
