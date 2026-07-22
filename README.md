@@ -82,3 +82,7 @@ AGENTS.md          # gramática canónica machine-facing para agentes/LLMs
 - [Informe de la última validación](docs/reports/VALIDATION_REPORT.md)
 - [Compatibilidad vectorial (libSQL/sqld ↔ pgvector)](docs/reports/VECTOR-COMPAT-REPORT.md)
 - [Especificación para agentes/LLMs](AGENTS.md): gramática canónica, CLIs y flujo de migración.
+
+## Licencia
+
+[MIT](LICENSE)
