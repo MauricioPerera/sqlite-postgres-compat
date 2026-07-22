@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 
@@ -47,6 +48,13 @@ func main() {
 		fail(cliout.ErrConfig, err)
 	}
 	if err := compat.RequireExact(findings); err != nil {
+		// The full findings array is emitted to stderr before the typed error
+		// envelope, mirroring compat-cutover exactly: an agent debugging a
+		// non-exact audit via compat-copy gets every feature verdict, not just
+		// the first failing one carried in the envelope's message.
+		fmt.Fprintln(os.Stderr, err)
+		encoded, _ := json.Marshal(findings)
+		fmt.Fprintln(os.Stderr, string(encoded))
 		fail(cliout.ErrAuditNotExact, err)
 	}
 
@@ -84,6 +92,13 @@ func main() {
 		fail(cliout.ErrInternal, err)
 	}
 	if err := compat.RequireEquivalent(report); err != nil {
+		// The structured VerificationReport (carrying both digests) is emitted to
+		// stderr before the typed error envelope, consistent with the findings
+		// path above: the digests survive as parseable JSON rather than only as
+		// free text inside the envelope's message field.
+		fmt.Fprintln(os.Stderr, err)
+		encoded, _ := json.Marshal(report)
+		fmt.Fprintln(os.Stderr, string(encoded))
 		fail(cliout.ErrVerifyDiverged, err)
 	}
 	if err := cliout.EmitJSON(report); err != nil {

@@ -530,10 +530,11 @@ func TestDryRunCLIUnreachableDestinationError(t *testing.T) {
 	}
 }
 
-// TestCutoverAuditCLIErrorCodeOnNotExact verifies that compat-audit emits a
+// TestAuditCLIErrorCodeOnNotExact verifies that compat-audit emits a
 // typed ERR_AUDIT_NOT_EXACT error JSON (in addition to its findings array) and
-// exits 1 when a required feature is not exact. It needs no PostgreSQL.
-func TestCutoverAuditCLIErrorCodeOnNotExact(t *testing.T) {
+// exits 1 when a required feature is not exact. It drives ./cmd/compat-audit
+// (not compat-cutover) and needs no PostgreSQL.
+func TestAuditCLIErrorCodeOnNotExact(t *testing.T) {
 	contract := map[string]any{
 		"source":           map[string]any{"engine": "sqlite", "version": map[string]any{"major": 3, "minor": 45, "patch": 0}},
 		"destination":      map[string]any{"engine": "postgres", "version": map[string]any{"major": 17, "minor": 0, "patch": 0}},

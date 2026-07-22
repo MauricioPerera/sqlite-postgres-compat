@@ -178,26 +178,31 @@ All CLIs take exactly one JSON config argument (`compat-cutover` accepts an opti
 
 ### 8.1 Typed error protocol (machine-facing)
 
-On any failure each CLI prints a single-line JSON error envelope to **stdout** (in addition to any result JSON it already emits) and exits with its current code (`1`, or `2` for `ERR_USAGE`):
+On any failure each CLI exits with its current code (`1`, or `2` for `ERR_USAGE`) and emits a machine-readable JSON signal. The shape of that signal depends on the failure path, so an agent should parse the per-case contract below rather than assume one fixed layout:
+
+- **Simple error envelope (default).** Most failures print a single-line JSON envelope to **stdout**, and nothing else machine-readable:
 
 ```json
 {"status":"error","code":"<CODE>","message":"<detalle>"}
 ```
 
-The line is always one parseable JSON object (the message is JSON-encoded, so embedded newlines never break it). An agent branches on `code`. The taxonomy is closed; the CLI picks the most specific applicable code. Free-text diagnostics still go to stderr for humans.
+- **`compat-cutover` diverged.** `ERR_VERIFY_DIVERGED` emits exactly **one** JSON line on stdout — the `cutoverReport` with the typed `code` embedded (`{"status":"diverged","code":"ERR_VERIFY_DIVERGED",...}`). There is no separate `{"status":"error",...}` envelope on this path.
+- **`compat-copy` not-exact or diverged.** Before the simple error envelope on stdout, `compat-copy` emits a structured JSON payload to **stderr**: the `[]Finding` array on `ERR_AUDIT_NOT_EXACT`, or the `VerificationReport` object on `ERR_VERIFY_DIVERGED`. The plain error envelope still follows on stdout with the same `code`; an agent reads the structured detail from stderr and the typed code from stdout.
+
+Each envelope line is one parseable JSON object (the message is JSON-encoded, so embedded newlines never break it). An agent branches on `code`. The taxonomy is closed; the CLI picks the most specific applicable code. Free-text diagnostics also go to stderr for humans.
 
 | Code | Emitted when | Exit |
 |---|---|---|
 | `ERR_USAGE` | Wrong argument count (or an unexpected flag). | `2` |
 | `ERR_CONFIG` | The config file is unreadable, fails to decode, or `compat.Audit` rejects the contract (`Contract.Validate`). Every config is decoded with `json.Decoder.DisallowUnknownFields`, so an unknown key is an explicit error rather than a silently-dropped key; a `schema`/`schema_ref` violation (both, neither, or an unreadable/invalid `schema_ref` file) is also `ERR_CONFIG`. | `1` |
-| `ERR_AUDIT_NOT_EXACT` | A required (or inferred) feature is not `exact` (`RequireExact` fails). `compat-audit` emits its findings array first, then this line. | `1` |
+| `ERR_AUDIT_NOT_EXACT` | A required (or inferred) feature is not `exact` (`RequireExact` fails). `compat-audit` emits its findings array to stdout, then this envelope; `compat-copy` and `compat-cutover` emit the findings array to stderr, then this envelope. | `1` |
 | `ERR_CONNECT_SOURCE` | The source store cannot be opened or pinged (`OpenStore`/`Ping` for the source). | `1` |
 | `ERR_CONNECT_DESTINATION` | The destination store cannot be opened or pinged (`OpenStore`/`Ping` for the destination). | `1` |
 | `ERR_SCHEMA` | `Schema.Validate` or `ApplySchema` fails. | `1` |
 | `ERR_SNAPSHOT` | `ExportSnapshot` or `ImportSnapshot` fails. | `1` |
 | `ERR_REPLICATION_CONFLICT` | A `compat.ConflictError` is raised while replaying the journal during catch-up (`ApplyChangesTolerant`). | `1` |
 | `ERR_CAPTURE` | `InstallChangeCapture` or `ReadCapturedChanges` fails. | `1` |
-| `ERR_VERIFY_DIVERGED` | Verification digests differ (`VerifySnapshots` → `Equivalent == false`). `compat-cutover` keeps its `diverged` result JSON and adds this `code`. | `1` |
+| `ERR_VERIFY_DIVERGED` | Verification digests differ (`VerifySnapshots` → `Equivalent == false`). `compat-cutover` emits one JSON line — its `diverged` result with this `code` embedded (no separate envelope). `compat-copy` emits its `VerificationReport` to stderr, then the error envelope with this `code`. | `1` |
 | `ERR_INTERNAL` | Any failure not covered above (e.g. `VerifySnapshots` returns an error, encoding fails, context cancellation). | `1` |
 
 Errors are classified by **phase heuristic** (which step of the flow failed) plus `errors.As` against the existing exported `compat.ConflictError`; the public `compat/` API is not extended. `compat-copy` maps a non-equivalent `VerificationReport` to `ERR_VERIFY_DIVERGED`.
@@ -225,7 +230,7 @@ Config: `{source_dsn, destination_dsn, contract, schema | schema_ref}`. Exactly 
 ```
 
 - Exit `0`: `equivalent == true`.
-- Exit `1`: any typed error (see 8.1) or `equivalent == false`, the latter reported as `ERR_VERIFY_DIVERGED`.
+- Exit `1`: any typed error (see 8.1). On `ERR_AUDIT_NOT_EXACT` the `[]Finding` array is printed to stderr before the envelope; on `ERR_VERIFY_DIVERGED` (digests differ) the `VerificationReport` is printed to stderr before the envelope, so the digests are recoverable as JSON rather than only as free text in the message.
 - Exit `2`: wrong argument count (`ERR_USAGE`). The destination must be empty for the described objects (import is additive).
 
 ### `compat-cutover <cutover.json>`

@@ -49,7 +49,7 @@ Ejecuta:
 go run ./cmd/compat-copy .\examples\migration.example.json
 ```
 
-El flujo audita las capacidades inferidas, exporta el origen, importa el destino y vuelve a exportarlo para verificar su hash canónico. El destino debe estar vacío para los objetos descritos. El proceso termina con código `1` ante cualquier error o falta de equivalencia exacta, y con código de salida 2 si el número de argumentos no es exactamente uno o se pasa un flag inesperado. En lugar de inlinear `schema`, podés usar `schema_ref` (ruta a un JSON con el `compat.Schema` canónico, resuelta relativa al archivo de config); debe haber exactamente uno de `schema` o `schema_ref`, si no `ERR_CONFIG` (ver cutover para el detalle).
+El flujo audita las capacidades inferidas, exporta el origen, importa el destino y vuelve a exportarlo para verificar su hash canónico. El destino debe estar vacío para los objetos descritos. El proceso termina con código `1` ante cualquier error o falta de equivalencia exacta, y con código de salida 2 si el número de argumentos no es exactamente uno o se pasa un flag inesperado. En lugar de inlinear `schema`, podés usar `schema_ref` (ruta a un JSON con el `compat.Schema` canónico, resuelta relativa al archivo de config); debe haber exactamente uno de `schema` o `schema_ref`, si no `ERR_CONFIG` (ver cutover para el detalle). En fallo: en `ERR_AUDIT_NOT_EXACT` imprime el arreglo `[]Finding` a stderr antes del envelope; en `ERR_VERIFY_DIVERGED` (digests distintos) imprime el `VerificationReport` a stderr antes del envelope, así los digests quedan como JSON parseable y no sólo como texto libre en el `message`.
 
 ## Usar el paquete Go
 
@@ -230,26 +230,31 @@ go run ./cmd/compat-cutover --dry-run .\cutover.json
 
 ### Códigos de error tipados (los 3 CLIs)
 
-Ante cualquier fallo, cada CLI imprime a **stdout** una línea JSON parseable (además del JSON de resultado que ya emita) y sale con su código actual (`1`, o `2` para `ERR_USAGE`):
+Ante cualquier fallo, cada CLI sale con su código actual (`1`, o `2` para `ERR_USAGE`) y emite una señal JSON legible por máquina. La forma de esa señal depende del camino de fallo, así que un agente debe parsear el contrato por caso en vez de asumir un único layout fijo:
+
+- **Envelope de error simple (por defecto).** La mayoría de los fallos imprime a **stdout** una sola línea JSON, y nada más legible por máquina:
 
 ```json
 {"status":"error","code":"<CODE>","message":"<detalle>"}
 ```
 
-Ramificá por `code`. La taxonomía es cerrada; el CLI elige el código más específico aplicable. El detalle libre sigue yendo a stderr para humanos.
+- **`compat-cutover` diverged.** `ERR_VERIFY_DIVERGED` emite **una sola** línea JSON en stdout — el `cutoverReport` con el `code` tipado embebido (`{"status":"diverged","code":"ERR_VERIFY_DIVERGED",...}`). No hay un envelope `{"status":"error",...}` separado en este camino.
+- **`compat-copy` not-exact o diverged.** Antes del envelope de error simple en stdout, `compat-copy` emite a **stderr** un payload JSON estructurado: el arreglo `[]Finding` en `ERR_AUDIT_NOT_EXACT`, o el objeto `VerificationReport` en `ERR_VERIFY_DIVERGED`. El envelope plano igual sigue en stdout con el mismo `code`; un agente lee el detalle estructurado de stderr y el código tipado de stdout.
+
+Cada línea de envelope es un objeto JSON parseable (el mensaje va JSON-encodeado, así que los newlines embebidos nunca la rompen). Ramificá por `code`. La taxonomía es cerrada; el CLI elige el código más específico aplicable. El detalle libre sigue yendo a stderr para humanos.
 
 | Código | Cuándo se emite | Exit |
 |---|---|---|
 | `ERR_USAGE` | Cantidad de argumentos incorrecta (o flag inesperado: cualquier argumento que empiece con `-` y no sea un flag reconocido, p. ej. `--bogus`). | `2` |
 | `ERR_CONFIG` | La config no se puede leer, falla el decode, o `Audit` rechaza el contrato. Toda config se decodifica con `json.Decoder.DisallowUnknownFields`, así que una key desconocida es un error explícito (no se dropea en silencio); una violación de `schema`/`schema_ref` (ambos, ninguno, o un archivo `schema_ref` ilegible/JSON inválido) también es `ERR_CONFIG`. | `1` |
-| `ERR_AUDIT_NOT_EXACT` | Una feature requerida (o inferida) no es `exact` (`RequireExact` falla). `compat-audit` imprime el arreglo de findings primero y después esta línea. | `1` |
+| `ERR_AUDIT_NOT_EXACT` | Una feature requerida (o inferida) no es `exact` (`RequireExact` falla). `compat-audit` imprime el arreglo de findings a stdout y después este envelope; `compat-copy` y `compat-cutover` imprimen el arreglo de findings a stderr y después este envelope. | `1` |
 | `ERR_CONNECT_SOURCE` | No se puede abrir o hacer ping al store origen. | `1` |
 | `ERR_CONNECT_DESTINATION` | No se puede abrir o hacer ping al store destino. | `1` |
 | `ERR_SCHEMA` | Falla `Schema.Validate` o `ApplySchema`. | `1` |
 | `ERR_SNAPSHOT` | Falla `ExportSnapshot` o `ImportSnapshot`. | `1` |
 | `ERR_REPLICATION_CONFLICT` | Se raises un `ConflictError` al reaplicar el journal en el catch-up. | `1` |
 | `ERR_CAPTURE` | Falla `InstallChangeCapture` o `ReadCapturedChanges`. | `1` |
-| `ERR_VERIFY_DIVERGED` | Los digests difieren (`Equivalent == false`). `compat-cutover` conserva su JSON `diverged` y le agrega este `code`. | `1` |
+| `ERR_VERIFY_DIVERGED` | Los digests difieren (`Equivalent == false`). `compat-cutover` emite una sola línea JSON — su resultado `diverged` con este `code` embebido (sin envelope separado). `compat-copy` emite su `VerificationReport` a stderr y después el envelope con este `code`. | `1` |
 | `ERR_INTERNAL` | Cualquier fallo no cubierto arriba. | `1` |
 
 La clasificación es por **heurística de fase** (qué paso del flujo falló) más `errors.As` contra el `ConflictError` ya exportado; la API pública de `compat/` no se extiende.
