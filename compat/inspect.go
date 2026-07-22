@@ -88,12 +88,13 @@ func (store *Store) inspectSQLite(ctx context.Context) (Inspection, error) {
 		if err != nil {
 			return Inspection{}, err
 		}
-		inspection.Schema.Tables = append(inspection.Schema.Tables, table)
 		inspection.Unresolved = append(inspection.Unresolved, checks...)
-		indexes, unresolved, err := store.inspectSQLiteIndexes(ctx, item.name)
+		indexes, uniqueConstraints, unresolved, err := store.inspectSQLiteIndexes(ctx, item.name)
 		if err != nil {
 			return Inspection{}, err
 		}
+		table.Constraints = append(table.Constraints, uniqueConstraints...)
+		inspection.Schema.Tables = append(inspection.Schema.Tables, table)
 		inspection.Schema.Indexes = append(inspection.Schema.Indexes, indexes...)
 		inspection.Unresolved = append(inspection.Unresolved, unresolved...)
 	}
@@ -106,7 +107,6 @@ func (store *Store) inspectSQLiteTable(ctx context.Context, name, definition str
 	if err != nil {
 		return Table{}, nil, err
 	}
-	defer rows.Close()
 	table := Table{Name: name}
 	var primary []string
 	for rows.Next() {
@@ -126,6 +126,9 @@ func (store *Store) inspectSQLiteTable(ctx context.Context, name, definition str
 	if err := rows.Err(); err != nil {
 		return Table{}, nil, err
 	}
+	if err := rows.Close(); err != nil {
+		return Table{}, nil, err
+	}
 	var unresolved []CatalogObject
 	for _, source := range extractCheckExpressions(definition) {
 		expression, err := parseCatalogExpression(source)
@@ -135,13 +138,54 @@ func (store *Store) inspectSQLiteTable(ctx context.Context, name, definition str
 		}
 		table.Constraints = append(table.Constraints, Constraint{Kind: Check, Expression: &expression})
 	}
+	foreignRows, err := store.DB.QueryContext(ctx, `SELECT id, seq, "table", "from", "to", on_update, on_delete, "match" FROM pragma_foreign_key_list(?) ORDER BY id, seq`, name)
+	if err != nil {
+		return Table{}, nil, err
+	}
+	type foreignKey struct {
+		columns, referenceColumns []string
+		referenceTable            string
+		valid                     bool
+	}
+	foreign := map[int]*foreignKey{}
+	var foreignOrder []int
+	for foreignRows.Next() {
+		var id, sequence int
+		var referenceTable, column, referenceColumn, onUpdate, onDelete, match string
+		if err := foreignRows.Scan(&id, &sequence, &referenceTable, &column, &referenceColumn, &onUpdate, &onDelete, &match); err != nil {
+			foreignRows.Close()
+			return Table{}, nil, err
+		}
+		key := foreign[id]
+		if key == nil {
+			key = &foreignKey{referenceTable: referenceTable, valid: true}
+			foreign[id] = key
+			foreignOrder = append(foreignOrder, id)
+		}
+		key.columns = append(key.columns, column)
+		key.referenceColumns = append(key.referenceColumns, referenceColumn)
+		if onUpdate != "NO ACTION" || onDelete != "NO ACTION" || match != "NONE" {
+			key.valid = false
+		}
+	}
+	if err := foreignRows.Close(); err != nil {
+		return Table{}, nil, err
+	}
+	for _, id := range foreignOrder {
+		key := foreign[id]
+		if !key.valid {
+			unresolved = append(unresolved, CatalogObject{Kind: "foreign_key", Name: fmt.Sprintf("%s#%d", name, id), Reason: "referential actions or match mode are outside the canonical foreign-key grammar"})
+			continue
+		}
+		table.Constraints = append(table.Constraints, Constraint{Kind: ForeignKey, Columns: key.columns, References: &Reference{Table: key.referenceTable, Columns: key.referenceColumns}})
+	}
 	return table, unresolved, nil
 }
 
-func (store *Store) inspectSQLiteIndexes(ctx context.Context, tableName string) ([]Index, []CatalogObject, error) {
+func (store *Store) inspectSQLiteIndexes(ctx context.Context, tableName string) ([]Index, []Constraint, []CatalogObject, error) {
 	rows, err := store.DB.QueryContext(ctx, `SELECT name, "unique", origin, partial FROM pragma_index_list(?) ORDER BY seq`, tableName)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	type catalogIndex struct {
 		name    string
@@ -154,24 +198,24 @@ func (store *Store) inspectSQLiteIndexes(ctx context.Context, tableName string) 
 		var item catalogIndex
 		if err := rows.Scan(&item.name, &item.unique, &item.origin, &item.partial); err != nil {
 			rows.Close()
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		catalog = append(catalog, item)
 	}
 	if err := rows.Close(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	var indexes []Index
+	var constraints []Constraint
 	var unresolved []CatalogObject
 	for _, item := range catalog {
-		if item.origin != "c" {
-			unresolved = append(unresolved, CatalogObject{Kind: "index", Name: item.name, Reason: "constraint-backed indexes require constraint translation"})
+		if item.origin == "pk" {
 			continue
 		}
 		index := Index{Name: item.name, Table: tableName, Unique: item.unique != 0}
 		columns, err := store.DB.QueryContext(ctx, `SELECT cid, name, "desc", key FROM pragma_index_xinfo(?) ORDER BY seqno`, item.name)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		valid := true
 		for columns.Next() {
@@ -179,7 +223,7 @@ func (store *Store) inspectSQLiteIndexes(ctx context.Context, tableName string) 
 			var name sql.NullString
 			if err := columns.Scan(&cid, &name, &descending, &key); err != nil {
 				columns.Close()
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			if key == 0 {
 				continue
@@ -191,11 +235,11 @@ func (store *Store) inspectSQLiteIndexes(ctx context.Context, tableName string) 
 			index.Columns = append(index.Columns, IndexColumn{Column: name.String, Descending: descending != 0})
 		}
 		if err := columns.Close(); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		var definition string
 		if err := store.DB.QueryRowContext(ctx, `SELECT COALESCE(sql, '') FROM sqlite_master WHERE type = 'index' AND name = ?`, item.name).Scan(&definition); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if item.partial != 0 {
 			predicate := extractIndexPredicate(definition)
@@ -210,9 +254,17 @@ func (store *Store) inspectSQLiteIndexes(ctx context.Context, tableName string) 
 			unresolved = append(unresolved, CatalogObject{Kind: "index", Name: item.name, Definition: definition, Reason: "expression, collation or predicate is outside the canonical index grammar"})
 			continue
 		}
+		if item.origin == "u" {
+			columns := make([]string, len(index.Columns))
+			for i, column := range index.Columns {
+				columns[i] = column.Column
+			}
+			constraints = append(constraints, Constraint{Kind: UniqueKey, Columns: columns})
+			continue
+		}
 		indexes = append(indexes, index)
 	}
-	return indexes, unresolved, nil
+	return indexes, constraints, unresolved, nil
 }
 
 func sqliteTypeFamily(declared string) TypeFamily {
@@ -274,32 +326,61 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 	for _, name := range order {
 		inspection.Schema.Tables = append(inspection.Schema.Tables, *tables[name])
 	}
-	constraints, err := store.DB.QueryContext(ctx, `SELECT tbl.relname, con.conname, con.contype::text, COALESCE(pg_get_expr(con.conbin, con.conrelid), '')
+	constraints, err := store.DB.QueryContext(ctx, `SELECT tbl.relname, con.conname, con.contype::text, COALESCE(pg_get_expr(con.conbin, con.conrelid), ''),
+		COALESCE((SELECT json_agg(att.attname ORDER BY key.ord)::text FROM unnest(con.conkey) WITH ORDINALITY key(attnum, ord) JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = key.attnum), '[]'),
+		COALESCE(ref.relname, ''),
+		COALESCE((SELECT json_agg(att.attname ORDER BY key.ord)::text FROM unnest(con.confkey) WITH ORDINALITY key(attnum, ord) JOIN pg_attribute att ON att.attrelid = con.confrelid AND att.attnum = key.attnum), '[]'),
+		con.confupdtype::text, con.confdeltype::text, con.confmatchtype::text, con.condeferrable, con.condeferred
 		FROM pg_constraint con
 		JOIN pg_class tbl ON tbl.oid = con.conrelid
 		JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+		LEFT JOIN pg_class ref ON ref.oid = con.confrelid
 		WHERE ns.nspname = current_schema()
 		ORDER BY tbl.relname, con.conname`)
 	if err != nil {
 		return Inspection{}, err
 	}
 	for constraints.Next() {
-		var tableName, name, kind, definition string
-		if err := constraints.Scan(&tableName, &name, &kind, &definition); err != nil {
+		var tableName, name, kind, definition, columnsJSON, referenceTable, referenceColumnsJSON string
+		var onUpdate, onDelete, match string
+		var deferrable, deferred bool
+		if err := constraints.Scan(&tableName, &name, &kind, &definition, &columnsJSON, &referenceTable, &referenceColumnsJSON, &onUpdate, &onDelete, &match, &deferrable, &deferred); err != nil {
 			constraints.Close()
 			return Inspection{}, err
 		}
-		if kind != "c" {
-			inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "constraint", Name: name, Definition: definition, Reason: "primary, unique and foreign constraints require catalog translation"})
+		var columns, referenceColumns []string
+		if err := json.Unmarshal([]byte(columnsJSON), &columns); err != nil {
+			constraints.Close()
+			return Inspection{}, err
+		}
+		if err := json.Unmarshal([]byte(referenceColumnsJSON), &referenceColumns); err != nil {
+			constraints.Close()
+			return Inspection{}, err
+		}
+		table := tables[tableName]
+		if table == nil {
 			continue
 		}
-		expression, err := parseCatalogExpression(definition)
-		if err != nil {
-			inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "check", Name: name, Definition: definition, Reason: err.Error()})
-			continue
-		}
-		if table := tables[tableName]; table != nil {
+		switch kind {
+		case "p":
+			table.Constraints = append(table.Constraints, Constraint{Kind: PrimaryKey, Columns: columns})
+		case "u":
+			table.Constraints = append(table.Constraints, Constraint{Kind: UniqueKey, Columns: columns})
+		case "f":
+			if onUpdate != "a" || onDelete != "a" || match != "s" || deferrable || deferred {
+				inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "foreign_key", Name: name, Reason: "referential actions, match mode or deferral are outside the canonical foreign-key grammar"})
+				continue
+			}
+			table.Constraints = append(table.Constraints, Constraint{Kind: ForeignKey, Columns: columns, References: &Reference{Table: referenceTable, Columns: referenceColumns}})
+		case "c":
+			expression, err := parseCatalogExpression(definition)
+			if err != nil {
+				inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "check", Name: name, Definition: definition, Reason: err.Error()})
+				continue
+			}
 			table.Constraints = append(table.Constraints, Constraint{Kind: Check, Expression: &expression})
+		default:
+			inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "constraint", Name: name, Definition: definition, Reason: "constraint kind is outside the canonical grammar"})
 		}
 	}
 	if err := constraints.Close(); err != nil {

@@ -19,7 +19,7 @@ La batería se ejecutó contra SQLite real y PostgreSQL 17.5 real proporcionado 
 - Comportamiento equivalente de claves foráneas.
 - Restricciones `CHECK` canónicas aplicadas y rechazando los mismos datos inválidos.
 - Índices canónicos únicos, parciales y descendentes creados y aplicados en ambos motores.
-- Reconstrucción desde catálogos externos, sin metadatos del framework, de restricciones `CHECK` e índices comunes.
+- Reconstrucción desde catálogos externos, sin metadatos del framework, de claves primarias, restricciones `UNIQUE`, claves foráneas compuestas, restricciones `CHECK` e índices comunes.
 - Rechazo explícito de expresiones, métodos, colaciones y clases de operador que no pertenecen a la gramática canónica comprobada.
 - Vistas canónicas con joins, filtros, agrupaciones y agregaciones.
 - Triggers canónicos con efectos equivalentes.

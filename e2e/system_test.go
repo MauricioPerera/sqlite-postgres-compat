@@ -696,7 +696,7 @@ func TestSystemEnforcesCanonicalChecksAndIndexesEqually(t *testing.T) {
 	assertStoreSnapshotsEquivalent(t, ctx, schema, stores[0], stores[1])
 }
 
-func TestSystemInspectsNativeChecksAndIndexesWithoutMetadata(t *testing.T) {
+func TestSystemInspectsNativeConstraintsAndIndexesWithoutMetadata(t *testing.T) {
 	ctx := context.Background()
 	sqlite := openSQLite(t, filepath.Join(t.TempDir(), "native-catalog.db"))
 	postgres := openPostgres(t)
@@ -713,11 +713,15 @@ func TestSystemInspectsNativeChecksAndIndexesWithoutMetadata(t *testing.T) {
 			`CREATE TABLE native_products (code TEXT NOT NULL, price INTEGER NOT NULL, active BOOLEAN NOT NULL, CHECK (price >= 0))`,
 			`CREATE UNIQUE INDEX native_products_code ON native_products (code ASC)`,
 			`CREATE INDEX native_products_active_price ON native_products (price DESC) WHERE active = TRUE`,
+			`CREATE TABLE native_parents (id INTEGER PRIMARY KEY, tenant INTEGER NOT NULL, code TEXT NOT NULL, UNIQUE (tenant, code))`,
+			`CREATE TABLE native_children (id INTEGER PRIMARY KEY, parent_tenant INTEGER NOT NULL, parent_code TEXT NOT NULL, FOREIGN KEY (parent_tenant, parent_code) REFERENCES native_parents (tenant, code))`,
 		},
 		compat.Postgres: {
 			`CREATE TABLE native_products (code TEXT NOT NULL, price BIGINT NOT NULL, active BOOLEAN NOT NULL, CHECK (price >= 0))`,
 			`CREATE UNIQUE INDEX native_products_code ON native_products (code ASC)`,
 			`CREATE INDEX native_products_active_price ON native_products (price DESC) WHERE active = TRUE`,
+			`CREATE TABLE native_parents (id BIGINT PRIMARY KEY, tenant BIGINT NOT NULL, code TEXT NOT NULL, UNIQUE (tenant, code))`,
+			`CREATE TABLE native_children (id BIGINT PRIMARY KEY, parent_tenant BIGINT NOT NULL, parent_code TEXT NOT NULL, FOREIGN KEY (parent_tenant, parent_code) REFERENCES native_parents (tenant, code))`,
 		},
 	}
 	for _, store := range []*compat.Store{sqlite, postgres} {
@@ -733,8 +737,22 @@ func TestSystemInspectsNativeChecksAndIndexesWithoutMetadata(t *testing.T) {
 		if !inspection.Exact || len(inspection.Unresolved) != 0 {
 			t.Fatalf("%s native catalog was not translated exactly: %+v", store.Target.Engine, inspection)
 		}
-		if len(inspection.Schema.Tables) != 1 || len(inspection.Schema.Tables[0].Constraints) != 1 || inspection.Schema.Tables[0].Constraints[0].Kind != compat.Check {
+		var products, parents, children *compat.Table
+		for i := range inspection.Schema.Tables {
+			switch inspection.Schema.Tables[i].Name {
+			case "native_products":
+				products = &inspection.Schema.Tables[i]
+			case "native_parents":
+				parents = &inspection.Schema.Tables[i]
+			case "native_children":
+				children = &inspection.Schema.Tables[i]
+			}
+		}
+		if products == nil || len(products.Constraints) != 1 || products.Constraints[0].Kind != compat.Check {
 			t.Fatalf("%s missing native CHECK: %+v", store.Target.Engine, inspection.Schema)
+		}
+		if parents == nil || children == nil || !hasConstraint(*parents, compat.PrimaryKey, 1) || !hasConstraint(*parents, compat.UniqueKey, 2) || !hasConstraint(*children, compat.PrimaryKey, 1) || !hasConstraint(*children, compat.ForeignKey, 2) {
+			t.Fatalf("%s native key constraints were not reconstructed: %+v", store.Target.Engine, inspection.Schema.Tables)
 		}
 		if len(inspection.Schema.Indexes) != 2 {
 			t.Fatalf("%s missing native indexes: %+v", store.Target.Engine, inspection.Schema.Indexes)
@@ -752,6 +770,15 @@ func TestSystemInspectsNativeChecksAndIndexesWithoutMetadata(t *testing.T) {
 			t.Fatalf("%s native index semantics lost: %+v", store.Target.Engine, inspection.Schema.Indexes)
 		}
 	}
+}
+
+func hasConstraint(table compat.Table, kind compat.ConstraintKind, columnCount int) bool {
+	for _, constraint := range table.Constraints {
+		if constraint.Kind == kind && len(constraint.Columns) == columnCount {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSystemClaimsExactCoverageForRequiredFeatureFamilies(t *testing.T) {
