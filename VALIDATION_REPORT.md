@@ -26,6 +26,7 @@ La batería se ejecutó contra SQLite real y PostgreSQL 17.5 real proporcionado 
 - Reconstrucción de vistas con joins `INNER`, `LEFT` y `CROSS`, condiciones compuestas y agregaciones `COUNT`, `SUM`, `AVG`, `MIN` y `MAX`.
 - Reconstrucción de triggers externos `BEFORE`/`AFTER` para `INSERT`, `UPDATE` y `DELETE` con condición e inserciones de auditoría basadas en `NEW`/`OLD`.
 - Detección explícita de funciones y procedimientos PostgreSQL independientes todavía no traducidos.
+- Traducción de procedimientos PostgreSQL `SQL`/`PLpgSQL` parametrizados con inserciones canónicas y ejecución equivalente mediante el runtime común sobre SQLite y PostgreSQL.
 - Detección explícita de defaults no portables, identidades y columnas generadas.
 - Rechazo explícito de expresiones, métodos, colaciones y clases de operador que no pertenecen a la gramática canónica comprobada.
 - Vistas canónicas con joins, filtros, agrupaciones y agregaciones.
@@ -50,7 +51,7 @@ La prueba de cobertura integral falla porque el sistema aún no proporciona equi
 - Índices y expresiones de índice.
 - Triggers con acciones distintas de inserciones canónicas o sintaxis procedural arbitraria.
 - Vistas con subconsultas, operaciones de conjuntos, ventanas u otras extensiones todavía fuera del parser común.
-- Rutinas almacenadas.
+- Funciones con retorno, parámetros avanzados o lógica procedural fuera de las inserciones canónicas.
 - Búsqueda de texto completo.
 
 El resultado de la batería es 15 pruebas superiores superadas y 1 fallida. Esta proporción no representa un porcentaje de compatibilidad total; el fallo significa que el objetivo del 100% no está cumplido.

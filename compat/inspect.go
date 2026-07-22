@@ -497,9 +497,10 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 	if err := triggers.Close(); err != nil {
 		return Inspection{}, err
 	}
-	routines, err := store.DB.QueryContext(ctx, `SELECT proc.proname, pg_get_functiondef(proc.oid)
+	routines, err := store.DB.QueryContext(ctx, `SELECT proc.proname, proc.prosrc, pg_get_function_arguments(proc.oid), COALESCE(pg_get_function_result(proc.oid), ''), lang.lanname, proc.prokind::text, pg_get_functiondef(proc.oid)
 		FROM pg_proc proc
 		JOIN pg_namespace ns ON ns.oid = proc.pronamespace
+		JOIN pg_language lang ON lang.oid = proc.prolang
 		WHERE ns.nspname = current_schema()
 		AND NOT EXISTS (SELECT 1 FROM pg_trigger trg WHERE trg.tgfoid = proc.oid)
 		ORDER BY proc.proname`)
@@ -507,12 +508,17 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 		return Inspection{}, err
 	}
 	for routines.Next() {
-		var name, definition string
-		if err := routines.Scan(&name, &definition); err != nil {
+		var name, body, arguments, resultType, language, kind, definition string
+		if err := routines.Scan(&name, &body, &arguments, &resultType, &language, &kind, &definition); err != nil {
 			routines.Close()
 			return Inspection{}, err
 		}
-		inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "routine", Name: name, Definition: definition, Reason: "stored routine requires procedural-language translation"})
+		routine, err := parsePostgresCatalogRoutine(name, body, arguments, resultType, language, kind)
+		if err != nil {
+			inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "routine", Name: name, Definition: definition, Reason: err.Error()})
+		} else {
+			inspection.Schema.Routines = append(inspection.Schema.Routines, routine)
+		}
 	}
 	if err := routines.Close(); err != nil {
 		return Inspection{}, err

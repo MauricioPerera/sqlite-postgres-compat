@@ -844,6 +844,26 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 			t.Fatalf("%s joined aggregate view differs: tenant=%d count=%d error=%v", store.Target.Engine, tenant, childCount, err)
 		}
 		if store.Target.Engine == compat.Postgres {
+			if _, err := store.DB.ExecContext(ctx, `CREATE PROCEDURE native_write_audit(p_code TEXT) LANGUAGE plpgsql AS $$ BEGIN INSERT INTO native_audit (product_code) VALUES (p_code); END $$`); err != nil {
+				t.Fatal(err)
+			}
+			withProcedure, err := store.InspectSchema(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !withProcedure.Exact || len(withProcedure.Schema.Routines) != 1 || withProcedure.Schema.Routines[0].Name != "native_write_audit" {
+				t.Fatalf("canonical PostgreSQL procedure was not translated: %+v", withProcedure)
+			}
+			arguments := map[string]compat.Value{"p_code": {Kind: compat.TextValue, Value: "R"}}
+			for _, runtimeStore := range []*compat.Store{sqlite, postgres} {
+				if err := runtimeStore.CallRoutine(ctx, withProcedure.Schema, "native_write_audit", arguments); err != nil {
+					t.Fatalf("%s translated routine: %v", runtimeStore.Target.Engine, err)
+				}
+				var routineRows int
+				if err := runtimeStore.DB.QueryRowContext(ctx, `SELECT count(*) FROM native_audit WHERE product_code = 'R'`).Scan(&routineRows); err != nil || routineRows != 1 {
+					t.Fatalf("%s translated routine behavior differs: rows=%d error=%v", runtimeStore.Target.Engine, routineRows, err)
+				}
+			}
 			if _, err := store.DB.ExecContext(ctx, `CREATE FUNCTION native_standalone() RETURNS BIGINT LANGUAGE SQL AS 'SELECT 1'`); err != nil {
 				t.Fatal(err)
 			}
