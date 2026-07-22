@@ -367,34 +367,69 @@ func parseTypeArguments(declared string) []int {
 }
 
 func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
-	// atttypmod is NOT a column of information_schema.columns in PostgreSQL 17
-	// (selecting it raises 42703), so it cannot be read straight from that view.
-	// pgvector stores the vector dimension verbatim in pg_attribute.atttypmod, so
-	// for udt_name='vector' columns we fetch it via a scalar subquery correlated
-	// on (schema, table, column) against pg_attribute joined to pg_class and
-	// pg_namespace. The correlation keys on c.table_schema (not a bare
-	// current_schema()) so homonym tables in other schemas cannot leak in, and
-	// NOT a.attisdropped excludes dropped columns (a dropped column keeps its
-	// attname but is marked dropped; only the live attribute is selected). For
-	// non-vector columns atttypmod is unused downstream, so it defaults to -1 and
-	// the subquery is not evaluated at all.
-	rows, err := store.DB.QueryContext(ctx, `SELECT c.table_name, c.column_name, c.data_type, c.udt_name,
-		CASE WHEN c.udt_name = 'vector'
-			THEN COALESCE((SELECT a.atttypmod
-				FROM pg_attribute a
-				JOIN pg_class cl ON cl.oid = a.attrelid
-				JOIN pg_namespace n ON n.oid = cl.relnamespace
-				WHERE n.nspname = c.table_schema AND cl.relname = c.table_name AND a.attname = c.column_name AND NOT a.attisdropped), -1)
-			ELSE -1 END AS atttypmod,
-		c.is_nullable, c.column_default, c.is_identity, c.is_generated
-		FROM information_schema.columns c
-		WHERE c.table_schema = current_schema() AND c.table_name NOT IN ($1, $2, $3, $4)
-		AND c.table_name IN (SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE')
-		ORDER BY c.table_name, c.ordinal_position`, schemaMetadataTable, appliedChangesTable, captureStateTable, changeJournalTable)
+	inspection := Inspection{Source: "postgres_catalog"}
+	tables, order, err := store.inspectPostgresColumns(ctx, &inspection)
 	if err != nil {
 		return Inspection{}, err
 	}
-	inspection := Inspection{Source: "postgres_catalog"}
+	for _, name := range order {
+		inspection.Schema.Tables = append(inspection.Schema.Tables, *tables[name])
+	}
+	if err := store.inspectPostgresConstraints(ctx, tables, &inspection); err != nil {
+		return Inspection{}, err
+	}
+	for i, name := range order {
+		inspection.Schema.Tables[i] = *tables[name]
+	}
+	indexes, err := store.inspectPostgresIndexes(ctx)
+	if err != nil {
+		return Inspection{}, err
+	}
+	inspection.Schema.Indexes = append(inspection.Schema.Indexes, indexes.indexes...)
+	inspection.Unresolved = append(inspection.Unresolved, indexes.unresolved...)
+	if err := store.inspectPostgresViews(ctx, &inspection); err != nil {
+		return Inspection{}, err
+	}
+	if err := store.inspectPostgresTriggers(ctx, &inspection); err != nil {
+		return Inspection{}, err
+	}
+	if err := store.inspectPostgresRoutines(ctx, &inspection); err != nil {
+		return Inspection{}, err
+	}
+	inspection.Exact = len(inspection.Unresolved) == 0
+	return inspection, nil
+}
+
+// inspectPostgresColumns queries information_schema.columns and assembles the
+// table map in first-appearance order. atttypmod is NOT a column of
+// information_schema.columns in PostgreSQL 17 (selecting it raises 42703), so it
+// cannot be read straight from that view. pgvector stores the vector dimension
+// verbatim in pg_attribute.atttypmod, so for udt_name='vector' columns we fetch it
+// via a scalar subquery correlated on (schema, table, column) against pg_attribute
+// joined to pg_class and pg_namespace. The correlation keys on c.table_schema (not
+// a bare current_schema()) so homonym tables in other schemas cannot leak in, and
+// NOT a.attisdropped excludes dropped columns (a dropped column keeps its attname
+// but is marked dropped; only the live attribute is selected). For non-vector
+// columns atttypmod is unused downstream, so it defaults to -1 and the subquery is
+// not evaluated at all. Column-level unresolved objects (vector dimension,
+// defaults, generated columns) are appended to inspection.Unresolved in row order.
+func (store *Store) inspectPostgresColumns(ctx context.Context, inspection *Inspection) (map[string]*Table, []string, error) {
+	rows, err := store.DB.QueryContext(ctx, `SELECT c.table_name, c.column_name, c.data_type, c.udt_name,
+			CASE WHEN c.udt_name = 'vector'
+				THEN COALESCE((SELECT a.atttypmod
+					FROM pg_attribute a
+					JOIN pg_class cl ON cl.oid = a.attrelid
+					JOIN pg_namespace n ON n.oid = cl.relnamespace
+					WHERE n.nspname = c.table_schema AND cl.relname = c.table_name AND a.attname = c.column_name AND NOT a.attisdropped), -1)
+				ELSE -1 END AS atttypmod,
+			c.is_nullable, c.column_default, c.is_identity, c.is_generated
+			FROM information_schema.columns c
+			WHERE c.table_schema = current_schema() AND c.table_name NOT IN ($1, $2, $3, $4)
+			AND c.table_name IN (SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE')
+			ORDER BY c.table_name, c.ordinal_position`, schemaMetadataTable, appliedChangesTable, captureStateTable, changeJournalTable)
+	if err != nil {
+		return nil, nil, err
+	}
 	tables := make(map[string]*Table)
 	var order []string
 	for rows.Next() {
@@ -402,7 +437,7 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 		var defaultSQL sql.NullString
 		var atttypmod int
 		if err := rows.Scan(&tableName, &columnName, &dataType, &udtName, &atttypmod, &nullable, &defaultSQL, &identity, &generated); err != nil {
-			return Inspection{}, err
+			return nil, nil, err
 		}
 		table := tables[tableName]
 		if table == nil {
@@ -432,27 +467,33 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 		table.Columns = append(table.Columns, column)
 	}
 	if err := rows.Err(); err != nil {
-		return Inspection{}, err
+		return nil, nil, err
 	}
 	if err := rows.Close(); err != nil {
-		return Inspection{}, err
+		return nil, nil, err
 	}
-	for _, name := range order {
-		inspection.Schema.Tables = append(inspection.Schema.Tables, *tables[name])
-	}
+	return tables, order, nil
+}
+
+// inspectPostgresConstraints queries pg_constraint and attaches primary, unique,
+// foreign and check constraints to the matching tables in tables. Constraints
+// whose referential actions, match mode, deferral or check expression fall outside
+// the canonical grammar are reported as unresolved objects on inspection in
+// catalog order, preserving the original append semantics.
+func (store *Store) inspectPostgresConstraints(ctx context.Context, tables map[string]*Table, inspection *Inspection) error {
 	constraints, err := store.DB.QueryContext(ctx, `SELECT tbl.relname, con.conname, con.contype::text, COALESCE(pg_get_expr(con.conbin, con.conrelid), ''),
-		COALESCE((SELECT json_agg(att.attname ORDER BY key.ord)::text FROM unnest(con.conkey) WITH ORDINALITY key(attnum, ord) JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = key.attnum), '[]'),
-		COALESCE(ref.relname, ''),
-		COALESCE((SELECT json_agg(att.attname ORDER BY key.ord)::text FROM unnest(con.confkey) WITH ORDINALITY key(attnum, ord) JOIN pg_attribute att ON att.attrelid = con.confrelid AND att.attnum = key.attnum), '[]'),
-		con.confupdtype::text, con.confdeltype::text, con.confmatchtype::text, con.condeferrable, con.condeferred
-		FROM pg_constraint con
-		JOIN pg_class tbl ON tbl.oid = con.conrelid
-		JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
-		LEFT JOIN pg_class ref ON ref.oid = con.confrelid
-		WHERE ns.nspname = current_schema()
-		ORDER BY tbl.relname, con.conname`)
+			COALESCE((SELECT json_agg(att.attname ORDER BY key.ord)::text FROM unnest(con.conkey) WITH ORDINALITY key(attnum, ord) JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = key.attnum), '[]'),
+			COALESCE(ref.relname, ''),
+			COALESCE((SELECT json_agg(att.attname ORDER BY key.ord)::text FROM unnest(con.confkey) WITH ORDINALITY key(attnum, ord) JOIN pg_attribute att ON att.attrelid = con.confrelid AND att.attnum = key.attnum), '[]'),
+			con.confupdtype::text, con.confdeltype::text, con.confmatchtype::text, con.condeferrable, con.condeferred
+			FROM pg_constraint con
+			JOIN pg_class tbl ON tbl.oid = con.conrelid
+			JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+			LEFT JOIN pg_class ref ON ref.oid = con.confrelid
+			WHERE ns.nspname = current_schema()
+			ORDER BY tbl.relname, con.conname`)
 	if err != nil {
-		return Inspection{}, err
+		return err
 	}
 	for constraints.Next() {
 		var tableName, name, kind, definition, columnsJSON, referenceTable, referenceColumnsJSON string
@@ -460,16 +501,16 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 		var deferrable, deferred bool
 		if err := constraints.Scan(&tableName, &name, &kind, &definition, &columnsJSON, &referenceTable, &referenceColumnsJSON, &onUpdate, &onDelete, &match, &deferrable, &deferred); err != nil {
 			constraints.Close()
-			return Inspection{}, err
+			return err
 		}
 		var columns, referenceColumns []string
 		if err := json.Unmarshal([]byte(columnsJSON), &columns); err != nil {
 			constraints.Close()
-			return Inspection{}, err
+			return err
 		}
 		if err := json.Unmarshal([]byte(referenceColumnsJSON), &referenceColumns); err != nil {
 			constraints.Close()
-			return Inspection{}, err
+			return err
 		}
 		table := tables[tableName]
 		if table == nil {
@@ -500,27 +541,24 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 		}
 	}
 	if err := constraints.Close(); err != nil {
-		return Inspection{}, err
+		return err
 	}
-	for i, name := range order {
-		inspection.Schema.Tables[i] = *tables[name]
-	}
+	return nil
+}
 
-	indexes, err := store.inspectPostgresIndexes(ctx)
-	if err != nil {
-		return Inspection{}, err
-	}
-	inspection.Schema.Indexes = append(inspection.Schema.Indexes, indexes.indexes...)
-	inspection.Unresolved = append(inspection.Unresolved, indexes.unresolved...)
+// inspectPostgresViews queries information_schema.views and translates each view
+// definition into a canonical SELECT. Views whose definition cannot be parsed are
+// reported as unresolved objects on inspection.
+func (store *Store) inspectPostgresViews(ctx context.Context, inspection *Inspection) error {
 	objects, err := store.DB.QueryContext(ctx, `SELECT 'view', table_name, view_definition FROM information_schema.views WHERE table_schema = current_schema()`)
 	if err != nil {
-		return Inspection{}, err
+		return err
 	}
 	for objects.Next() {
 		var kind, name string
 		var definition sql.NullString
 		if err := objects.Scan(&kind, &name, &definition); err != nil {
-			return Inspection{}, err
+			return err
 		}
 		query, err := parseCatalogSelect(definition.String)
 		if err != nil {
@@ -530,8 +568,15 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 		}
 	}
 	if err := objects.Close(); err != nil {
-		return Inspection{}, err
+		return err
 	}
+	return nil
+}
+
+// inspectPostgresTriggers queries pg_trigger for user-defined triggers (excluding
+// internal and capture-table triggers) and parses each definition. Triggers that
+// cannot be parsed are reported as unresolved objects on inspection.
+func (store *Store) inspectPostgresTriggers(ctx context.Context, inspection *Inspection) error {
 	triggers, err := store.DB.QueryContext(ctx, `SELECT trg.tgname, pg_get_triggerdef(trg.oid, true), proc.prosrc
 		FROM pg_trigger trg
 		JOIN pg_class tbl ON tbl.oid = trg.tgrelid
@@ -540,13 +585,13 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 		WHERE ns.nspname = current_schema() AND NOT trg.tgisinternal AND trg.tgname NOT LIKE '__compat_capture_%'
 		ORDER BY trg.tgname`)
 	if err != nil {
-		return Inspection{}, err
+		return err
 	}
 	for triggers.Next() {
 		var name, definition, functionBody string
 		if err := triggers.Scan(&name, &definition, &functionBody); err != nil {
 			triggers.Close()
-			return Inspection{}, err
+			return err
 		}
 		trigger, err := parsePostgresCatalogTrigger(definition, functionBody)
 		if err != nil {
@@ -556,13 +601,20 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 		}
 	}
 	if err := triggers.Close(); err != nil {
-		return Inspection{}, err
+		return err
 	}
-	// Only plain functions ('f') and procedures ('p') are modeled as routines;
-	// aggregates ('a') and window functions ('w') are not. Restricting prokind
-	// also keeps pg_get_function_result/pg_get_functiondef off aggregates: those
-	// helpers raise 42809 on an aggregate (e.g. pgvector installs an avg(vector)
-	// aggregate in the public schema), which would abort the whole inspection.
+	return nil
+}
+
+// inspectPostgresRoutines queries pg_proc for plain functions and procedures
+// (prokind 'f'/'p') that are not trigger-bound, and parses each into a canonical
+// routine. Only plain functions ('f') and procedures ('p') are modeled as
+// routines; aggregates ('a') and window functions ('w') are not. Restricting
+// prokind also keeps pg_get_function_result/pg_get_functiondef off aggregates:
+// those helpers raise 42809 on an aggregate (e.g. pgvector installs an avg(vector)
+// aggregate in the public schema), which would abort the whole inspection.
+// Routines that cannot be parsed are reported as unresolved objects on inspection.
+func (store *Store) inspectPostgresRoutines(ctx context.Context, inspection *Inspection) error {
 	routines, err := store.DB.QueryContext(ctx, `SELECT proc.proname, proc.prosrc, pg_get_function_arguments(proc.oid), COALESCE(pg_get_function_result(proc.oid), ''), lang.lanname, proc.prokind::text, pg_get_functiondef(proc.oid)
 		FROM pg_proc proc
 		JOIN pg_namespace ns ON ns.oid = proc.pronamespace
@@ -572,13 +624,13 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 		AND NOT EXISTS (SELECT 1 FROM pg_trigger trg WHERE trg.tgfoid = proc.oid)
 		ORDER BY proc.proname`)
 	if err != nil {
-		return Inspection{}, err
+		return err
 	}
 	for routines.Next() {
 		var name, body, arguments, resultType, language, kind, definition string
 		if err := routines.Scan(&name, &body, &arguments, &resultType, &language, &kind, &definition); err != nil {
 			routines.Close()
-			return Inspection{}, err
+			return err
 		}
 		routine, err := parsePostgresCatalogRoutine(name, body, arguments, resultType, language, kind)
 		if err != nil {
@@ -588,10 +640,9 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 		}
 	}
 	if err := routines.Close(); err != nil {
-		return Inspection{}, err
+		return err
 	}
-	inspection.Exact = len(inspection.Unresolved) == 0
-	return inspection, nil
+	return nil
 }
 
 func sqliteReferentialAction(action string) (ReferentialAction, bool) {
