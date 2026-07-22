@@ -80,6 +80,15 @@ func (store *Store) inspectSQLite(ctx context.Context) (Inspection, error) {
 		if item.kind == "index" {
 			continue
 		}
+		if item.kind == "view" {
+			query, err := parseCatalogSelect(item.definition)
+			if err != nil {
+				inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: item.kind, Name: item.name, Definition: item.definition, Reason: err.Error()})
+			} else {
+				inspection.Schema.Views = append(inspection.Schema.Views, View{Name: item.name, Query: query})
+			}
+			continue
+		}
 		if item.kind != "table" {
 			inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: item.kind, Name: item.name, Definition: item.definition, Reason: "requires SQL parser translation"})
 			continue
@@ -443,7 +452,12 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 		if err := objects.Scan(&kind, &name, &definition); err != nil {
 			return Inspection{}, err
 		}
-		inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: kind, Name: name, Definition: definition.String, Reason: "requires SQL parser translation"})
+		query, err := parseCatalogSelect(definition.String)
+		if err != nil {
+			inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: kind, Name: name, Definition: definition.String, Reason: err.Error()})
+		} else {
+			inspection.Schema.Views = append(inspection.Schema.Views, View{Name: name, Query: query})
+		}
 	}
 	inspection.Exact = len(inspection.Unresolved) == 0
 	return inspection, objects.Err()

@@ -22,6 +22,7 @@ La batería se ejecutó contra SQLite real y PostgreSQL 17.5 real proporcionado 
 - Índices canónicos únicos, parciales y descendentes creados y aplicados en ambos motores.
 - Reconstrucción desde catálogos externos, sin metadatos del framework, de claves primarias, restricciones `UNIQUE`, claves foráneas compuestas, restricciones `CHECK` e índices comunes.
 - Reconstrucción de valores por defecto literales de texto, enteros, decimales, booleanos, `NULL` y `CURRENT_TIMESTAMP`, incluidos casts nativos conocidos de PostgreSQL.
+- Reconstrucción de vistas externas con proyecciones, alias, filtros, agrupación, orden, límite y desplazamiento dentro de la gramática `SELECT` común.
 - Detección explícita de defaults no portables, identidades y columnas generadas.
 - Rechazo explícito de expresiones, métodos, colaciones y clases de operador que no pertenecen a la gramática canónica comprobada.
 - Vistas canónicas con joins, filtros, agrupaciones y agregaciones.
@@ -45,7 +46,7 @@ La prueba de cobertura integral falla porque el sistema aún no proporciona equi
 - Restricciones `CHECK`.
 - Índices y expresiones de índice.
 - Triggers.
-- Vistas.
+- Vistas con joins, fuentes compuestas u otras extensiones todavía fuera del parser común.
 - Rutinas almacenadas.
 - Búsqueda de texto completo.
 

@@ -718,7 +718,7 @@ func TestSystemEnforcesCanonicalChecksAndIndexesEqually(t *testing.T) {
 	assertStoreSnapshotsEquivalent(t, ctx, schema, stores[0], stores[1])
 }
 
-func TestSystemInspectsNativeConstraintsAndIndexesWithoutMetadata(t *testing.T) {
+func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 	ctx := context.Background()
 	sqlite := openSQLite(t, filepath.Join(t.TempDir(), "native-catalog.db"))
 	postgres := openPostgres(t)
@@ -735,6 +735,7 @@ func TestSystemInspectsNativeConstraintsAndIndexesWithoutMetadata(t *testing.T) 
 			`CREATE TABLE native_products (code TEXT NOT NULL, price INTEGER NOT NULL DEFAULT 3, active BOOLEAN NOT NULL DEFAULT TRUE, status TEXT NOT NULL DEFAULT 'new', CHECK (price >= 0))`,
 			`CREATE UNIQUE INDEX native_products_code ON native_products (code ASC)`,
 			`CREATE INDEX native_products_active_price ON native_products (price DESC) WHERE active = TRUE`,
+			`CREATE VIEW native_active_products AS SELECT code AS product_code, price FROM native_products WHERE active = TRUE`,
 			`CREATE TABLE native_parents (id INTEGER PRIMARY KEY, tenant INTEGER NOT NULL, code TEXT NOT NULL, UNIQUE (tenant, code))`,
 			`CREATE TABLE native_children (id INTEGER PRIMARY KEY, parent_tenant INTEGER NOT NULL, parent_code TEXT NOT NULL, FOREIGN KEY (parent_tenant, parent_code) REFERENCES native_parents (tenant, code) ON UPDATE CASCADE ON DELETE CASCADE)`,
 		},
@@ -742,6 +743,7 @@ func TestSystemInspectsNativeConstraintsAndIndexesWithoutMetadata(t *testing.T) 
 			`CREATE TABLE native_products (code TEXT NOT NULL, price BIGINT NOT NULL DEFAULT 3, active BOOLEAN NOT NULL DEFAULT TRUE, status TEXT NOT NULL DEFAULT 'new', CHECK (price >= 0))`,
 			`CREATE UNIQUE INDEX native_products_code ON native_products (code ASC)`,
 			`CREATE INDEX native_products_active_price ON native_products (price DESC) WHERE active = TRUE`,
+			`CREATE VIEW native_active_products AS SELECT code AS product_code, price FROM native_products WHERE active = TRUE`,
 			`CREATE TABLE native_parents (id BIGINT PRIMARY KEY, tenant BIGINT NOT NULL, code TEXT NOT NULL, UNIQUE (tenant, code))`,
 			`CREATE TABLE native_children (id BIGINT PRIMARY KEY, parent_tenant BIGINT NOT NULL, parent_code TEXT NOT NULL, FOREIGN KEY (parent_tenant, parent_code) REFERENCES native_parents (tenant, code) ON UPDATE CASCADE ON DELETE CASCADE)`,
 		},
@@ -796,6 +798,17 @@ func TestSystemInspectsNativeConstraintsAndIndexesWithoutMetadata(t *testing.T) 
 		}
 		if !foundUnique || !foundPartial {
 			t.Fatalf("%s native index semantics lost: %+v", store.Target.Engine, inspection.Schema.Indexes)
+		}
+		if len(inspection.Schema.Views) != 1 || inspection.Schema.Views[0].Name != "native_active_products" || len(inspection.Schema.Views[0].Query.Columns) != 2 || inspection.Schema.Views[0].Query.Where == nil {
+			t.Fatalf("%s native view was not reconstructed: %+v", store.Target.Engine, inspection.Schema.Views)
+		}
+		if _, err := store.DB.ExecContext(ctx, `INSERT INTO native_products (code) VALUES ('A')`); err != nil {
+			t.Fatal(err)
+		}
+		var code string
+		var price int
+		if err := store.DB.QueryRowContext(ctx, `SELECT product_code, price FROM native_active_products`).Scan(&code, &price); err != nil || code != "A" || price != 3 {
+			t.Fatalf("%s native view behavior differs: code=%q price=%d error=%v", store.Target.Engine, code, price, err)
 		}
 	}
 }
