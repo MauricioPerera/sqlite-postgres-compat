@@ -16,6 +16,55 @@ func TestContractRejectsUnknownEngine(t *testing.T) {
 	}
 }
 
+func TestVersionValidRejectsAllZero(t *testing.T) {
+	if (Version{0, 0, 0}).Valid() {
+		t.Fatal("Version{0,0,0} must be invalid: it carries no real version and is unsafe as a dedup key")
+	}
+}
+
+func TestVersionValidAcceptsPartialZero(t *testing.T) {
+	cases := []Version{
+		{0, 9, 0},
+		{1, 0, 0},
+		{0, 0, 1},
+	}
+	for _, v := range cases {
+		if !v.Valid() {
+			t.Fatalf("Version{%d,%d,%d} must be valid", v.Major, v.Minor, v.Patch)
+		}
+	}
+}
+
+func TestVersionValidRejectsNegatives(t *testing.T) {
+	cases := []Version{
+		{-1, 0, 0},
+		{0, -1, 0},
+		{1, 2, -3},
+	}
+	for _, v := range cases {
+		if v.Valid() {
+			t.Fatalf("Version{%d,%d,%d} must be invalid: negative components", v.Major, v.Minor, v.Patch)
+		}
+	}
+}
+
+func TestTargetValidateRejectsZeroVersion(t *testing.T) {
+	target := Target{Engine: SQLite, Version: Version{0, 0, 0}}
+	if err := target.Validate(); err == nil {
+		t.Fatal("expected zero version to fail Target.Validate")
+	}
+}
+
+func TestContractValidateRejectsZeroVersion(t *testing.T) {
+	contract := Contract{
+		Source:      Target{Engine: SQLite, Version: Version{0, 0, 0}},
+		Destination: Target{Engine: Postgres, Version: Version{Major: 17}},
+	}
+	if err := contract.Validate(); err == nil {
+		t.Fatal("expected contract with a zero version to fail Validate")
+	}
+}
+
 func TestAuditDoesNotSilentlyDowngrade(t *testing.T) {
 	contract := Contract{
 		Source:           Target{Engine: SQLite, Version: Version{Major: 3, Minor: 45}},

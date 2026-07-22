@@ -21,6 +21,14 @@ type Version struct {
 }
 
 func (v Version) Valid() bool {
+	// The zero value Version{0,0,0} is invalid: it carries no real version
+	// information and is unsafe to use as a replication dedup key (two distinct
+	// zero-version sources would collide). A truly zero version is rejected,
+	// negative components remain rejected, and versions like 0.9.0 or 1.0.0
+	// stay valid.
+	if v.Major == 0 && v.Minor == 0 && v.Patch == 0 {
+		return false
+	}
 	return v.Major >= 0 && v.Minor >= 0 && v.Patch >= 0
 }
 

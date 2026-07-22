@@ -20,7 +20,12 @@ type ConflictError struct {
 }
 
 func (err *ConflictError) Error() string {
-	return fmt.Sprintf("replication conflict on %s primary key %v", err.Table, err.PrimaryKey)
+	// Render Expected/Actual as compact, key-sorted JSON so the diagnostic
+	// shows exactly which values differ, not just the table and primary key.
+	expected, _ := json.Marshal(err.Expected)
+	actual, _ := json.Marshal(err.Actual)
+	return fmt.Sprintf("replication conflict on %s primary key %v: expected %s, actual %s",
+		err.Table, err.PrimaryKey, expected, actual)
 }
 
 // ApplyChanges applies one ordered source stream atomically. Reapplying the

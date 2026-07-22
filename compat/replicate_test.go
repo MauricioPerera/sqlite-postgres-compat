@@ -3,6 +3,7 @@ package compat
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -73,6 +74,47 @@ func TestApplyChangesDetectsConflictAndRollsBack(t *testing.T) {
 	}
 	if title != "local" {
 		t.Fatalf("conflicting row was modified: %q", title)
+	}
+}
+
+func TestConflictErrorReportsExpectedAndActualValues(t *testing.T) {
+	ctx := context.Background()
+	schema := replicationTestSchema("conflict_report_items")
+	store, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB.Exec(`INSERT INTO conflict_report_items (id, title) VALUES (1, 'local')`); err != nil {
+		t.Fatal(err)
+	}
+	change := Change{
+		Source:     Target{Engine: Postgres, Version: Version{Major: 17}},
+		Sequence:   1,
+		Kind:       Update,
+		Table:      "conflict_report_items",
+		PrimaryKey: Row{"id": {Kind: IntegerValue, Value: "1"}},
+		Before:     Row{"id": {Kind: IntegerValue, Value: "1"}, "title": {Kind: TextValue, Value: "remote-before"}},
+		After:      Row{"id": {Kind: IntegerValue, Value: "1"}, "title": {Kind: TextValue, Value: "remote-after"}},
+	}
+	err = store.ApplyChanges(ctx, schema, []Change{change})
+	var conflict *ConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("expected ConflictError, got %v", err)
+	}
+	message := err.Error()
+	for _, want := range []string{
+		"conflict_report_items", // table
+		"1",                     // primary key value
+		"remote-before",         // expected value that differs
+		"local",                 // actual value that differs
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("conflict error missing %q in message:\n%s", want, message)
+		}
 	}
 }
 
