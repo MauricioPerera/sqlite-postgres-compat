@@ -10,6 +10,7 @@ import (
 )
 
 const appliedChangesTable = "__compat_applied_changes"
+const captureStateTable = "__compat_capture_state"
 
 type ConflictError struct {
 	Table      string
@@ -46,6 +47,9 @@ func (store *Store) ApplyChanges(ctx context.Context, schema Schema, changes []C
 	if err := createAppliedChangesTable(ctx, tx); err != nil {
 		return err
 	}
+	if err := setCaptureSuppressed(ctx, tx, true); err != nil {
+		return err
+	}
 	for _, change := range ordered {
 		applied, err := changeWasApplied(ctx, tx, store.Target.Engine, change)
 		if err != nil {
@@ -65,6 +69,9 @@ func (store *Store) ApplyChanges(ctx context.Context, schema Schema, changes []C
 			return err
 		}
 	}
+	if err := setCaptureSuppressed(ctx, tx, false); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -74,7 +81,25 @@ func createAppliedChangesTable(ctx context.Context, tx *sql.Tx) error {
 		quoteIdentifier("source_version") + " TEXT NOT NULL, " +
 		quoteIdentifier("sequence") + " TEXT NOT NULL, PRIMARY KEY (" +
 		quoteIdentifier("source_engine") + ", " + quoteIdentifier("source_version") + ", " + quoteIdentifier("sequence") + "))"
-	_, err := tx.ExecContext(ctx, statement)
+	if _, err := tx.ExecContext(ctx, statement); err != nil {
+		return err
+	}
+	state := "CREATE TABLE IF NOT EXISTS " + quoteIdentifier(captureStateTable) + " (" + quoteIdentifier("id") + " INTEGER PRIMARY KEY, " + quoteIdentifier("suppress") + " INTEGER NOT NULL)"
+	if _, err := tx.ExecContext(ctx, state); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO "+quoteIdentifier(captureStateTable)+" ("+quoteIdentifier("id")+", "+quoteIdentifier("suppress")+") VALUES (1, 0) ON CONFLICT ("+quoteIdentifier("id")+") DO NOTHING"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func setCaptureSuppressed(ctx context.Context, tx *sql.Tx, suppressed bool) error {
+	value := 0
+	if suppressed {
+		value = 1
+	}
+	_, err := tx.ExecContext(ctx, "UPDATE "+quoteIdentifier(captureStateTable)+" SET "+quoteIdentifier("suppress")+" = "+fmt.Sprint(value)+" WHERE "+quoteIdentifier("id")+" = 1")
 	return err
 }
 

@@ -800,6 +800,79 @@ func TestSystemInspectsNativeConstraintsAndIndexesWithoutMetadata(t *testing.T) 
 	}
 }
 
+func TestSystemAutomaticallyCapturesAndReplicatesBothDirections(t *testing.T) {
+	ctx := context.Background()
+	schema := compat.Schema{Tables: []compat.Table{{
+		Name: "automatic_changes",
+		Columns: []compat.Column{
+			{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+			{Name: "title", Type: compat.Type{Family: compat.TextType}},
+			{Name: "payload", Type: compat.Type{Family: compat.BinaryType}, Nullable: true},
+		},
+		Constraints: []compat.Constraint{{Kind: compat.PrimaryKey, Columns: []string{"id"}}},
+	}}}
+	sqlite := openSQLite(t, filepath.Join(t.TempDir(), "automatic-capture.db"))
+	postgres := openPostgres(t)
+	for _, store := range []*compat.Store{sqlite, postgres} {
+		if err := store.ApplySchema(ctx, schema); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.InstallChangeCapture(ctx, schema); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := sqlite.DB.ExecContext(ctx, `INSERT INTO automatic_changes (id, title, payload) VALUES (1, 'sqlite', x'00FF')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlite.DB.ExecContext(ctx, `UPDATE automatic_changes SET title = 'sqlite updated' WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	sqliteChanges, err := sqlite.ReadCapturedChanges(ctx, schema, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sqliteChanges) != 2 {
+		t.Fatalf("expected two automatic SQLite changes, got %+v", sqliteChanges)
+	}
+	if err := postgres.ApplyChanges(ctx, schema, sqliteChanges); err != nil {
+		t.Fatal(err)
+	}
+	postgresEchoes, err := postgres.ReadCapturedChanges(ctx, schema, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(postgresEchoes) != 0 {
+		t.Fatalf("replicated changes were captured again by PostgreSQL: %+v", postgresEchoes)
+	}
+	assertStoreSnapshotsEquivalent(t, ctx, schema, sqlite, postgres)
+
+	if _, err := postgres.DB.ExecContext(ctx, `UPDATE automatic_changes SET title = 'postgres' WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := postgres.DB.ExecContext(ctx, `DELETE FROM automatic_changes WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	postgresChanges, err := postgres.ReadCapturedChanges(ctx, schema, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(postgresChanges) != 2 || postgresChanges[0].Kind != compat.Update || postgresChanges[1].Kind != compat.Delete {
+		t.Fatalf("unexpected automatic PostgreSQL stream: %+v", postgresChanges)
+	}
+	if err := sqlite.ApplyChanges(ctx, schema, postgresChanges); err != nil {
+		t.Fatal(err)
+	}
+	sqliteEchoes, err := sqlite.ReadCapturedChanges(ctx, schema, sqliteChanges[len(sqliteChanges)-1].Sequence, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sqliteEchoes) != 0 {
+		t.Fatalf("replicated changes were captured again by SQLite: %+v", sqliteEchoes)
+	}
+	assertStoreSnapshotsEquivalent(t, ctx, schema, sqlite, postgres)
+}
+
 func hasConstraint(table compat.Table, kind compat.ConstraintKind, columnCount int) bool {
 	for _, constraint := range table.Constraints {
 		if constraint.Kind == kind && len(constraint.Columns) == columnCount {

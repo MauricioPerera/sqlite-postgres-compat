@@ -30,6 +30,9 @@ La batería se ejecutó contra SQLite real y PostgreSQL 17.5 real proporcionado 
 - Búsqueda textual Unicode determinista ejecutada por el runtime común.
 - Reconstrucción exacta del esquema canónico persistido desde SQLite y PostgreSQL.
 - Replicación incremental SQLite → PostgreSQL y PostgreSQL → SQLite.
+- Captura automática mediante triggers nativos de `INSERT`, `UPDATE` y `DELETE` en ambos motores.
+- Lectura ordenada por cursor y supresión transaccional de ecos al aplicar cambios remotos.
+- Preservación de datos binarios en el journal automático.
 - Reintentos idempotentes de secuencias ya aplicadas.
 - Detección de conflictos antes de sobrescribir cambios divergentes.
 - Eliminación de las bases PostgreSQL temporales después de la prueba.
@@ -46,7 +49,7 @@ La prueba de cobertura integral falla porque el sistema aún no proporciona equi
 - Rutinas almacenadas.
 - Búsqueda de texto completo.
 
-El resultado de la batería es 14 pruebas superiores superadas y 1 fallida. Esta proporción no representa un porcentaje de compatibilidad total; el fallo significa que el objetivo del 100% no está cumplido.
+El resultado de la batería es 15 pruebas superiores superadas y 1 fallida. Esta proporción no representa un porcentaje de compatibilidad total; el fallo significa que el objetivo del 100% no está cumplido.
 
 ## Defectos detectados y corregidos durante la ejecución
 

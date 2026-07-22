@@ -187,7 +187,7 @@ func (s Schema) Validate() error {
 		if table.Name == "" {
 			return fmt.Errorf("table name is required")
 		}
-		if table.Name == schemaMetadataTable || table.Name == appliedChangesTable {
+		if table.Name == schemaMetadataTable || table.Name == appliedChangesTable || table.Name == captureStateTable || table.Name == changeJournalTable {
 			return fmt.Errorf("table name %q is reserved", table.Name)
 		}
 		if _, exists := tables[table.Name]; exists {

@@ -50,7 +50,7 @@ func (store *Store) InspectSchema(ctx context.Context) (Inspection, error) {
 }
 
 func (store *Store) inspectSQLite(ctx context.Context) (Inspection, error) {
-	rows, err := store.DB.QueryContext(ctx, `SELECT type, name, COALESCE(sql, '') FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT IN (?, ?) ORDER BY type, name`, schemaMetadataTable, appliedChangesTable)
+	rows, err := store.DB.QueryContext(ctx, `SELECT type, name, COALESCE(sql, '') FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT IN (?, ?, ?, ?) AND name NOT LIKE '__compat_capture_%' ORDER BY type, name`, schemaMetadataTable, appliedChangesTable, captureStateTable, changeJournalTable)
 	if err != nil {
 		return Inspection{}, err
 	}
@@ -316,9 +316,9 @@ func sqliteTypeFamily(declared string) TypeFamily {
 func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 	rows, err := store.DB.QueryContext(ctx, `SELECT table_name, column_name, data_type, is_nullable, column_default, is_identity, is_generated
 		FROM information_schema.columns
-		WHERE table_schema = current_schema() AND table_name NOT IN ($1, $2)
+		WHERE table_schema = current_schema() AND table_name NOT IN ($1, $2, $3, $4)
 		AND table_name IN (SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE')
-		ORDER BY table_name, ordinal_position`, schemaMetadataTable, appliedChangesTable)
+		ORDER BY table_name, ordinal_position`, schemaMetadataTable, appliedChangesTable, captureStateTable, changeJournalTable)
 	if err != nil {
 		return Inspection{}, err
 	}
