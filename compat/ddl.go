@@ -181,8 +181,15 @@ func compileConstraint(engine Engine, constraint Constraint) (string, error) {
 		if constraint.References == nil || constraint.References.Table == "" || len(constraint.References.Columns) == 0 {
 			return "", fmt.Errorf("foreign key requires a reference")
 		}
-		return "FOREIGN KEY (" + strings.Join(columns, ", ") + ") REFERENCES " +
-			quoteIdentifier(constraint.References.Table) + " (" + strings.Join(quoteIdentifiers(constraint.References.Columns), ", ") + ")", nil
+		definition := "FOREIGN KEY (" + strings.Join(columns, ", ") + ") REFERENCES " +
+			quoteIdentifier(constraint.References.Table) + " (" + strings.Join(quoteIdentifiers(constraint.References.Columns), ", ") + ")"
+		if constraint.References.OnUpdate != "" && constraint.References.OnUpdate != NoAction {
+			definition += " ON UPDATE " + compileReferentialAction(constraint.References.OnUpdate)
+		}
+		if constraint.References.OnDelete != "" && constraint.References.OnDelete != NoAction {
+			definition += " ON DELETE " + compileReferentialAction(constraint.References.OnDelete)
+		}
+		return definition, nil
 	case Check:
 		if constraint.Expression == nil {
 			return "", fmt.Errorf("check constraint requires an expression")
@@ -194,6 +201,21 @@ func compileConstraint(engine Engine, constraint Constraint) (string, error) {
 		return "CHECK (" + expression + ")", nil
 	default:
 		return "", fmt.Errorf("unknown constraint %q", constraint.Kind)
+	}
+}
+
+func compileReferentialAction(action ReferentialAction) string {
+	switch action {
+	case Restrict:
+		return "RESTRICT"
+	case Cascade:
+		return "CASCADE"
+	case SetNull:
+		return "SET NULL"
+	case SetDefault:
+		return "SET DEFAULT"
+	default:
+		return "NO ACTION"
 	}
 }
 

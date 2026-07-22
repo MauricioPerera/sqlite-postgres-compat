@@ -7,5 +7,5 @@
     "engine": "postgres",
     "version": { "major": 17, "minor": 0, "patch": 0 }
   },
-  "required_features": ["tables", "foreign_keys", "transactions"]
+  "required_features": ["tables", "canonical_foreign_keys", "transactions"]
 }

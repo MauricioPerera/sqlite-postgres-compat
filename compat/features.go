@@ -5,24 +5,25 @@ import "fmt"
 type Feature string
 
 const (
-	Tables            Feature = "tables"
-	PrimaryKeys       Feature = "primary_keys"
-	ForeignKeys       Feature = "foreign_keys"
-	CheckRules        Feature = "check_constraints"
-	CanonicalChecks   Feature = "canonical_check_constraints"
-	Transactions      Feature = "transactions"
-	Indexes           Feature = "indexes"
-	CanonicalIndexes  Feature = "canonical_indexes"
-	JSONValues        Feature = "json"
-	UUIDValues        Feature = "uuid"
-	Triggers          Feature = "triggers"
-	CanonicalTriggers Feature = "canonical_triggers"
-	Views             Feature = "views"
-	CanonicalViews    Feature = "canonical_views"
-	StoredRoutines    Feature = "stored_routines"
-	CanonicalRoutines Feature = "canonical_routines"
-	FullText          Feature = "full_text"
-	CanonicalFullText Feature = "canonical_full_text"
+	Tables               Feature = "tables"
+	PrimaryKeys          Feature = "primary_keys"
+	ForeignKeys          Feature = "foreign_keys"
+	CanonicalForeignKeys Feature = "canonical_foreign_keys"
+	CheckRules           Feature = "check_constraints"
+	CanonicalChecks      Feature = "canonical_check_constraints"
+	Transactions         Feature = "transactions"
+	Indexes              Feature = "indexes"
+	CanonicalIndexes     Feature = "canonical_indexes"
+	JSONValues           Feature = "json"
+	UUIDValues           Feature = "uuid"
+	Triggers             Feature = "triggers"
+	CanonicalTriggers    Feature = "canonical_triggers"
+	Views                Feature = "views"
+	CanonicalViews       Feature = "canonical_views"
+	StoredRoutines       Feature = "stored_routines"
+	CanonicalRoutines    Feature = "canonical_routines"
+	FullText             Feature = "full_text"
+	CanonicalFullText    Feature = "canonical_full_text"
 )
 
 type MappingStatus string
@@ -56,11 +57,11 @@ func Audit(contract Contract) ([]Finding, error) {
 
 func assess(feature Feature) Finding {
 	switch feature {
-	case Tables, PrimaryKeys, ForeignKeys, Transactions, CanonicalChecks, CanonicalIndexes, CanonicalViews, CanonicalTriggers, CanonicalRoutines, CanonicalFullText:
+	case Tables, PrimaryKeys, Transactions, CanonicalForeignKeys, CanonicalChecks, CanonicalIndexes, CanonicalViews, CanonicalTriggers, CanonicalRoutines, CanonicalFullText:
 		return Finding{Feature: feature, Status: Exact}
 	case JSONValues, UUIDValues:
 		return Finding{Feature: feature, Status: Exact, Reason: "lossless canonical text representation"}
-	case CheckRules, Indexes, Triggers, Views, StoredRoutines, FullText:
+	case ForeignKeys, CheckRules, Indexes, Triggers, Views, StoredRoutines, FullText:
 		return Finding{Feature: feature, Status: Unknown, Reason: "requires parser and semantic compiler"}
 	default:
 		return Finding{Feature: feature, Status: Unknown, Reason: "feature is not in the compatibility catalog"}
@@ -107,7 +108,7 @@ func InferFeatures(schema Schema) []Feature {
 			case PrimaryKey:
 				seen[PrimaryKeys] = struct{}{}
 			case ForeignKey:
-				seen[ForeignKeys] = struct{}{}
+				seen[CanonicalForeignKeys] = struct{}{}
 			case Check:
 				seen[CanonicalChecks] = struct{}{}
 			}

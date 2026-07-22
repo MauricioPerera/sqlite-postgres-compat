@@ -158,6 +158,7 @@ func (store *Store) inspectSQLiteTable(ctx context.Context, name, definition str
 	type foreignKey struct {
 		columns, referenceColumns []string
 		referenceTable            string
+		onUpdate, onDelete        ReferentialAction
 		valid                     bool
 	}
 	foreign := map[int]*foreignKey{}
@@ -177,7 +178,13 @@ func (store *Store) inspectSQLiteTable(ctx context.Context, name, definition str
 		}
 		key.columns = append(key.columns, column)
 		key.referenceColumns = append(key.referenceColumns, referenceColumn)
-		if onUpdate != "NO ACTION" || onDelete != "NO ACTION" || match != "NONE" {
+		var actionOK bool
+		key.onUpdate, actionOK = sqliteReferentialAction(onUpdate)
+		if !actionOK {
+			key.valid = false
+		}
+		key.onDelete, actionOK = sqliteReferentialAction(onDelete)
+		if !actionOK || match != "NONE" {
 			key.valid = false
 		}
 	}
@@ -190,7 +197,7 @@ func (store *Store) inspectSQLiteTable(ctx context.Context, name, definition str
 			unresolved = append(unresolved, CatalogObject{Kind: "foreign_key", Name: fmt.Sprintf("%s#%d", name, id), Reason: "referential actions or match mode are outside the canonical foreign-key grammar"})
 			continue
 		}
-		table.Constraints = append(table.Constraints, Constraint{Kind: ForeignKey, Columns: key.columns, References: &Reference{Table: key.referenceTable, Columns: key.referenceColumns}})
+		table.Constraints = append(table.Constraints, Constraint{Kind: ForeignKey, Columns: key.columns, References: &Reference{Table: key.referenceTable, Columns: key.referenceColumns, OnUpdate: key.onUpdate, OnDelete: key.onDelete}})
 	}
 	return table, unresolved, nil
 }
@@ -394,11 +401,13 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 		case "u":
 			table.Constraints = append(table.Constraints, Constraint{Kind: UniqueKey, Columns: columns})
 		case "f":
-			if onUpdate != "a" || onDelete != "a" || match != "s" || deferrable || deferred {
+			updateAction, updateOK := postgresReferentialAction(onUpdate)
+			deleteAction, deleteOK := postgresReferentialAction(onDelete)
+			if !updateOK || !deleteOK || match != "s" || deferrable || deferred {
 				inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "foreign_key", Name: name, Reason: "referential actions, match mode or deferral are outside the canonical foreign-key grammar"})
 				continue
 			}
-			table.Constraints = append(table.Constraints, Constraint{Kind: ForeignKey, Columns: columns, References: &Reference{Table: referenceTable, Columns: referenceColumns}})
+			table.Constraints = append(table.Constraints, Constraint{Kind: ForeignKey, Columns: columns, References: &Reference{Table: referenceTable, Columns: referenceColumns, OnUpdate: updateAction, OnDelete: deleteAction}})
 		case "c":
 			expression, err := parseCatalogExpression(definition)
 			if err != nil {
@@ -438,6 +447,40 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 	}
 	inspection.Exact = len(inspection.Unresolved) == 0
 	return inspection, objects.Err()
+}
+
+func sqliteReferentialAction(action string) (ReferentialAction, bool) {
+	switch action {
+	case "NO ACTION":
+		return "", true
+	case "RESTRICT":
+		return Restrict, true
+	case "CASCADE":
+		return Cascade, true
+	case "SET NULL":
+		return SetNull, true
+	case "SET DEFAULT":
+		return SetDefault, true
+	default:
+		return "", false
+	}
+}
+
+func postgresReferentialAction(action string) (ReferentialAction, bool) {
+	switch action {
+	case "a":
+		return "", true
+	case "r":
+		return Restrict, true
+	case "c":
+		return Cascade, true
+	case "n":
+		return SetNull, true
+	case "d":
+		return SetDefault, true
+	default:
+		return "", false
+	}
 }
 
 type postgresIndexInspection struct {

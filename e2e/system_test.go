@@ -604,7 +604,7 @@ func TestSystemEnforcesForeignKeysEqually(t *testing.T) {
 			},
 			Constraints: []compat.Constraint{
 				{Kind: compat.PrimaryKey, Columns: []string{"id"}},
-				{Kind: compat.ForeignKey, Columns: []string{"parent_id"}, References: &compat.Reference{Table: "parents", Columns: []string{"id"}}},
+				{Kind: compat.ForeignKey, Columns: []string{"parent_id"}, References: &compat.Reference{Table: "parents", Columns: []string{"id"}, OnUpdate: compat.Cascade, OnDelete: compat.Cascade}},
 			},
 		},
 	}}
@@ -626,6 +626,28 @@ func TestSystemEnforcesForeignKeysEqually(t *testing.T) {
 	}
 	if sqliteErr == nil {
 		t.Fatal("both engines accepted an invalid foreign key")
+	}
+	for _, store := range []*compat.Store{sqlite, postgres} {
+		if _, err := store.DB.ExecContext(ctx, `INSERT INTO parents (id) VALUES (1)`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DB.ExecContext(ctx, `INSERT INTO children (id, parent_id) VALUES (2, 1)`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DB.ExecContext(ctx, `UPDATE parents SET id = 3 WHERE id = 1`); err != nil {
+			t.Fatalf("%s update cascade: %v", store.Target.Engine, err)
+		}
+		var parentID int
+		if err := store.DB.QueryRowContext(ctx, `SELECT parent_id FROM children WHERE id = 2`).Scan(&parentID); err != nil || parentID != 3 {
+			t.Fatalf("%s update cascade produced parent_id=%d error=%v", store.Target.Engine, parentID, err)
+		}
+		if _, err := store.DB.ExecContext(ctx, `DELETE FROM parents WHERE id = 3`); err != nil {
+			t.Fatalf("%s delete cascade: %v", store.Target.Engine, err)
+		}
+		var children int
+		if err := store.DB.QueryRowContext(ctx, `SELECT count(*) FROM children`).Scan(&children); err != nil || children != 0 {
+			t.Fatalf("%s delete cascade left %d rows, error=%v", store.Target.Engine, children, err)
+		}
 	}
 }
 
@@ -714,14 +736,14 @@ func TestSystemInspectsNativeConstraintsAndIndexesWithoutMetadata(t *testing.T) 
 			`CREATE UNIQUE INDEX native_products_code ON native_products (code ASC)`,
 			`CREATE INDEX native_products_active_price ON native_products (price DESC) WHERE active = TRUE`,
 			`CREATE TABLE native_parents (id INTEGER PRIMARY KEY, tenant INTEGER NOT NULL, code TEXT NOT NULL, UNIQUE (tenant, code))`,
-			`CREATE TABLE native_children (id INTEGER PRIMARY KEY, parent_tenant INTEGER NOT NULL, parent_code TEXT NOT NULL, FOREIGN KEY (parent_tenant, parent_code) REFERENCES native_parents (tenant, code))`,
+			`CREATE TABLE native_children (id INTEGER PRIMARY KEY, parent_tenant INTEGER NOT NULL, parent_code TEXT NOT NULL, FOREIGN KEY (parent_tenant, parent_code) REFERENCES native_parents (tenant, code) ON UPDATE CASCADE ON DELETE CASCADE)`,
 		},
 		compat.Postgres: {
 			`CREATE TABLE native_products (code TEXT NOT NULL, price BIGINT NOT NULL DEFAULT 3, active BOOLEAN NOT NULL DEFAULT TRUE, status TEXT NOT NULL DEFAULT 'new', CHECK (price >= 0))`,
 			`CREATE UNIQUE INDEX native_products_code ON native_products (code ASC)`,
 			`CREATE INDEX native_products_active_price ON native_products (price DESC) WHERE active = TRUE`,
 			`CREATE TABLE native_parents (id BIGINT PRIMARY KEY, tenant BIGINT NOT NULL, code TEXT NOT NULL, UNIQUE (tenant, code))`,
-			`CREATE TABLE native_children (id BIGINT PRIMARY KEY, parent_tenant BIGINT NOT NULL, parent_code TEXT NOT NULL, FOREIGN KEY (parent_tenant, parent_code) REFERENCES native_parents (tenant, code))`,
+			`CREATE TABLE native_children (id BIGINT PRIMARY KEY, parent_tenant BIGINT NOT NULL, parent_code TEXT NOT NULL, FOREIGN KEY (parent_tenant, parent_code) REFERENCES native_parents (tenant, code) ON UPDATE CASCADE ON DELETE CASCADE)`,
 		},
 	}
 	for _, store := range []*compat.Store{sqlite, postgres} {
@@ -757,6 +779,9 @@ func TestSystemInspectsNativeConstraintsAndIndexesWithoutMetadata(t *testing.T) 
 		if parents == nil || children == nil || !hasConstraint(*parents, compat.PrimaryKey, 1) || !hasConstraint(*parents, compat.UniqueKey, 2) || !hasConstraint(*children, compat.PrimaryKey, 1) || !hasConstraint(*children, compat.ForeignKey, 2) {
 			t.Fatalf("%s native key constraints were not reconstructed: %+v", store.Target.Engine, inspection.Schema.Tables)
 		}
+		if !hasForeignActions(*children, compat.Cascade, compat.Cascade) {
+			t.Fatalf("%s native referential actions were not reconstructed: %+v", store.Target.Engine, children.Constraints)
+		}
 		if len(inspection.Schema.Indexes) != 2 {
 			t.Fatalf("%s missing native indexes: %+v", store.Target.Engine, inspection.Schema.Indexes)
 		}
@@ -788,6 +813,15 @@ func hasColumnDefault(table compat.Table, columnName, kind, value string) bool {
 	for _, column := range table.Columns {
 		if column.Name == columnName {
 			return column.Default != nil && column.Default.Kind == kind && column.Default.Value == value
+		}
+	}
+	return false
+}
+
+func hasForeignActions(table compat.Table, onUpdate, onDelete compat.ReferentialAction) bool {
+	for _, constraint := range table.Constraints {
+		if constraint.Kind == compat.ForeignKey && constraint.References != nil && constraint.References.OnUpdate == onUpdate && constraint.References.OnDelete == onDelete {
+			return true
 		}
 	}
 	return false

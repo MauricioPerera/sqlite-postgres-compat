@@ -65,9 +65,21 @@ const (
 )
 
 type Reference struct {
-	Table   string   `json:"table"`
-	Columns []string `json:"columns"`
+	Table    string            `json:"table"`
+	Columns  []string          `json:"columns"`
+	OnUpdate ReferentialAction `json:"on_update,omitempty"`
+	OnDelete ReferentialAction `json:"on_delete,omitempty"`
 }
+
+type ReferentialAction string
+
+const (
+	NoAction   ReferentialAction = "no_action"
+	Restrict   ReferentialAction = "restrict"
+	Cascade    ReferentialAction = "cascade"
+	SetNull    ReferentialAction = "set_null"
+	SetDefault ReferentialAction = "set_default"
+)
 
 type Index struct {
 	Name    string        `json:"name"`
@@ -195,6 +207,14 @@ func (s Schema) Validate() error {
 			}
 			columns[column.Name] = struct{}{}
 		}
+		for _, constraint := range table.Constraints {
+			if constraint.Kind != ForeignKey || constraint.References == nil {
+				continue
+			}
+			if !validReferentialAction(constraint.References.OnUpdate) || !validReferentialAction(constraint.References.OnDelete) {
+				return fmt.Errorf("foreign key on table %q has an invalid referential action", table.Name)
+			}
+		}
 		tableColumns[table.Name] = columns
 	}
 	indexes := make(map[string]struct{}, len(s.Indexes))
@@ -281,4 +301,13 @@ func (s Schema) Validate() error {
 		}
 	}
 	return nil
+}
+
+func validReferentialAction(action ReferentialAction) bool {
+	switch action {
+	case "", NoAction, Restrict, Cascade, SetNull, SetDefault:
+		return true
+	default:
+		return false
+	}
 }

@@ -17,6 +17,7 @@ La batería se ejecutó contra SQLite real y PostgreSQL 17.5 real proporcionado 
 - Preservación de decimales de 38 dígitos y 18 decimales.
 - Preservación canónica de JSON, UUID y timestamps con nanosegundos.
 - Comportamiento equivalente de claves foráneas.
+- Acciones referenciales canónicas `CASCADE`, `RESTRICT`, `SET NULL`, `SET DEFAULT` y `NO ACTION`, con verificación conductual de actualización y eliminación en cascada.
 - Restricciones `CHECK` canónicas aplicadas y rechazando los mismos datos inválidos.
 - Índices canónicos únicos, parciales y descendentes creados y aplicados en ambos motores.
 - Reconstrucción desde catálogos externos, sin metadatos del framework, de claves primarias, restricciones `UNIQUE`, claves foráneas compuestas, restricciones `CHECK` e índices comunes.
@@ -37,6 +38,7 @@ La batería se ejecutó contra SQLite real y PostgreSQL 17.5 real proporcionado 
 
 La prueba de cobertura integral falla porque el sistema aún no proporciona equivalencia exacta demostrada para variantes arbitrarias específicas de cada dialecto de:
 
+- Claves foráneas con modos `MATCH`, diferimiento u otras extensiones específicas.
 - Restricciones `CHECK`.
 - Índices y expresiones de índice.
 - Triggers.

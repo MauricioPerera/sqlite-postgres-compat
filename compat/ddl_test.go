@@ -169,3 +169,22 @@ func TestSchemaRejectsIndexOnUnknownColumn(t *testing.T) {
 		t.Fatalf("expected unknown index column error, got %v", err)
 	}
 }
+
+func TestCompileCanonicalForeignKeyActions(t *testing.T) {
+	constraint := Constraint{
+		Kind:    ForeignKey,
+		Columns: []string{"parent_id"},
+		References: &Reference{
+			Table: "parents", Columns: []string{"id"}, OnUpdate: Cascade, OnDelete: SetNull,
+		},
+	}
+	for _, engine := range []Engine{SQLite, Postgres} {
+		got, err := compileConstraint(engine, constraint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(got, `ON UPDATE CASCADE ON DELETE SET NULL`) {
+			t.Fatalf("%s lost referential actions: %s", engine, got)
+		}
+	}
+}
