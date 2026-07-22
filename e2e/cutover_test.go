@@ -383,8 +383,8 @@ func TestDryRunCLISuccessPlan(t *testing.T) {
 	}
 
 	var plan struct {
-		Status               string `json:"status"`
-		SourceTables         []struct {
+		Status       string `json:"status"`
+		SourceTables []struct {
 			Name string `json:"name"`
 			Rows int    `json:"rows"`
 		} `json:"source_tables"`
@@ -536,8 +536,8 @@ func TestDryRunCLIUnreachableDestinationError(t *testing.T) {
 // (not compat-cutover) and needs no PostgreSQL.
 func TestAuditCLIErrorCodeOnNotExact(t *testing.T) {
 	contract := map[string]any{
-		"source":           map[string]any{"engine": "sqlite", "version": map[string]any{"major": 3, "minor": 45, "patch": 0}},
-		"destination":      map[string]any{"engine": "postgres", "version": map[string]any{"major": 17, "minor": 0, "patch": 0}},
+		"source":            map[string]any{"engine": "sqlite", "version": map[string]any{"major": 3, "minor": 45, "patch": 0}},
+		"destination":       map[string]any{"engine": "postgres", "version": map[string]any{"major": 17, "minor": 0, "patch": 0}},
 		"required_features": []string{"tables", "views"},
 	}
 	data, err := json.Marshal(contract)

@@ -273,7 +273,7 @@ func TestParseCatalogExpressionNotPrecedence(t *testing.T) {
 		{
 			name:  "not over a bare column does not regress",
 			input: "NOT a",
-			want: Expression{Kind: "not", Args: []Expression{column("a")}},
+			want:  Expression{Kind: "not", Args: []Expression{column("a")}},
 		},
 	}
 

@@ -31,7 +31,7 @@ type cutoverConfig struct {
 	Contract       compat.Contract `json:"contract"`
 	Schema         compat.Schema   `json:"schema"`
 	SchemaRef      string          `json:"schema_ref,omitempty"`
-	Options        cutoverOptions   `json:"options"`
+	Options        cutoverOptions  `json:"options"`
 }
 
 type cutoverOptions struct {

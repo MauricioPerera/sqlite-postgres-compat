@@ -174,8 +174,8 @@ func TestCompileLikePreservesSQLiteSemanticsForBothEngines(t *testing.T) {
 			Name: "product_codes",
 			Query: SelectQuery{
 				Columns: []Projection{{Expression: Expression{Kind: "column", Value: "code"}, Alias: "code"}},
-				From:   TableSource{Table: "products"},
-				Where:  &like,
+				From:    TableSource{Table: "products"},
+				Where:   &like,
 			},
 		}},
 	}
@@ -433,7 +433,7 @@ func TestCompileTriggerNewOldStillMagic(t *testing.T) {
 			Name: "trg", Table: "entries", Timing: "before", Event: "update", When: &when,
 			Actions: []TriggerAction{{Kind: "update", Table: "entries",
 				Assignments: []Assignment{{Column: "amount", Value: Expression{Kind: "column", Value: "new.amount"}}},
-				Where: &Expression{Kind: "eq", Args: []Expression{{Kind: "column", Value: "new.amount"}, {Kind: "integer", Value: "0"}}}}},
+				Where:       &Expression{Kind: "eq", Args: []Expression{{Kind: "column", Value: "new.amount"}, {Kind: "integer", Value: "0"}}}}},
 		}
 		for _, engine := range []Engine{SQLite, Postgres} {
 			statements, err := CompileDDL(Target{Engine: engine, Version: Version{Major: 17}}, Schema{Triggers: []Trigger{trigger}})
