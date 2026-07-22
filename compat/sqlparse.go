@@ -68,11 +68,40 @@ func parseCatalogExpression(input string) (Expression, error) {
 		}
 		return Expression{Kind: kind, Value: text}, nil
 	}
+	if function, argument, ok := catalogFunctionCall(text); ok {
+		switch function {
+		case "count", "sum", "avg", "min", "max", "lower", "upper":
+			if strings.TrimSpace(argument) == "*" {
+				return Expression{Kind: function, Args: []Expression{{Kind: "star"}}}, nil
+			}
+			parsed, err := parseCatalogExpression(argument)
+			if err != nil {
+				return Expression{}, err
+			}
+			return Expression{Kind: function, Args: []Expression{parsed}}, nil
+		default:
+			return Expression{}, fmt.Errorf("unsupported catalog function %q", function)
+		}
+	}
 	identifier, ok := parseCatalogIdentifier(text)
 	if ok {
 		return Expression{Kind: "column", Value: identifier}, nil
 	}
 	return Expression{}, fmt.Errorf("unsupported catalog expression %q", input)
+}
+
+func catalogFunctionCall(text string) (string, string, bool) {
+	position := strings.IndexByte(text, '(')
+	if position <= 0 || matchingParenthesis(text, position) != len(text)-1 {
+		return "", "", false
+	}
+	name := strings.ToLower(strings.TrimSpace(text[:position]))
+	for _, character := range name {
+		if !(unicode.IsLetter(character) || character == '_') {
+			return "", "", false
+		}
+	}
+	return name, text[position+1 : len(text)-1], true
 }
 
 func parsePostgresCatalogDefault(input string) (Expression, error) {

@@ -12,8 +12,12 @@ func TestParseCatalogSelectCommonView(t *testing.T) {
 	}
 }
 
-func TestParseCatalogSelectRejectsJoinUntilSemanticsAreTranslated(t *testing.T) {
-	if _, err := parseCatalogSelect(`SELECT a.id FROM a JOIN b ON b.id = a.id`); err == nil {
-		t.Fatal("expected join to be rejected")
+func TestParseCatalogSelectWithJoinAndAggregation(t *testing.T) {
+	query, err := parseCatalogSelect(`SELECT p.id, count(c.id) AS total FROM parents AS p LEFT JOIN children AS c ON c.parent_id = p.id GROUP BY p.id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(query.Joins) != 1 || query.Joins[0].Kind != "left" || len(query.GroupBy) != 1 || query.Columns[1].Expression.Kind != "count" {
+		t.Fatalf("unexpected joined query: %+v", query)
 	}
 }

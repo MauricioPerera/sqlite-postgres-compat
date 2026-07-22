@@ -250,6 +250,8 @@ func compileExpression(engine Engine, expression Expression) (string, error) {
 			}
 		}
 		return strings.Join(parts, "."), nil
+	case "star":
+		return "*", nil
 	case "and", "or", "eq", "ne", "lt", "lte", "gt", "gte", "add", "sub", "mul", "div", "like":
 		if len(expression.Args) != 2 {
 			return "", fmt.Errorf("expression %q requires two arguments", expression.Kind)

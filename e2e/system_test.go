@@ -738,6 +738,7 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 			`CREATE VIEW native_active_products AS SELECT code AS product_code, price FROM native_products WHERE active = TRUE`,
 			`CREATE TABLE native_parents (id INTEGER PRIMARY KEY, tenant INTEGER NOT NULL, code TEXT NOT NULL, UNIQUE (tenant, code))`,
 			`CREATE TABLE native_children (id INTEGER PRIMARY KEY, parent_tenant INTEGER NOT NULL, parent_code TEXT NOT NULL, FOREIGN KEY (parent_tenant, parent_code) REFERENCES native_parents (tenant, code) ON UPDATE CASCADE ON DELETE CASCADE)`,
+			`CREATE VIEW native_parent_counts AS SELECT p.tenant AS tenant, count(c.id) AS child_count FROM native_parents AS p LEFT JOIN native_children AS c ON ((c.parent_tenant = p.tenant) AND (c.parent_code = p.code)) GROUP BY p.tenant`,
 		},
 		compat.Postgres: {
 			`CREATE TABLE native_products (code TEXT NOT NULL, price BIGINT NOT NULL DEFAULT 3, active BOOLEAN NOT NULL DEFAULT TRUE, status TEXT NOT NULL DEFAULT 'new', CHECK (price >= 0))`,
@@ -746,6 +747,7 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 			`CREATE VIEW native_active_products AS SELECT code AS product_code, price FROM native_products WHERE active = TRUE`,
 			`CREATE TABLE native_parents (id BIGINT PRIMARY KEY, tenant BIGINT NOT NULL, code TEXT NOT NULL, UNIQUE (tenant, code))`,
 			`CREATE TABLE native_children (id BIGINT PRIMARY KEY, parent_tenant BIGINT NOT NULL, parent_code TEXT NOT NULL, FOREIGN KEY (parent_tenant, parent_code) REFERENCES native_parents (tenant, code) ON UPDATE CASCADE ON DELETE CASCADE)`,
+			`CREATE VIEW native_parent_counts AS SELECT p.tenant AS tenant, count(c.id) AS child_count FROM native_parents AS p LEFT JOIN native_children AS c ON ((c.parent_tenant = p.tenant) AND (c.parent_code = p.code)) GROUP BY p.tenant`,
 		},
 	}
 	for _, store := range []*compat.Store{sqlite, postgres} {
@@ -799,7 +801,16 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 		if !foundUnique || !foundPartial {
 			t.Fatalf("%s native index semantics lost: %+v", store.Target.Engine, inspection.Schema.Indexes)
 		}
-		if len(inspection.Schema.Views) != 1 || inspection.Schema.Views[0].Name != "native_active_products" || len(inspection.Schema.Views[0].Query.Columns) != 2 || inspection.Schema.Views[0].Query.Where == nil {
+		activeView, aggregateView := false, false
+		for _, view := range inspection.Schema.Views {
+			if view.Name == "native_active_products" && len(view.Query.Columns) == 2 && view.Query.Where != nil {
+				activeView = true
+			}
+			if view.Name == "native_parent_counts" && len(view.Query.Columns) == 2 && len(view.Query.Joins) == 1 && len(view.Query.GroupBy) == 1 && view.Query.Columns[1].Expression.Kind == "count" {
+				aggregateView = true
+			}
+		}
+		if !activeView || !aggregateView {
 			t.Fatalf("%s native view was not reconstructed: %+v", store.Target.Engine, inspection.Schema.Views)
 		}
 		if _, err := store.DB.ExecContext(ctx, `INSERT INTO native_products (code) VALUES ('A')`); err != nil {
@@ -809,6 +820,16 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 		var price int
 		if err := store.DB.QueryRowContext(ctx, `SELECT product_code, price FROM native_active_products`).Scan(&code, &price); err != nil || code != "A" || price != 3 {
 			t.Fatalf("%s native view behavior differs: code=%q price=%d error=%v", store.Target.Engine, code, price, err)
+		}
+		if _, err := store.DB.ExecContext(ctx, `INSERT INTO native_parents (id, tenant, code) VALUES (1, 7, 'P')`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DB.ExecContext(ctx, `INSERT INTO native_children (id, parent_tenant, parent_code) VALUES (1, 7, 'P')`); err != nil {
+			t.Fatal(err)
+		}
+		var tenant, childCount int64
+		if err := store.DB.QueryRowContext(ctx, `SELECT tenant, child_count FROM native_parent_counts`).Scan(&tenant, &childCount); err != nil || tenant != 7 || childCount != 1 {
+			t.Fatalf("%s joined aggregate view differs: tenant=%d count=%d error=%v", store.Target.Engine, tenant, childCount, err)
 		}
 	}
 }

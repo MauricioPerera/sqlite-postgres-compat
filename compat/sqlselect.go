@@ -110,11 +110,12 @@ func parseCatalogSelect(definition string) (SelectQuery, error) {
 	if len(located) > 0 {
 		sourceEnd = located[0].position
 	}
-	source, err := parseCatalogTableSource(strings.TrimSpace(remainder[:sourceEnd]))
+	source, joins, err := parseCatalogFrom(strings.TrimSpace(remainder[:sourceEnd]))
 	if err != nil {
 		return SelectQuery{}, err
 	}
 	query.From = source
+	query.Joins = joins
 	for i, current := range located {
 		start := current.position + len(clauses[current.index].keyword)
 		end := len(remainder)
@@ -225,8 +226,8 @@ func splitProjectionAlias(text string) (string, string) {
 }
 
 func parseCatalogTableSource(text string) (TableSource, error) {
-	if strings.ContainsAny(text, ",()") || topLevelKeyword(text, "JOIN") >= 0 {
-		return TableSource{}, fmt.Errorf("joins and compound sources require extended SELECT translation")
+	if strings.ContainsAny(text, ",()") {
+		return TableSource{}, fmt.Errorf("compound table source is outside the canonical grammar")
 	}
 	fields := strings.Fields(text)
 	if len(fields) == 0 || len(fields) > 3 {
@@ -248,4 +249,92 @@ func parseCatalogTableSource(text string) (TableSource, error) {
 		return TableSource{}, fmt.Errorf("unsupported table alias %q", text)
 	}
 	return source, nil
+}
+
+func parseCatalogFrom(text string) (TableSource, []Join, error) {
+	text = strings.TrimSpace(text)
+	for hasOuterParentheses(text) {
+		text = strings.TrimSpace(text[1 : len(text)-1])
+	}
+	position, _, found := nextCatalogJoin(text)
+	if !found {
+		source, err := parseCatalogTableSource(text)
+		return source, nil, err
+	}
+	base, err := parseCatalogTableSource(strings.TrimSpace(text[:position]))
+	if err != nil {
+		return TableSource{}, nil, err
+	}
+	remainder := strings.TrimSpace(text[position:])
+	var joins []Join
+	for remainder != "" {
+		start, kind, found := nextCatalogJoin(remainder)
+		if !found || start != 0 {
+			return TableSource{}, nil, fmt.Errorf("invalid JOIN sequence %q", remainder)
+		}
+		keywordLength := len("JOIN")
+		switch kind {
+		case "left":
+			if strings.HasPrefix(strings.ToUpper(remainder), "LEFT OUTER JOIN") {
+				keywordLength = len("LEFT OUTER JOIN")
+			} else {
+				keywordLength = len("LEFT JOIN")
+			}
+		case "inner":
+			if strings.HasPrefix(strings.ToUpper(remainder), "INNER JOIN") {
+				keywordLength = len("INNER JOIN")
+			}
+		case "cross":
+			keywordLength = len("CROSS JOIN")
+		}
+		tail := strings.TrimSpace(remainder[keywordLength:])
+		next, _, hasNext := nextCatalogJoin(tail)
+		segment := tail
+		if hasNext {
+			segment = strings.TrimSpace(tail[:next])
+			remainder = strings.TrimSpace(tail[next:])
+		} else {
+			remainder = ""
+		}
+		join := Join{Kind: kind}
+		if kind == "cross" {
+			join.Table, err = parseCatalogTableSource(segment)
+		} else {
+			on := topLevelKeyword(segment, "ON")
+			if on < 0 {
+				return TableSource{}, nil, fmt.Errorf("JOIN has no ON condition")
+			}
+			join.Table, err = parseCatalogTableSource(strings.TrimSpace(segment[:on]))
+			if err == nil {
+				join.On, err = parseCatalogExpression(strings.TrimSpace(segment[on+len("ON"):]))
+			}
+		}
+		if err != nil {
+			return TableSource{}, nil, err
+		}
+		joins = append(joins, join)
+	}
+	return base, joins, nil
+}
+
+func nextCatalogJoin(text string) (int, string, bool) {
+	candidates := []struct {
+		keyword, kind string
+	}{
+		{"LEFT OUTER JOIN", "left"},
+		{"LEFT JOIN", "left"},
+		{"INNER JOIN", "inner"},
+		{"CROSS JOIN", "cross"},
+		{"JOIN", "inner"},
+	}
+	position := -1
+	kind := ""
+	for _, candidate := range candidates {
+		found := topLevelKeyword(text, candidate.keyword)
+		if found >= 0 && (position < 0 || found < position) {
+			position = found
+			kind = candidate.kind
+		}
+	}
+	return position, kind, position >= 0
 }
