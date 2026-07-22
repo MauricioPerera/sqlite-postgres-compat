@@ -288,3 +288,285 @@ func TestCutoverTolerantGenuineDivergenceStillConflicts(t *testing.T) {
 		t.Fatalf("expected ConflictError for genuine divergence under tolerant mode, got %v", err)
 	}
 }
+
+// runCLI runs a compat CLI as a subprocess from the repo root and returns its
+// stdout, stderr, and exit code. Unlike exec.Command.Output, it returns the
+// captured stdout even when the process exits non-zero.
+func runCLI(t *testing.T, args ...string) (stdout, stderr string, exitCode int) {
+	t.Helper()
+	command := exec.Command("go", append([]string{"run"}, args...)...)
+	command.Dir = ".."
+	var out, errbuf strings.Builder
+	command.Stdout = &out
+	command.Stderr = &errbuf
+	err := command.Run()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			t.Fatalf("failed to run CLI %v: %v\nstderr:\n%s", args, err, errbuf.String())
+		}
+	}
+	return out.String(), errbuf.String(), exitCode
+}
+
+// firstErrorJSONLine scans a CLI stdout (which may contain a findings array
+// followed by an error object) and returns the parsed error envelope, or fails
+// the test if no single-line error JSON is present.
+func firstErrorJSONLine(t *testing.T, stdout string) map[string]any {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(line), &parsed); err != nil {
+			continue
+		}
+		if status, _ := parsed["status"].(string); status == "error" {
+			return parsed
+		}
+	}
+	t.Fatalf("no error JSON line in stdout:\n%s", stdout)
+	return nil
+}
+
+// TestDryRunCLISuccessPlan drives compat-cutover --dry-run against a real
+// PostgreSQL destination: it exits 0 with a plan JSON carrying the correct
+// source row counts and destination_has_tables=false, and it writes NOTHING to
+// either store (no capture triggers, no journal, no destination tables).
+func TestDryRunCLISuccessPlan(t *testing.T) {
+	ctx := context.Background()
+	const table = "dryrun_plan_items"
+	schema := cutoverSchema(table)
+
+	sourcePath := filepath.Join(t.TempDir(), "dryrun-source.db")
+	source, err := compat.OpenSQLite(compat.Version{Major: 3}, "file:"+filepath.ToSlash(sourcePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO dryrun_plan_items (id, title) VALUES (?, ?), (?, ?)`, 1, "one", 2, "two"); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	configuration := map[string]any{
+		"source_dsn":      "file:" + filepath.ToSlash(sourcePath),
+		"destination_dsn": postgresTestDSN,
+		"contract": compat.Contract{
+			Source:      compat.Target{Engine: compat.SQLite, Version: compat.Version{Major: 3}},
+			Destination: compat.Target{Engine: compat.Postgres, Version: compat.Version{Major: 17, Minor: 5}},
+		},
+		"schema":  schema,
+		"options": map[string]any{"poll_interval_ms": 10, "drain_polls": 2, "batch_limit": 100},
+	}
+	data, err := json.Marshal(configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "cutover.json")
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, exitCode := runCLI(t, "./cmd/compat-cutover", "--dry-run", configPath)
+	if exitCode != 0 {
+		t.Fatalf("expected exit 0, got %d\nstderr:\n%s\nstdout:\n%s", exitCode, stderr, stdout)
+	}
+
+	var plan struct {
+		Status               string `json:"status"`
+		SourceTables         []struct {
+			Name string `json:"name"`
+			Rows int    `json:"rows"`
+		} `json:"source_tables"`
+		DestinationHasTables bool     `json:"destination_has_tables"`
+		Phases               []string `json:"phases"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &plan); err != nil {
+		t.Fatalf("invalid plan JSON %q: %v", stdout, err)
+	}
+	if plan.Status != "plan" {
+		t.Fatalf("expected status=plan, got %q\n%s", plan.Status, stdout)
+	}
+	if len(plan.SourceTables) != 1 || plan.SourceTables[0].Name != table || plan.SourceTables[0].Rows != 2 {
+		t.Fatalf("expected source_tables=[{name=%s,rows=2}], got %+v", table, plan.SourceTables)
+	}
+	if plan.DestinationHasTables {
+		t.Fatalf("expected destination_has_tables=false on a fresh destination, got true")
+	}
+	wantPhases := []string{"install_capture", "snapshot", "catch_up", "verify"}
+	if len(plan.Phases) != len(wantPhases) {
+		t.Fatalf("expected %d phases, got %v", len(wantPhases), plan.Phases)
+	}
+	for i, phase := range wantPhases {
+		if plan.Phases[i] != phase {
+			t.Fatalf("expected phases=%v, got %v", wantPhases, plan.Phases)
+		}
+	}
+
+	// No-write assertion on the source: no capture triggers and no journal table.
+	reopened, err := compat.OpenSQLite(compat.Version{Major: 3}, "file:"+filepath.ToSlash(sourcePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	var triggerCount int
+	if err := reopened.DB.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE '__compat_capture_%'`).Scan(&triggerCount); err != nil {
+		t.Fatal(err)
+	}
+	if triggerCount != 0 {
+		t.Fatalf("dry-run must not install capture triggers; found %d", triggerCount)
+	}
+	var journalCount int
+	if err := reopened.DB.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '__compat_change_journal'`).Scan(&journalCount); err != nil {
+		t.Fatal(err)
+	}
+	if journalCount != 0 {
+		t.Fatalf("dry-run must not create a change journal; found %d", journalCount)
+	}
+
+	// No-write assertion on the destination: the contract table must be absent.
+	postgres := openPostgres(t)
+	var destTableCount int
+	if err := postgres.DB.QueryRowContext(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1`, table).Scan(&destTableCount); err != nil {
+		t.Fatal(err)
+	}
+	if destTableCount != 0 {
+		t.Fatalf("dry-run must not create destination tables; %s present", table)
+	}
+}
+
+// TestDryRunCLIInvalidConfigError verifies that an unreadable JSON config is
+// reported as a typed ERR_CONFIG error on stdout with exit 1.
+func TestDryRunCLIInvalidConfigError(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "bad.json")
+	if err := os.WriteFile(configPath, []byte("{not valid json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, _, exitCode := runCLI(t, "./cmd/compat-cutover", "--dry-run", configPath)
+	if exitCode != 1 {
+		t.Fatalf("expected exit 1 for invalid config, got %d\nstdout:\n%s", exitCode, stdout)
+	}
+	parsed := firstErrorJSONLine(t, stdout)
+	if code, _ := parsed["code"].(string); code != "ERR_CONFIG" {
+		t.Fatalf("expected code=ERR_CONFIG, got %v\nstdout:\n%s", parsed["code"], stdout)
+	}
+}
+
+// TestDryRunCLIUnreachableDestinationError verifies that a destination DSN that
+// cannot be reached is reported as ERR_CONNECT_DESTINATION with exit 1, and that
+// no write occurs on the source before the failure.
+func TestDryRunCLIUnreachableDestinationError(t *testing.T) {
+	ctx := context.Background()
+	const table = "dryrun_unreach_items"
+	schema := cutoverSchema(table)
+
+	sourcePath := filepath.Join(t.TempDir(), "dryrun-unreach-source.db")
+	source, err := compat.OpenSQLite(compat.Version{Major: 3}, "file:"+filepath.ToSlash(sourcePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO dryrun_unreach_items (id, title) VALUES (?, ?)`, 1, "one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Port 1 is privileged and unlistened; connect_timeout bounds the wait.
+	const unreachableDSN = "postgres://postgres:x@127.0.0.1:1/postgres?sslmode=disable&connect_timeout=3"
+	configuration := map[string]any{
+		"source_dsn":      "file:" + filepath.ToSlash(sourcePath),
+		"destination_dsn": unreachableDSN,
+		"contract": compat.Contract{
+			Source:      compat.Target{Engine: compat.SQLite, Version: compat.Version{Major: 3}},
+			Destination: compat.Target{Engine: compat.Postgres, Version: compat.Version{Major: 17, Minor: 5}},
+		},
+		"schema": schema,
+	}
+	data, err := json.Marshal(configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "cutover.json")
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, _, exitCode := runCLI(t, "./cmd/compat-cutover", "--dry-run", configPath)
+	if exitCode != 1 {
+		t.Fatalf("expected exit 1 for unreachable destination, got %d\nstdout:\n%s", exitCode, stdout)
+	}
+	parsed := firstErrorJSONLine(t, stdout)
+	if code, _ := parsed["code"].(string); code != "ERR_CONNECT_DESTINATION" {
+		t.Fatalf("expected code=ERR_CONNECT_DESTINATION, got %v\nstdout:\n%s", parsed["code"], stdout)
+	}
+
+	// The source must be untouched: the failure happens before any write phase.
+	reopened, err := compat.OpenSQLite(compat.Version{Major: 3}, "file:"+filepath.ToSlash(sourcePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	var triggerCount int
+	if err := reopened.DB.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE '__compat_capture_%'`).Scan(&triggerCount); err != nil {
+		t.Fatal(err)
+	}
+	if triggerCount != 0 {
+		t.Fatalf("no capture triggers must exist when the destination is unreachable; found %d", triggerCount)
+	}
+}
+
+// TestCutoverAuditCLIErrorCodeOnNotExact verifies that compat-audit emits a
+// typed ERR_AUDIT_NOT_EXACT error JSON (in addition to its findings array) and
+// exits 1 when a required feature is not exact. It needs no PostgreSQL.
+func TestCutoverAuditCLIErrorCodeOnNotExact(t *testing.T) {
+	contract := map[string]any{
+		"source":           map[string]any{"engine": "sqlite", "version": map[string]any{"major": 3, "minor": 45, "patch": 0}},
+		"destination":      map[string]any{"engine": "postgres", "version": map[string]any{"major": 17, "minor": 0, "patch": 0}},
+		"required_features": []string{"tables", "views"},
+	}
+	data, err := json.Marshal(contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contractPath := filepath.Join(t.TempDir(), "contract.json")
+	if err := os.WriteFile(contractPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, _, exitCode := runCLI(t, "./cmd/compat-audit", contractPath)
+	if exitCode != 1 {
+		t.Fatalf("expected exit 1 for non-exact audit, got %d\nstdout:\n%s", exitCode, stdout)
+	}
+
+	// The findings array is emitted first; the typed error JSON follows it.
+	var findings []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") {
+			if err := json.Unmarshal([]byte(line), &findings); err != nil {
+				t.Fatalf("invalid findings JSON %q: %v", line, err)
+			}
+			break
+		}
+	}
+	if findings == nil {
+		t.Fatalf("no findings array in audit stdout:\n%s", stdout)
+	}
+	parsed := firstErrorJSONLine(t, stdout)
+	if code, _ := parsed["code"].(string); code != "ERR_AUDIT_NOT_EXACT" {
+		t.Fatalf("expected code=ERR_AUDIT_NOT_EXACT, got %v\nstdout:\n%s", parsed["code"], stdout)
+	}
+}

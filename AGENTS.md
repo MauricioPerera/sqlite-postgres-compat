@@ -174,7 +174,33 @@ The layer never silently degrades. These are rejected with explicit errors:
 
 ## 8. CLIs
 
-All CLIs take exactly one JSON config argument. Exit codes: `0` success; `1` any error or non-exact/non-equivalent result; `2` wrong argument count.
+All CLIs take exactly one JSON config argument (`compat-cutover` accepts an optional `--dry-run` before it). Exit codes: `0` success; `1` any error or non-exact/non-equivalent result; `2` wrong argument count.
+
+### 8.1 Typed error protocol (machine-facing)
+
+On any failure each CLI prints a single-line JSON error envelope to **stdout** (in addition to any result JSON it already emits) and exits with its current code (`1`, or `2` for `ERR_USAGE`):
+
+```json
+{"status":"error","code":"<CODE>","message":"<detalle>"}
+```
+
+The line is always one parseable JSON object (the message is JSON-encoded, so embedded newlines never break it). An agent branches on `code`. The taxonomy is closed; the CLI picks the most specific applicable code. Free-text diagnostics still go to stderr for humans.
+
+| Code | Emitted when | Exit |
+|---|---|---|
+| `ERR_USAGE` | Wrong argument count (or an unexpected flag). | `2` |
+| `ERR_CONFIG` | The config file is unreadable, fails `json.Unmarshal`, or `compat.Audit` rejects the contract (`Contract.Validate`). | `1` |
+| `ERR_AUDIT_NOT_EXACT` | A required (or inferred) feature is not `exact` (`RequireExact` fails). `compat-audit` emits its findings array first, then this line. | `1` |
+| `ERR_CONNECT_SOURCE` | The source store cannot be opened or pinged (`OpenStore`/`Ping` for the source). | `1` |
+| `ERR_CONNECT_DESTINATION` | The destination store cannot be opened or pinged (`OpenStore`/`Ping` for the destination). | `1` |
+| `ERR_SCHEMA` | `Schema.Validate` or `ApplySchema` fails. | `1` |
+| `ERR_SNAPSHOT` | `ExportSnapshot` or `ImportSnapshot` fails. | `1` |
+| `ERR_REPLICATION_CONFLICT` | A `compat.ConflictError` is raised while replaying the journal during catch-up (`ApplyChangesTolerant`). | `1` |
+| `ERR_CAPTURE` | `InstallChangeCapture` or `ReadCapturedChanges` fails. | `1` |
+| `ERR_VERIFY_DIVERGED` | Verification digests differ (`VerifySnapshots` → `Equivalent == false`). `compat-cutover` keeps its `diverged` result JSON and adds this `code`. | `1` |
+| `ERR_INTERNAL` | Any failure not covered above (e.g. `VerifySnapshots` returns an error, encoding fails, context cancellation). | `1` |
+
+Errors are classified by **phase heuristic** (which step of the flow failed) plus `errors.As` against the existing exported `compat.ConflictError`; the public `compat/` API is not extended. `compat-copy` maps a non-equivalent `VerificationReport` to `ERR_VERIFY_DIVERGED`.
 
 ### `compat-audit <contract.json>`
 
@@ -187,8 +213,8 @@ Audits a `Contract` (`{source, destination, required_features}`) and prints one 
 ```
 
 - Exit `0`: every required feature is `exact`.
-- Exit `1`: any feature is not `exact` (the failing reason is also printed to stderr), or any read/parse/audit error.
-- Exit `2`: argument count is not 1.
+- Exit `1`: any feature is not `exact`. The findings array is still printed to stdout first, followed by a typed `{"status":"error","code":"ERR_AUDIT_NOT_EXACT",...}` line; the failing reason is also printed to stderr. Any read/parse/audit error prints `ERR_CONFIG` instead.
+- Exit `2`: argument count is not 1 (`ERR_USAGE`).
 
 ### `compat-copy <migration.json>`
 
@@ -199,8 +225,8 @@ Config: `{source_dsn, destination_dsn, contract, schema}`. Infers features from 
 ```
 
 - Exit `0`: `equivalent == true`.
-- Exit `1`: any error or `equivalent == false`.
-- Exit `2`: wrong argument count. The destination must be empty for the described objects (import is additive).
+- Exit `1`: any typed error (see 8.1) or `equivalent == false`, the latter reported as `ERR_VERIFY_DIVERGED`.
+- Exit `2`: wrong argument count (`ERR_USAGE`). The destination must be empty for the described objects (import is additive).
 
 ### `compat-cutover <cutover.json>`
 
@@ -211,9 +237,33 @@ Config: `{source_dsn, destination_dsn, contract, schema, options}`. `options` is
 ```
 
 - Exit `0`: digests match → `status=ready`.
-- Exit `1`: `status=diverged` (digests differ), a required feature is not exact (findings also printed to stderr), or any error.
-- Exit `2`: wrong argument count.
+- Exit `1`: `status=diverged` (digests differ — the report keeps its shape and adds `"code":"ERR_VERIFY_DIVERGED"`), a required feature is not exact (`ERR_AUDIT_NOT_EXACT`, findings also printed to stderr), or any typed error.
+- Exit `2`: wrong argument count (`ERR_USAGE`).
 - Cutting the application's DSN over to the destination is **manual** and is not this tool's responsibility; do it after `status=ready`.
+
+The `diverged` report carries the typed code inline:
+
+```json
+{"status":"diverged","code":"ERR_VERIFY_DIVERGED","source_digest":"...","destination_digest":"...","changes_applied":N}
+```
+
+#### `compat-cutover --dry-run <cutover.json>`
+
+Runs only the read-only phases: parse config, audit the contract (refusing non-exact with `ERR_AUDIT_NOT_EXACT`), connect and ping both stores (`ERR_CONNECT_SOURCE`/`ERR_CONNECT_DESTINATION`), count source rows per contract table, and detect whether the destination already holds those tables. It prints a plan JSON on stdout and exits `0`:
+
+```json
+{"status":"plan","audit":[{"feature":"tables","status":"exact"}],
+ "source_tables":[{"name":"entries","rows":N}],
+ "destination_has_tables":false,
+ "phases":["install_capture","snapshot","catch_up","verify"]}
+```
+
+- `audit`: the full `Finding` array for the required + inferred features.
+- `source_tables`: one `{name, rows}` per `schema.tables` entry, counted via `SELECT count(*)`.
+- `destination_has_tables`: `true` iff every contract table already exists on the destination (a real cutover's `ImportSnapshot` would collide with those).
+- `phases`: the fixed sequence a real cutover would run after the plan.
+
+`--dry-run` never installs capture, creates tables, imports a snapshot, or writes a journal on either store. If the audit is not exact or a connection fails, it emits the corresponding typed error JSON and exits `1`.
 
 ## 9. Migration flow (phases and verdicts)
 
@@ -230,3 +280,6 @@ A migration is a sequence of auditable verdicts. Each phase produces a machine-c
 A canonical schema that contains a `vector` column infers `canonical_vectors`; one with views/triggers/routines/indexes infers the corresponding `canonical_*` features. Generic families (`foreign_keys`, `check_constraints`, `indexes`, `views`, `triggers`, `stored_routines`, `full_text`) remain `unknown` because they represent arbitrary native SQL and are not audited as exact.
 
 See [`contracts/migration.contract.example.md`](contracts/migration.contract.example.md) for a full executable example.
+## Interface note
+
+The CLIs are the canonical interface for agents: every operation is available as a command with a machine-readable JSON result, a typed error envelope and a stable exit code. An MCP server wrapping the same library functions is a possible optional layer (useful for shell-less agents or long-running cutover monitoring) and is intentionally not part of this repository today.

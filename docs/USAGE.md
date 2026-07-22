@@ -190,7 +190,55 @@ if err := postgres.ApplyChangesTolerant(ctx, schema, changes); err != nil {
 go run ./cmd/compat-cutover .\cutover.json
 ```
 
-El flujo: audita las capacidades inferidas (detiene con código `1` si alguna no es exacta), instala captura en el origen, exporta el snapshot y lo importa en el destino, drena el journal leyendo lotes y aplicándolos con `ApplyChangesTolerant` hasta `drain_polls` lecturas vacías consecutivas, y verifica los digests. Si son equivalentes imprime `{"status":"ready","source_digest":...,"destination_digest":...,"changes_applied":N}` y termina con código `0`; si divergen imprime `{"status":"diverged",...}` y termina con código `1`. Código de salida `2` si el número de argumentos no es exactamente uno. El corte del DSN de la aplicación NO es responsabilidad de esta herramienta: cortá la conexión de la app manualmente tras recibir `status=ready`.
+El flujo: audita las capacidades inferidas (detiene con código `1` si alguna no es exacta), instala captura en el origen, exporta el snapshot y lo importa en el destino, drena el journal leyendo lotes y aplicándolos con `ApplyChangesTolerant` hasta `drain_polls` lecturas vacías consecutivas, y verifica los digests. Si son equivalentes imprime `{"status":"ready","source_digest":...,"destination_digest":...,"changes_applied":N}` y termina con código `0`; si divergen imprime `{"status":"diverged","code":"ERR_VERIFY_DIVERGED",...}` y termina con código `1`. Código de salida `2` si el número de argumentos no es exactamente uno. El corte del DSN de la aplicación NO es responsabilidad de esta herramienta: cortá la conexión de la app manualmente tras recibir `status=ready`.
+
+### Plan de sólo lectura con `--dry-run`
+
+```powershell
+go run ./cmd/compat-cutover --dry-run .\cutover.json
+```
+
+`--dry-run` (opcional, antes del JSON posicional) ejecuta sólo fases de lectura: parsea la config, audita el contrato, conecta y hace ping a ambos stores, cuenta las filas del origen por cada tabla del esquema del contrato y verifica si el destino ya contiene esas tablas. Imprime un plan JSON a stdout y termina con código `0`:
+
+```json
+{"status":"plan","audit":[{"feature":"tables","status":"exact"}],
+ "source_tables":[{"name":"entries","rows":N}],
+ "destination_has_tables":false,
+ "phases":["install_capture","snapshot","catch_up","verify"]}
+```
+
+- `audit`: el arreglo de `Finding` para las features requeridas + inferidas.
+- `source_tables`: un `{name, rows}` por tabla del esquema, con conteo vía `SELECT count(*)`.
+- `destination_has_tables`: `true` sólo si todas las tablas del contrato ya existen en el destino (un cutover real chocaría con ellas al importar).
+- `phases`: la secuencia fija que ejecutaría un cutover real después del plan.
+
+`--dry-run` **no escribe nada** en origen ni destino: no instala captura, no crea tablas, no importa snapshot, no escribe journal. Si la auditoría no es exacta o una conexión falla, emite el JSON de error tipado correspondiente y termina con código `1`.
+
+### Códigos de error tipados (los 3 CLIs)
+
+Ante cualquier fallo, cada CLI imprime a **stdout** una línea JSON parseable (además del JSON de resultado que ya emita) y sale con su código actual (`1`, o `2` para `ERR_USAGE`):
+
+```json
+{"status":"error","code":"<CODE>","message":"<detalle>"}
+```
+
+Ramificá por `code`. La taxonomía es cerrada; el CLI elige el código más específico aplicable. El detalle libre sigue yendo a stderr para humanos.
+
+| Código | Cuándo se emite | Exit |
+|---|---|---|
+| `ERR_USAGE` | Cantidad de argumentos incorrecta (o flag inesperado). | `2` |
+| `ERR_CONFIG` | La config no se puede leer, falla `json.Unmarshal`, o `Audit` rechaza el contrato. | `1` |
+| `ERR_AUDIT_NOT_EXACT` | Una feature requerida (o inferida) no es `exact` (`RequireExact` falla). `compat-audit` imprime el arreglo de findings primero y después esta línea. | `1` |
+| `ERR_CONNECT_SOURCE` | No se puede abrir o hacer ping al store origen. | `1` |
+| `ERR_CONNECT_DESTINATION` | No se puede abrir o hacer ping al store destino. | `1` |
+| `ERR_SCHEMA` | Falla `Schema.Validate` o `ApplySchema`. | `1` |
+| `ERR_SNAPSHOT` | Falla `ExportSnapshot` o `ImportSnapshot`. | `1` |
+| `ERR_REPLICATION_CONFLICT` | Se raises un `ConflictError` al reaplicar el journal en el catch-up. | `1` |
+| `ERR_CAPTURE` | Falla `InstallChangeCapture` o `ReadCapturedChanges`. | `1` |
+| `ERR_VERIFY_DIVERGED` | Los digests difieren (`Equivalent == false`). `compat-cutover` conserva su JSON `diverged` y le agrega este `code`. | `1` |
+| `ERR_INTERNAL` | Cualquier fallo no cubierto arriba. | `1` |
+
+La clasificación es por **heurística de fase** (qué paso del flujo falló) más `errors.As` contra el `ConflictError` ya exportado; la API pública de `compat/` no se extiende.
 
 ## Ejecutar una rutina traducida
 
