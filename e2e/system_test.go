@@ -5,9 +5,11 @@ package e2e_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -116,6 +118,74 @@ func TestSystemPortableCoreRoundTripSQLitePostgresSQLite(t *testing.T) {
 	assertEquivalent(t, sourceSnapshot, returnSnapshot)
 }
 
+func TestSystemCompatCopyCLIEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	schema := compat.Schema{Tables: []compat.Table{{
+		Name: "cli_roundtrip",
+		Columns: []compat.Column{
+			{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+			{Name: "title", Type: compat.Type{Family: compat.TextType}},
+		},
+		Constraints: []compat.Constraint{{Kind: compat.PrimaryKey, Columns: []string{"id"}}},
+	}}}
+
+	sourcePath := filepath.Join(t.TempDir(), "cli-source.db")
+	source, err := compat.OpenSQLite(compat.Version{Major: 3}, "file:"+filepath.ToSlash(sourcePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO cli_roundtrip (id, title) VALUES (?, ?), (?, ?)`, 1, "one", 2, "two"); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	configuration := map[string]any{
+		"source_dsn":      "file:" + filepath.ToSlash(sourcePath),
+		"destination_dsn": postgresTestDSN,
+		"contract": compat.Contract{
+			Source:      compat.Target{Engine: compat.SQLite, Version: compat.Version{Major: 3}},
+			Destination: compat.Target{Engine: compat.Postgres, Version: compat.Version{Major: 17, Minor: 5}},
+		},
+		"schema": schema,
+	}
+	data, err := json.Marshal(configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "migration.json")
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command("go", "run", "./cmd/compat-copy", configPath)
+	command.Dir = ".."
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("compat-copy failed: %v\n%s", err, output)
+	}
+	var report compat.VerificationReport
+	if err := json.Unmarshal(output, &report); err != nil {
+		t.Fatalf("invalid compat-copy output %q: %v", output, err)
+	}
+	if !report.Equivalent {
+		t.Fatalf("compat-copy reported non-equivalent snapshots: %+v", report)
+	}
+
+	postgres := openPostgres(t)
+	var count int
+	if err := postgres.DB.QueryRowContext(ctx, `SELECT count(*) FROM cli_roundtrip`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 migrated rows, got %d", count)
+	}
+}
+
 func TestSystemPreservesArbitraryPrecisionDecimals(t *testing.T) {
 	ctx := context.Background()
 	schema := compat.Schema{Tables: []compat.Table{{
@@ -187,8 +257,6 @@ func TestSystemPreservesJSONUUIDAndTimestampSemantics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("source rows: %+v", sourceSnapshot.Rows)
-	t.Logf("postgres rows: %+v", postgresSnapshot.Rows)
 	assertEquivalent(t, sourceSnapshot, postgresSnapshot)
 }
 

@@ -1,0 +1,47 @@
+# Informe de validación integral
+
+Fecha: 2026-07-22
+
+## Resultado
+
+El sistema todavía **no cumple el objetivo de compatibilidad total SQLite ↔ PostgreSQL**.
+
+La batería se ejecutó contra SQLite real y PostgreSQL 17.5 real proporcionado por Laragon en `127.0.0.1:5432`. Cada ejecución creó una base PostgreSQL temporal y la eliminó al finalizar.
+
+## Comprobaciones superadas
+
+- Compilación y pruebas unitarias de todos los paquetes.
+- Análisis estático con `go vet`.
+- Migración SQLite → PostgreSQL → SQLite del núcleo portable.
+- Ejecución completa de la CLI `compat-copy` y comprobación de filas en PostgreSQL.
+- Preservación de decimales de 38 dígitos y 18 decimales.
+- Preservación canónica de JSON, UUID y timestamps con nanosegundos.
+- Comportamiento equivalente de claves foráneas.
+- Eliminación de las bases PostgreSQL temporales después de la prueba.
+
+## Incumplimiento que permanece
+
+La prueba de cobertura integral falla porque el sistema aún no proporciona equivalencia exacta demostrada para:
+
+- JSON y UUID en el catálogo de capacidades, aunque los casos de datos probados sí completaron el viaje de ida y vuelta.
+- Triggers.
+- Vistas.
+- Rutinas almacenadas.
+- Búsqueda de texto completo.
+
+El resultado de la batería es 6 pruebas de aceptación superadas y 1 fallida. Esta proporción no representa un porcentaje de compatibilidad total; el fallo significa que el objetivo del 100% no está cumplido.
+
+## Defectos detectados y corregidos durante la ejecución
+
+- Pérdida de precisión decimal por almacenamiento SQLite `REAL`; ahora usa representación canónica sin pérdida.
+- Redondeo de timestamps PostgreSQL de nanosegundos a microsegundos; ahora conserva la representación canónica completa.
+- Diferencias de normalización JSON; ahora se normaliza antes de comparar.
+- Claves foráneas desactivadas en conexiones SQLite; ahora se habilitan en todas las conexiones del adaptador.
+
+## Ejecución
+
+```powershell
+.\scripts\test-system.ps1
+```
+
+La ejecución debe seguir terminando con código distinto de cero mientras exista cualquier familia requerida sin equivalencia exacta.
