@@ -2,6 +2,7 @@ package compat
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -37,5 +38,96 @@ func TestSQLiteChangeCaptureProducesCanonicalStream(t *testing.T) {
 	}
 	if changes[1].Before["title"].Value != "first" || changes[1].After["title"].Value != "second" {
 		t.Fatalf("update images were not preserved: %+v", changes[1])
+	}
+}
+
+// vectorCaptureSchema is a schema whose vector column declares a dimension of 3.
+// The TEXT carrier in SQLite accepts any bracketed text, so a value with the
+// wrong component count can be inserted directly and must be caught downstream.
+func vectorCaptureSchema(name string) Schema {
+	return Schema{Tables: []Table{{
+		Name: name,
+		Columns: []Column{
+			{Name: "id", Type: Type{Family: IntegerType}},
+			{Name: "v", Type: Type{Family: VectorType, Arguments: []int{3}}, Nullable: true},
+		},
+		Constraints: []Constraint{{Kind: PrimaryKey, Columns: []string{"id"}}},
+	}}}
+}
+
+func TestSQLiteCaptureRejectsVectorDimensionMismatch(t *testing.T) {
+	ctx := context.Background()
+	schema := vectorCaptureSchema("vector_capture_items")
+	source, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.InstallChangeCapture(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	// Insert a 2-component value directly: the TEXT carrier does not enforce the
+	// declared dimension, so the mutation is journaled verbatim. Reading it back
+	// must surface the dimension mismatch rather than canonicalize it silently.
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO vector_capture_items (id, v) VALUES (1, '[1, 2]')`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = source.ReadCapturedChanges(ctx, schema, 0, 10)
+	if err == nil {
+		t.Fatal("expected ReadCapturedChanges to reject a dimension-mismatched vector value")
+	}
+	if !strings.Contains(err.Error(), "dimension") {
+		t.Fatalf("expected error to mention dimension, got: %v", err)
+	}
+}
+
+func TestSQLiteCaptureReplicatesDimensionedVector(t *testing.T) {
+	ctx := context.Background()
+	schema := vectorCaptureSchema("vector_replicate_items")
+	source, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.InstallChangeCapture(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO vector_replicate_items (id, v) VALUES (1, '[1, 2.0, 3]')`); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := source.ReadCapturedChanges(ctx, schema, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 1 || changes[0].Kind != Insert {
+		t.Fatalf("unexpected captured stream: %+v", changes)
+	}
+	if got := changes[0].After["v"]; got.Kind != VectorValue || got.Value != "[1,2,3]" {
+		t.Fatalf("unexpected captured vector value %+v", got)
+	}
+
+	destination, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destination.Close()
+	if err := destination.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := destination.ApplyChanges(ctx, schema, changes); err != nil {
+		t.Fatalf("vector replication must apply: %v", err)
+	}
+	var v string
+	if err := destination.DB.QueryRow(`SELECT v FROM vector_replicate_items WHERE id = 1`).Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	if v != "[1,2,3]" {
+		t.Fatalf("expected canonical vector [1,2,3] at destination, got %q", v)
 	}
 }

@@ -258,3 +258,49 @@ func replicationTestSchema(name string) Schema {
 		Constraints: []Constraint{{Kind: PrimaryKey, Columns: []string{"id"}}},
 	}}}
 }
+
+// TestApplyChangesRejectsDestinationVectorDimensionMismatch exercises the
+// loadRow path: when the destination already holds a vector whose component
+// count does not match the declared dimension, reconstructing that row for a
+// conflict check must surface the mismatch rather than canonicalize it silently.
+func TestApplyChangesRejectsDestinationVectorDimensionMismatch(t *testing.T) {
+	ctx := context.Background()
+	schema := Schema{Tables: []Table{{
+		Name: "vector_conflict_items",
+		Columns: []Column{
+			{Name: "id", Type: Type{Family: IntegerType}},
+			{Name: "v", Type: Type{Family: VectorType, Arguments: []int{3}}, Nullable: true},
+		},
+		Constraints: []Constraint{{Kind: PrimaryKey, Columns: []string{"id"}}},
+	}}}
+	destination, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destination.Close()
+	if err := destination.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	// Store a 2-component value directly against a declared dimension of 3; the
+	// TEXT carrier allows it, so the mismatch only surfaces when loadRow
+	// canonicalizes the row for the update conflict check.
+	if _, err := destination.DB.Exec(`INSERT INTO vector_conflict_items (id, v) VALUES (1, '[1, 2]')`); err != nil {
+		t.Fatal(err)
+	}
+	change := Change{
+		Source:     Target{Engine: Postgres, Version: Version{Major: 17}},
+		Sequence:   1,
+		Kind:       Update,
+		Table:      "vector_conflict_items",
+		PrimaryKey: Row{"id": {Kind: IntegerValue, Value: "1"}},
+		Before:     Row{"id": {Kind: IntegerValue, Value: "1"}, "v": {Kind: VectorValue, Value: "[1,2,3]"}},
+		After:      Row{"id": {Kind: IntegerValue, Value: "1"}, "v": {Kind: VectorValue, Value: "[4,5,6]"}},
+	}
+	err = destination.ApplyChanges(ctx, schema, []Change{change})
+	if err == nil {
+		t.Fatal("expected ApplyChanges to reject a dimension-mismatched destination vector value")
+	}
+	if !strings.Contains(err.Error(), "dimension") {
+		t.Fatalf("expected error to mention dimension, got: %v", err)
+	}
+}

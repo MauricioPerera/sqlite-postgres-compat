@@ -222,7 +222,17 @@ func decodeCapturedRow(payload string, table Table) (Row, error) {
 			}
 			source = decoded
 		}
-		canonical, err := canonicalValue(column.Type.Family, source)
+		// Vector values carry a declared dimension in Type.Arguments; pass it so
+		// canonicalValue rejects a value whose component count differs from the
+		// declared dimension before it enters the replication stream. Other
+		// families do not need it and omit the variadic argument.
+		var canonical Value
+		var err error
+		if column.Type.Family == VectorType {
+			canonical, err = canonicalValue(column.Type.Family, source, column.Type.Arguments...)
+		} else {
+			canonical, err = canonicalValue(column.Type.Family, source)
+		}
 		if err != nil {
 			return nil, err
 		}

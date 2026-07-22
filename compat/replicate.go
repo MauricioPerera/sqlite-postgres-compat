@@ -173,7 +173,18 @@ func loadRow(ctx context.Context, tx *sql.Tx, engine Engine, table Table, primar
 	}
 	row := make(Row, len(table.Columns))
 	for i, column := range table.Columns {
-		value, err := canonicalValue(column.Type.Family, values[i])
+		// Vector values carry a declared dimension in Type.Arguments; pass it so
+		// canonicalValue rejects a value whose component count differs from the
+		// declared dimension when reconstructing the current destination row for
+		// conflict checks. Other families do not need it and omit the variadic
+		// argument.
+		var value Value
+		var err error
+		if column.Type.Family == VectorType {
+			value, err = canonicalValue(column.Type.Family, values[i], column.Type.Arguments...)
+		} else {
+			value, err = canonicalValue(column.Type.Family, values[i])
+		}
 		if err != nil {
 			return nil, false, err
 		}
