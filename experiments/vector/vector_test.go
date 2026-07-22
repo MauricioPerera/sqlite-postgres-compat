@@ -22,14 +22,14 @@ func libsqlURL() string {
 	if v := os.Getenv("VECTOR_LIBSQL_URL"); v != "" {
 		return v
 	}
-	return "http://31.220.22.176:8081"
+	return "http://localhost:8081"
 }
 
 func pgDSN() string {
 	if v := os.Getenv("VECTOR_PG_DSN"); v != "" {
 		return v
 	}
-	return "postgres://postgres:REDACTED@31.220.22.176:5434/postgres?sslmode=disable"
+	return "postgres://postgres:postgres@localhost:5434/postgres?sslmode=disable"
 }
 
 func openLibSQL(t *testing.T) *sql.DB {

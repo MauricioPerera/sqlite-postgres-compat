@@ -1,18 +1,22 @@
 # sqlite-postgres-compat
 
-Motor experimental de compatibilidad bidireccional SQLite ↔ PostgreSQL escrito en Go.
+Capa de compatibilidad para Go con contratos de esquema canónico, migración por snapshot, replicación incremental bidireccional y cutover en vivo de SQLite/libSQL hacia PostgreSQL.
 
-El proyecto usa un esquema canónico independiente de ambos dialectos. Su contrato declara las versiones de origen y destino y las capacidades que deben conservarse. Una capacidad desconocida o no traducida detiene la operación en vez de degradarse silenciosamente.
+## ¿Por qué?
 
-Las capas implementadas son el contrato de compatibilidad, la representación canónica de esquemas, persistencia e inspección exacta del contrato, traducción de catálogos externos para claves primarias, restricciones `UNIQUE`, claves foráneas con acciones referenciales, valores por defecto, expresiones `CHECK`, índices, vistas `SELECT` con joins y agregaciones, triggers con acciones `INSERT`/`UPDATE`/`DELETE`, rutinas parametrizadas con acciones `INSERT`/`UPDATE`/`DELETE` dentro de la gramática SQL común, tipos canónicos escalares y `vector(N)` (feature `canonical_vectors`), auditoría de capacidades, compiladores DDL SQLite/PostgreSQL, adaptadores para snapshots, captura automática de cambios, replicación incremental transaccional e idempotente con detección de conflictos (incluye `Expected`/`Actual` en `ConflictError`) y supresión de ecos transaccional (GUC local `compat.suppress` en Postgres), un runtime común para vistas, triggers, rutinas y búsqueda textual canónicos, y la CLI `compat-cutover` para migración sin ventana. La siguiente capa es completar el análisis de dialectos externos.
+El caso de uso: arrancar un SaaS con SQLite o libSQL (cero operación, sin servidor de base de datos que administrar) y migrar a PostgreSQL más adelante, cuando el crecimiento lo exija, sin ventana de corte y sin apagar la aplicación. Cada fase del camino —auditoría de capacidades, snapshot, replicación, cutover— produce un veredicto determinista (exit code y JSON) en vez de una promesa optimista: si una capacidad no se puede garantizar en ambos motores, el proceso se detiene y lo dice, no degrada en silencio.
+
+## Características
+
+- **Contrato de esquema canónico auditable**: declara motor, versión y capacidades requeridas; `Audit` devuelve un veredicto por capacidad (`exact`/`unknown`) y `RequireExact` corta la migración ante cualquier capacidad no garantizada.
+- **Snapshot con verificación por digest**: exporta el esquema y los datos a una representación canónica, importa en el destino y compara hashes canónicos de ambos lados antes de dar por buena la copia.
+- **Replicación incremental por triggers**: captura automática de cambios (`INSERT`/`UPDATE`/`DELETE`) vía triggers internos, aplicación idempotente por secuencia, detección de conflictos con `Expected`/`Actual`, y supresión de ecos transaccional (GUC local `compat.suppress` en Postgres, no filtra a transacciones ajenas bajo MVCC).
+- **Cutover orquestado sin ventana**: `compat-cutover` audita, instala captura, hace snapshot, drena el journal con `ApplyChangesTolerant` (tolera el solapamiento captura/snapshot sin ser un bypass de conflictos reales) y verifica equivalencia; incluye un modo `--dry-run` de sólo lectura que imprime el plan sin escribir nada.
+- **Tipo `vector(N)` de primera clase**: SQLite/libSQL (`F32_BLOB(N)`) ↔ PostgreSQL (`pgvector`), validado end-to-end contra motores reales (libSQL/sqld y pgvector), incluida inspección de dimensión, snapshot y replicación incremental hacia una columna `vector` nativa.
+- **CLIs con salidas JSON y códigos de error tipados**, pensadas para ser consumidas por agentes de IA: cada fallo emite un envelope `{"status":"error","code":"<CODE>","message":"..."}` sobre una taxonomía cerrada de códigos.
+- **Gramática canónica documentada para agentes** (`AGENTS.md`): especifica exactamente qué SQL/esquema es traducible, qué se rechaza y con qué error.
 
 > Estado: el núcleo canónico funciona y está probado en ambos motores, pero el proyecto todavía no ofrece compatibilidad total con cualquier SQL arbitrario de SQLite y PostgreSQL. La prueba global permanece roja hasta que esa afirmación sea verdadera.
-
-## Requisitos
-
-- Go 1.26 o la versión indicada por `go.mod`.
-- PostgreSQL accesible para las pruebas E2E. SQLite se ejecuta mediante `modernc.org/sqlite` y no requiere CGO.
-- Una base de destino vacía para `compat-copy`; la CLI no elimina ni reemplaza objetos existentes.
 
 ## Inicio rápido
 
@@ -28,37 +32,45 @@ Para copiar un snapshot, edita `examples/migration.example.json` con DSN reales 
 go run ./cmd/compat-copy .\examples\migration.example.json
 ```
 
-## Auditoría
+Para un cutover sin ventana (edita `examples/cutover.example.json` con DSN reales primero):
 
 ```powershell
-go run ./cmd/compat-audit .\contract.json
+go run ./cmd/compat-cutover --dry-run .\examples\cutover.example.json
 ```
 
-## Migración de snapshot
+## Los CLIs
 
-```powershell
-go run ./cmd/compat-copy .\migration.json
+| Comando | Qué hace | Salida / exit codes |
+|---|---|---|
+| `compat-audit <contract.json>` | Audita un contrato (`{source, destination, required_features}`) y evalúa cada capacidad requerida. | Array JSON de `Finding` en stdout. Exit `0` si todo es `exact`; `1` si alguna capacidad no lo es (`ERR_AUDIT_NOT_EXACT`); `2` si el número de argumentos no es uno (`ERR_USAGE`). |
+| `compat-copy <migration.json>` | Migración por snapshot: audita, exporta el origen, importa en el destino (que debe estar vacío para esos objetos) y verifica digests. | `VerificationReport` JSON en stdout. Exit `0` si `equivalent=true`; `1` ante cualquier error tipado o divergencia (`ERR_VERIFY_DIVERGED`); `2` si el número de argumentos no es uno. |
+| `compat-cutover [--dry-run] <cutover.json>` | Cutover sin ventana: audita, instala captura en el origen, hace snapshot al destino, drena el journal con `ApplyChangesTolerant` y verifica. `--dry-run` sólo audita, cuenta filas y prueba conectividad, sin escribir nada. | `cutoverReport` JSON (`status=ready`/`diverged`) o plan JSON con `--dry-run`. Exit `0` si `status=ready` (o plan); `1` ante error tipado o `status=diverged` (`ERR_VERIFY_DIVERGED`); `2` si el número de argumentos no es uno. El corte del DSN de la aplicación es manual, tras recibir `status=ready`. |
+
+Los tres CLIs comparten una taxonomía cerrada de códigos de error (`ERR_USAGE`, `ERR_CONFIG`, `ERR_AUDIT_NOT_EXACT`, `ERR_CONNECT_SOURCE`, `ERR_CONNECT_DESTINATION`, `ERR_SCHEMA`, `ERR_SNAPSHOT`, `ERR_REPLICATION_CONFLICT`, `ERR_CAPTURE`, `ERR_VERIFY_DIVERGED`, `ERR_INTERNAL`); ver el detalle en [docs/USAGE.md](docs/USAGE.md).
+
+## Uso con agentes de IA
+
+`AGENTS.md` es la especificación machine-facing de la gramática canónica: qué tipos, constraints, expresiones, vistas, triggers y rutinas son traducibles, y con qué error explícito se rechaza todo lo demás. `contracts/migration.contract.example.md` es un contrato de migración ejecutable de ejemplo (frontmatter YAML + veredictos verificables comando por comando). Los tres CLIs emiten únicamente JSON parseable, incluidos los errores tipados descritos arriba, para que un agente pueda ramificar por código sin parsear texto libre.
+
+## Estado de validación
+
+La batería E2E (`e2e/system_test.go`, `e2e/suppress_test.go`, `e2e/cutover_test.go`) corre contra SQLite real y PostgreSQL 17.10 real: 28 pruebas de nivel superior, 27 superadas y 1 fallida de forma intencional (`TestSystemClaimsExactCoverageForRequiredFeatureFamilies`), que documenta que las familias genéricas no-canónicas (`foreign_keys`, `check_constraints`, `indexes`, `views`, `triggers`, `stored_routines`, `full_text`) permanecen `unknown` porque representan SQL arbitrario del dialecto, no cubierto todavía. Detalle completo en [docs/reports/VALIDATION_REPORT.md](docs/reports/VALIDATION_REPORT.md).
+
+La compatibilidad del tipo `vector` fue validada por separado contra libSQL/sqld y pgvector reales (snapshot, replicación incremental e inspección de dimensión hacia una columna `vector(N)` nativa). Detalle en [docs/reports/VECTOR-COMPAT-REPORT.md](docs/reports/VECTOR-COMPAT-REPORT.md).
+
+## Estructura del repo
+
 ```
-
-`compat-copy` exporta el origen al formato canónico y lo importa en el destino. Antes de modificar el destino, audita el esquema inferido y detiene la operación si alguna capacidad no está marcada como equivalente exacta. Después exporta el destino y compara hashes canónicos de ambos snapshots.
-
-## Cutover sin ventana
-
-```powershell
-go run ./cmd/compat-cutover .\cutover.json
+compat/           # núcleo: esquema canónico, parser SQL, DDL, snapshots, journal, replicación, runtime
+cmd/               # CLIs: compat-audit, compat-copy, compat-cutover
+e2e/               # batería end-to-end contra SQLite y PostgreSQL reales
+experiments/vector/# validación del tipo vector contra libSQL/sqld y pgvector reales
+examples/          # contratos y configuraciones de ejemplo para los CLIs
+contracts/         # contrato de migración de ejemplo para agentes/CI
+docs/              # arquitectura, uso, compatibilidad, operaciones, pruebas y reportes
+scripts/           # script de validación integral (test-system.ps1)
+AGENTS.md          # gramática canónica machine-facing para agentes/LLMs
 ```
-
-`compat-cutover` orquesta un cutover SQLite → PostgreSQL sin ventana de corte: audita el contrato, instala captura en el origen, importa el snapshot en el destino, drena el journal con `ApplyChangesTolerant` (resolviendo el solapamiento inherente entre captura y snapshot) y verifica equivalencia. Termina con código `0` e imprime `{"status":"ready",...}` cuando los digests coinciden, con código `1` si divergen o alguna capacidad requerida no es exacta, y con código `2` si el número de argumentos no es uno. El corte del DSN de la aplicación es manual: córtalo tras recibir `status=ready`.
-
-## Validación integral
-
-La batería integral usa instancias reales de SQLite y PostgreSQL. Crea una base PostgreSQL temporal, ejecuta migraciones SQLite → PostgreSQL → SQLite, valida datos y comportamiento y elimina la base al terminar.
-
-```powershell
-.\scripts\test-system.ps1
-```
-
-La suite comprueba el núcleo portable, CLI completa, precisión decimal, JSON, UUID, timestamps, claves foráneas, restricciones `CHECK`, índices únicos/parciales/descendentes, inspección de objetos creados con SQL nativo sin metadatos, vistas, triggers, rutinas, búsqueda textual y la cobertura declarada de familias arbitrarias avanzadas. Una prueba fallida representa una capacidad del objetivo total que el sistema todavía no cumple.
 
 ## Documentación
 
@@ -68,14 +80,5 @@ La suite comprueba el núcleo portable, CLI completa, precisión decimal, JSON, 
 - [Operación, concurrencia y recuperación](docs/OPERATIONS.md)
 - [Pruebas y criterios de aceptación](docs/TESTING.md)
 - [Informe de la última validación](docs/reports/VALIDATION_REPORT.md)
+- [Compatibilidad vectorial (libSQL/sqld ↔ pgvector)](docs/reports/VECTOR-COMPAT-REPORT.md)
 - [Especificación para agentes/LLMs](AGENTS.md): gramática canónica, CLIs y flujo de migración.
-
-Ejemplo de `contract.json`:
-
-```json
-{
-  "source": {"engine": "sqlite", "version": {"major": 3, "minor": 45, "patch": 0}},
-  "destination": {"engine": "postgres", "version": {"major": 17, "minor": 0, "patch": 0}},
-  "required_features": ["tables", "canonical_foreign_keys", "transactions"]
-}
-```

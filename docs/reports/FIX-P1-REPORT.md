@@ -93,7 +93,7 @@ usan `SQLite v3 seq=1/2`), cada test de supresión usa una **versión de source
 
 ## Hecho — definición 2: `go test -tags=e2e ./e2e -run TestSuppress -v -count=1 -timeout 600s`
 
-DSN (password enmascarado): `postgres://postgres:****@31.220.22.176:5434/postgres?sslmode=disable`
+DSN (password enmascarado): `postgres://postgres:****@<test-host>:5434/postgres?sslmode=disable`
 
 Salida real:
 

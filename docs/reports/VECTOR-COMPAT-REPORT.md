@@ -4,8 +4,8 @@ Date: 2026-07-22
 Module under test: `experiments/vector/` (module `example.com/vector-exp`, `replace` → root `example.com/sqlite-postgres-compat`).
 Infra (remote, ~100–300ms RTT):
 
-- libSQL / sqld with native vectors: `http://31.220.22.176:8081` (`VECTOR_LIBSQL_URL`).
-- PostgreSQL 17 + pgvector 0.8.5: `postgres://postgres:***@31.220.22.176:5434/postgres?sslmode=disable` (`VECTOR_PG_DSN`).
+- libSQL / sqld with native vectors: `http://<test-host>:8081` (`VECTOR_LIBSQL_URL`).
+- PostgreSQL 17 + pgvector 0.8.5: `postgres://postgres:***@<test-host>:5434/postgres?sslmode=disable` (`VECTOR_PG_DSN`).
 
 The `compat` layer has **no `vector` type family** (see `compat/schema.go` `TypeFamily` constants). This experiment characterizes what does and does not cross the layer, with executed evidence for every cell. Tables use the `vexp_` prefix and are cleaned up best-effort at the end of each test.
 
@@ -51,7 +51,7 @@ CREATE INDEX vexp_san_l_idx ON vexp_san_l(libsql_vector_idx(v))
 ```
 === RUN   TestSanityDirectPgvector
     vector_test.go:216: pgvector [4,5,6] <=> [1,2,3] = 0.025368153802923787
-    vector_test.go:220: pgvector DSN: postgres://postgres:***@31.220.22.176:5434/postgres?sslmode=disable
+    vector_test.go:220: pgvector DSN: postgres://postgres:***@<test-host>:5434/postgres?sslmode=disable
 --- PASS: TestSanityDirectPgvector (1.01s)
 ```
 
@@ -149,7 +149,7 @@ Command: `cd experiments/vector && go test ./... -v -count=1 -timeout 600s`
 --- PASS: TestSanityDirectLibSQL (0.90s)
 === RUN   TestSanityDirectPgvector
     vector_test.go:216: pgvector [4,5,6] <=> [1,2,3] = 0.025368153802923787
-    vector_test.go:220: pgvector DSN: postgres://postgres:***@31.220.22.176:5434/postgres?sslmode=disable
+    vector_test.go:220: pgvector DSN: postgres://postgres:***@<test-host>:5434/postgres?sslmode=disable
 --- PASS: TestSanityDirectPgvector (1.01s)
 === RUN   TestInspectF32BlobMapsToBinaryFamily
     vector_test.go:248: InspectSchema Exact=false unresolved=1
@@ -391,7 +391,7 @@ Command: `cd experiments/vector && go test ./... -v -count=1 -timeout 600s` — 
 --- PASS: TestSanityDirectLibSQL (0.81s)
 === RUN   TestSanityDirectPgvector
     vector_test.go:216: pgvector [4,5,6] <=> [1,2,3] = 0.025368153802923787
-    vector_test.go:220: pgvector DSN: postgres://postgres:***@31.220.22.176:5434/postgres?sslmode=disable
+    vector_test.go:220: pgvector DSN: postgres://postgres:***@<test-host>:5434/postgres?sslmode=disable
 --- PASS: TestSanityDirectPgvector (1.05s)
 === RUN   TestInspectF32BlobMapsToVectorFamily
     vector_test.go:254: InspectSchema Exact=true unresolved=0

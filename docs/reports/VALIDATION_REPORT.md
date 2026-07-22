@@ -62,7 +62,7 @@ La prueba de cobertura integral falla porque el sistema aún no proporciona equi
 - Búsqueda de texto completo.
 - Índices ANN y funciones de distancia nativas para vectores.
 
-El resultado de la batería es 23 pruebas superiores superadas y 1 fallida, sobre 24 pruebas de nivel superior (23 PASS + 1 FAIL intencional, `TestSystemClaimsExactCoverageForRequiredFeatureFamilies`). Esta proporción no representa un porcentaje de compatibilidad total; el fallo significa que el objetivo del 100% no está cumplido.
+El resultado de la batería es 27 pruebas superiores superadas y 1 fallida, sobre 28 pruebas de nivel superior (27 PASS + 1 FAIL intencional, `TestSystemClaimsExactCoverageForRequiredFeatureFamilies`). Esta proporción no representa un porcentaje de compatibilidad total; el fallo significa que el objetivo del 100% no está cumplido.
 
 ## Defectos detectados y corregidos durante la ejecución
 

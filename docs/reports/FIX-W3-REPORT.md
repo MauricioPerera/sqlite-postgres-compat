@@ -4,8 +4,8 @@ Date: 2026-07-22. Module: `example.com/sqlite-postgres-compat` (repo root), expe
 
 Infra (remote, live, used for validation):
 
-- PostgreSQL 17 + pgvector 0.8.5: `postgres://postgres:***@31.220.22.176:5434/postgres?sslmode=disable` (`VECTOR_PG_DSN`).
-- libSQL / sqld with native vectors: `http://31.220.22.176:8081` (`VECTOR_LIBSQL_URL`).
+- PostgreSQL 17 + pgvector 0.8.5: `postgres://postgres:***@<test-host>:5434/postgres?sslmode=disable` (`VECTOR_PG_DSN`).
+- libSQL / sqld with native vectors: `http://<test-host>:8081` (`VECTOR_LIBSQL_URL`).
 
 ## 1. Root cause
 
@@ -131,7 +131,7 @@ Rationale: the canonical routine grammar models functions (`'f'`) and procedures
 --- PASS: TestSanityDirectLibSQL (0.85s)
 === RUN   TestSanityDirectPgvector
     vector_test.go:216: pgvector [4,5,6] <=> [1,2,3] = 0.025368153802923787
-    vector_test.go:220: pgvector DSN: postgres://postgres:***@31.220.22.176:5434/postgres?sslmode=disable
+    vector_test.go:220: pgvector DSN: postgres://postgres:***@<test-host>:5434/postgres?sslmode=disable
 --- PASS: TestSanityDirectPgvector (0.96s)
 === RUN   TestInspectF32BlobMapsToVectorFamily
     vector_test.go:254: InspectSchema Exact=true unresolved=0

@@ -71,7 +71,7 @@ ok  example.com/sqlite-postgres-compat/compat             (cached)
 
 ### 2. `go test -tags=e2e ./e2e -run TestCutover -v -count=1 -timeout 600s` (COMPAT_POSTGRES_DSN vivo, password enmascarado)
 
-DSN usado: `postgres://postgres:***@31.220.22.176:5434/postgres?sslmode=disable`
+DSN usado: `postgres://postgres:***@<test-host>:5434/postgres?sslmode=disable`
 
 ```
 === RUN   TestCutoverCLIEndToEnd
