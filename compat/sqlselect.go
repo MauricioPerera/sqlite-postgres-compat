@@ -79,13 +79,30 @@ func parseCatalogSelect(definition string) (SelectQuery, error) {
 		}},
 		{"LIMIT", func(value string) error {
 			number, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil {
+				return err
+			}
+			// SQLite treats a negative LIMIT as "no limit", a semantics this
+			// compatibility layer cannot preserve. Reject it explicitly at
+			// parse time instead of accepting it silently.
+			if number < 0 {
+				return fmt.Errorf("unsupported negative LIMIT %d", number)
+			}
 			query.Limit = &number
-			return err
+			return nil
 		}},
 		{"OFFSET", func(value string) error {
 			number, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil {
+				return err
+			}
+			// A negative OFFSET has no portable meaning here; reject it
+			// explicitly at parse time rather than accepting it silently.
+			if number < 0 {
+				return fmt.Errorf("unsupported negative OFFSET %d", number)
+			}
 			query.Offset = &number
-			return err
+			return nil
 		}},
 	}
 

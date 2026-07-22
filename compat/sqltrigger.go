@@ -10,7 +10,7 @@ const catalogIdentifierPattern = `(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_]*)`
 
 var (
 	sqliteTriggerPattern   = regexp.MustCompile(`(?is)^CREATE\s+TRIGGER\s+(` + catalogIdentifierPattern + `)\s+(BEFORE|AFTER)\s+(INSERT|UPDATE|DELETE)\s+ON\s+(` + catalogIdentifierPattern + `)(?:\s+FOR\s+EACH\s+ROW)?(?:\s+WHEN\s+(.+?))?\s+BEGIN\s+(.+)\s+END\s*;?$`)
-	postgresTriggerPattern = regexp.MustCompile(`(?is)^CREATE\s+TRIGGER\s+(` + catalogIdentifierPattern + `)\s+(BEFORE|AFTER)\s+(INSERT|UPDATE|DELETE)\s+ON\s+(?:` + catalogIdentifierPattern + `\.)?(` + catalogIdentifierPattern + `)\s+FOR\s+EACH\s+ROW(?:\s+WHEN\s+\((.+)\))?\s+EXECUTE\s+FUNCTION\s+.+$`)
+	postgresTriggerPattern = regexp.MustCompile(`(?is)^CREATE\s+TRIGGER\s+(` + catalogIdentifierPattern + `)\s+(BEFORE|AFTER)\s+(INSERT|UPDATE|DELETE)\s+ON\s+(` + catalogIdentifierPattern + `\.)?(` + catalogIdentifierPattern + `)\s+FOR\s+EACH\s+ROW(?:\s+WHEN\s+\((.+)\))?\s+EXECUTE\s+FUNCTION\s+.+$`)
 	insertActionPattern    = regexp.MustCompile(`(?is)^INSERT\s+INTO\s+(` + catalogIdentifierPattern + `)\s*\((.+)\)\s*VALUES\s*\((.+)\)$`)
 	updateActionPattern    = regexp.MustCompile(`(?is)^UPDATE\s+(` + catalogIdentifierPattern + `)\s+SET\s+(.+)\s+WHERE\s+(.+)$`)
 	deleteActionPattern    = regexp.MustCompile(`(?is)^DELETE\s+FROM\s+(` + catalogIdentifierPattern + `)\s+WHERE\s+(.+)$`)
@@ -51,10 +51,20 @@ func parsePostgresCatalogTrigger(definition, functionBody string) (Trigger, erro
 		Name:   unquoteCatalogIdentifier(match[1]),
 		Timing: strings.ToLower(match[2]),
 		Event:  strings.ToLower(match[3]),
-		Table:  unquoteCatalogIdentifier(match[4]),
+		Table:  unquoteCatalogIdentifier(match[5]),
 	}
-	if strings.TrimSpace(match[5]) != "" {
-		when, err := parseCatalogExpression(match[5])
+	// Only the default "public" schema qualifier is accepted (and dropped, as
+	// it carries no information here). Any other schema is rejected explicitly
+	// instead of being discarded silently, matching parseCatalogSelect's
+	// rejection of qualified names.
+	if schemaQualifier := strings.TrimSpace(match[4]); schemaQualifier != "" {
+		schema := unquoteCatalogIdentifier(strings.TrimSuffix(schemaQualifier, "."))
+		if !strings.EqualFold(schema, "public") {
+			return Trigger{}, fmt.Errorf("unsupported trigger schema %q: only \"public\" is allowed", schema)
+		}
+	}
+	if strings.TrimSpace(match[6]) != "" {
+		when, err := parseCatalogExpression(match[6])
 		if err != nil {
 			return Trigger{}, err
 		}
