@@ -42,6 +42,14 @@ go run ./cmd/compat-copy .\migration.json
 
 `compat-copy` exporta el origen al formato canónico y lo importa en el destino. Antes de modificar el destino, audita el esquema inferido y detiene la operación si alguna capacidad no está marcada como equivalente exacta. Después exporta el destino y compara hashes canónicos de ambos snapshots.
 
+## Cutover sin ventana
+
+```powershell
+go run ./cmd/compat-cutover .\cutover.json
+```
+
+`compat-cutover` orquesta un cutover SQLite → PostgreSQL sin ventana de corte: audita el contrato, instala captura en el origen, importa el snapshot en el destino, drena el journal con `ApplyChangesTolerant` (resolviendo el solapamiento inherente entre captura y snapshot) y verifica equivalencia. Termina con código `0` e imprime `{"status":"ready",...}` cuando los digests coinciden, con código `1` si divergen o alguna capacidad requerida no es exacta, y con código `2` si el número de argumentos no es uno. El corte del DSN de la aplicación es manual: córtalo tras recibir `status=ready`.
+
 ## Validación integral
 
 La batería integral usa instancias reales de SQLite y PostgreSQL. Crea una base PostgreSQL temporal, ejecuta migraciones SQLite → PostgreSQL → SQLite, valida datos y comportamiento y elimina la base al terminar.

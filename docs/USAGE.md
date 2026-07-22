@@ -142,6 +142,56 @@ Repite el flujo en dirección contraria con un cursor independiente. Nunca compa
 
 `ApplyChanges` es idempotente por motor, versión y secuencia de origen. Los cambios replicados no se vuelven a registrar en el journal del destino.
 
+### Catch-up tolerante para cutover sin ventana
+
+`ApplyChangesTolerant` aplica el mismo stream ordenado que `ApplyChanges`, pero resuelve conflictos de solapamiento: un cambio journaled después de instalar la captura puede haber viajado ya dentro del snapshot, de modo que reaplicarlo produciría un `ConflictError` espurio. Si el estado ACTUAL del destino ya coincide con el estado FINAL del cambio (insert: la fila existe y `rowsEqual(after, actual)`; update: `rowsEqual(after, actual)` aunque `Before` no matchee; delete: la fila ya no existe), el cambio se marca como aplicado y se continúa. Cualquier otra divergencia sigue siendo `ConflictError` estricto: el modo tolerante es una conveniencia de catch-up, no un bypass.
+
+```go
+if err := postgres.ApplyChangesTolerant(ctx, schema, changes); err != nil {
+    var conflict *compat.ConflictError
+    if errors.As(err, &conflict) {
+        log.Printf("conflicto real en %s: %v", conflict.Table, conflict.PrimaryKey)
+    }
+    panic(err)
+}
+```
+
+`ApplyChanges` queda intacto; usá `ApplyChangesTolerant` sólo durante el catch-up de un cutover.
+
+## Cutover sin ventana con la CLI
+
+`compat-cutover` orquesta un cutover SQLite → PostgreSQL sin ventana de corte: audita el contrato, instala captura en el origen, importa el snapshot en el destino, drena el journal con `ApplyChangesTolerant` (resolviendo el solapamiento inherente) y verifica equivalencia. Configura `cutover.example.json`:
+
+```json
+{
+  "source_dsn": "source.db",
+  "destination_dsn": "postgres://user:password@localhost:5432/database?sslmode=disable",
+  "contract": {
+    "source": {"engine": "sqlite", "version": {"major": 3, "minor": 45, "patch": 0}},
+    "destination": {"engine": "postgres", "version": {"major": 17, "minor": 0, "patch": 0}}
+  },
+  "schema": {
+    "tables": [{
+      "name": "entries",
+      "columns": [
+        {"name": "id", "type": {"family": "integer"}, "nullable": false},
+        {"name": "title", "type": {"family": "text"}, "nullable": false}
+      ],
+      "constraints": [{"kind": "primary_key", "columns": ["id"]}]
+    }]
+  },
+  "options": {"poll_interval_ms": 1000, "drain_polls": 3, "batch_limit": 500}
+}
+```
+
+`options` es opcional; los defaults son `poll_interval_ms=1000`, `drain_polls=3`, `batch_limit=500`. Ejecuta:
+
+```powershell
+go run ./cmd/compat-cutover .\cutover.json
+```
+
+El flujo: audita las capacidades inferidas (detiene con código `1` si alguna no es exacta), instala captura en el origen, exporta el snapshot y lo importa en el destino, drena el journal leyendo lotes y aplicándolos con `ApplyChangesTolerant` hasta `drain_polls` lecturas vacías consecutivas, y verifica los digests. Si son equivalentes imprime `{"status":"ready","source_digest":...,"destination_digest":...,"changes_applied":N}` y termina con código `0`; si divergen imprime `{"status":"diverged",...}` y termina con código `1`. Código de salida `2` si el número de argumentos no es exactamente uno. El corte del DSN de la aplicación NO es responsabilidad de esta herramienta: cortá la conexión de la app manualmente tras recibir `status=ready`.
+
 ## Ejecutar una rutina traducida
 
 ```go

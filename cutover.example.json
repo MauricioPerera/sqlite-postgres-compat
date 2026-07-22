@@ -1,0 +1,33 @@
+{
+  "source_dsn": "source.db",
+  "destination_dsn": "postgres://user:password@localhost:5432/database?sslmode=disable",
+  "contract": {
+    "source": {
+      "engine": "sqlite",
+      "version": { "major": 3, "minor": 45, "patch": 0 }
+    },
+    "destination": {
+      "engine": "postgres",
+      "version": { "major": 17, "minor": 0, "patch": 0 }
+    }
+  },
+  "schema": {
+    "tables": [
+      {
+        "name": "entries",
+        "columns": [
+          { "name": "id", "type": { "family": "integer" }, "nullable": false },
+          { "name": "title", "type": { "family": "text" }, "nullable": false }
+        ],
+        "constraints": [
+          { "kind": "primary_key", "columns": ["id"] }
+        ]
+      }
+    ]
+  },
+  "options": {
+    "poll_interval_ms": 1000,
+    "drain_polls": 3,
+    "batch_limit": 500
+  }
+}
