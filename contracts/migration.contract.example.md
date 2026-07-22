@@ -14,8 +14,10 @@ destination:
   version: { major: 17, minor: 10, patch: 0 }
 # Point schema_ref at a JSON file holding the canonical `compat.Schema`, or
 # inline the schema under `schema` below. The referenced file is the example
-# shipped with the repo; replace it with your own.
-schema_ref: examples/migration.example.json
+# shipped with the repo; replace it with your own. The path is resolved relative
+# to the cutover.json config file, not the cwd. Exactly one of schema or
+# schema_ref is required; both or neither is rejected with ERR_CONFIG.
+schema_ref: examples/schema.example.json
 # schema: inline        # alternative to schema_ref
 required_features:
   - tables

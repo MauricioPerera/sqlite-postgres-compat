@@ -9,7 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"example.com/sqlite-postgres-compat/compat"
@@ -568,5 +570,266 @@ func TestCutoverAuditCLIErrorCodeOnNotExact(t *testing.T) {
 	parsed := firstErrorJSONLine(t, stdout)
 	if code, _ := parsed["code"].(string); code != "ERR_AUDIT_NOT_EXACT" {
 		t.Fatalf("expected code=ERR_AUDIT_NOT_EXACT, got %v\nstdout:\n%s", parsed["code"], stdout)
+	}
+}
+
+// builtBinaries caches a compiled CLI executable per package across tests in the
+// process. `go run` collapses every non-zero subprocess exit code to 1 on
+// Windows, so it cannot reveal the ERR_USAGE exit-2 path; building the binary
+// once and execing it directly yields the real process exit code. The binaries
+// live in an OS temp dir (not t.TempDir) so they survive across tests; the OS
+// reaps its temp dir.
+var (
+	builtOnce sync.Map // pkg -> *sync.Once
+	builtPath sync.Map // pkg -> binary path
+)
+
+func builtCLI(t *testing.T, pkg string) string {
+	t.Helper()
+	once, _ := builtOnce.LoadOrStore(pkg, &sync.Once{})
+	once.(*sync.Once).Do(func() {
+		dir, err := os.MkdirTemp("", "compat-cli-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := "cli"
+		if runtime.GOOS == "windows" {
+			name = "cli.exe"
+		}
+		bin := filepath.Join(dir, name)
+		build := exec.Command("go", "build", "-o", bin, "./"+pkg)
+		build.Dir = ".."
+		if out, err := build.CombinedOutput(); err != nil {
+			t.Fatalf("build %s: %v\n%s", pkg, err, out)
+		}
+		builtPath.Store(pkg, bin)
+	})
+	p, _ := builtPath.Load(pkg)
+	return p.(string)
+}
+
+// runBuiltCLI builds pkg (e.g. "cmd/compat-cutover") and runs the resulting binary
+// with args, returning stdout, stderr and the real process exit code.
+func runBuiltCLI(t *testing.T, pkg string, args ...string) (stdout, stderr string, exitCode int) {
+	t.Helper()
+	bin := builtCLI(t, pkg)
+	command := exec.Command(bin, args...)
+	var out, errbuf strings.Builder
+	command.Stdout = &out
+	command.Stderr = &errbuf
+	err := command.Run()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			t.Fatalf("run %s: %v\nstderr:\n%s", pkg, err, errbuf.String())
+		}
+	}
+	return out.String(), errbuf.String(), exitCode
+}
+
+// TestCLIRejectsUnknownFlagAsUsage verifies that an unrecognized flag (a token
+// starting with "-" that is not a known flag like --dry-run) is reported as
+// ERR_USAGE with exit 2 across all three CLIs, instead of being treated as the
+// positional config path (the prior ERR_CONFIG/exit-1 behavior).
+func TestCLIRejectsUnknownFlagAsUsage(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pkg  string
+		args []string
+	}{
+		{"cutover", "cmd/compat-cutover", []string{"--bogus", "x.json"}},
+		{"copy", "cmd/compat-copy", []string{"--bogus", "x.json"}},
+		{"audit", "cmd/compat-audit", []string{"--bogus", "x.json"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, _, exitCode := runBuiltCLI(t, tc.pkg, tc.args...)
+			if exitCode != 2 {
+				t.Fatalf("expected exit 2 for unknown flag, got %d\nstdout:\n%s", exitCode, stdout)
+			}
+			parsed := firstErrorJSONLine(t, stdout)
+			if code, _ := parsed["code"].(string); code != "ERR_USAGE" {
+				t.Fatalf("expected code=ERR_USAGE, got %v\nstdout:\n%s", parsed["code"], stdout)
+			}
+		})
+	}
+}
+
+// writeCutoverConfig marshals config to a JSON file in dir and returns its path.
+func writeCutoverConfig(t *testing.T, dir, name string, config map[string]any) string {
+	t.Helper()
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func cutoverContract() compat.Contract {
+	return compat.Contract{
+		Source:      compat.Target{Engine: compat.SQLite, Version: compat.Version{Major: 3}},
+		Destination: compat.Target{Engine: compat.Postgres, Version: compat.Version{Major: 17, Minor: 5}},
+	}
+}
+
+// TestCutoverRejectsUnknownConfigKey verifies that an unknown top-level key in the
+// cutover config is rejected with ERR_CONFIG (exit 1) rather than silently
+// dropped, via json.Decoder.DisallowUnknownFields. The decode fails before any
+// store is opened.
+func TestCutoverRejectsUnknownConfigKey(t *testing.T) {
+	dir := t.TempDir()
+	config := map[string]any{
+		"source_dsn":      "file:" + filepath.ToSlash(filepath.Join(dir, "src.db")),
+		"destination_dsn": postgresTestDSN,
+		"contract":        cutoverContract(),
+		"schema":          cutoverSchema("unknown_key_items"),
+		"bogus_key":       "must be rejected",
+	}
+	configPath := writeCutoverConfig(t, dir, "cutover.json", config)
+
+	stdout, _, exitCode := runBuiltCLI(t, "cmd/compat-cutover", configPath)
+	if exitCode != 1 {
+		t.Fatalf("expected exit 1 for unknown config key, got %d\nstdout:\n%s", exitCode, stdout)
+	}
+	parsed := firstErrorJSONLine(t, stdout)
+	if code, _ := parsed["code"].(string); code != "ERR_CONFIG" {
+		t.Fatalf("expected code=ERR_CONFIG, got %v\nstdout:\n%s", parsed["code"], stdout)
+	}
+}
+
+// TestCutoverRejectsSchemaAndSchemaRef verifies that a config specifying both an
+// inline schema and a schema_ref is rejected with ERR_CONFIG (exit 1): exactly
+// one of the two is allowed.
+func TestCutoverRejectsSchemaAndSchemaRef(t *testing.T) {
+	dir := t.TempDir()
+	schema := cutoverSchema("both_schema_items")
+	schemaData, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "schema.json"), schemaData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config := map[string]any{
+		"source_dsn":      "file:" + filepath.ToSlash(filepath.Join(dir, "src.db")),
+		"destination_dsn": postgresTestDSN,
+		"contract":        cutoverContract(),
+		"schema":          schema,
+		"schema_ref":      "schema.json",
+	}
+	configPath := writeCutoverConfig(t, dir, "cutover.json", config)
+
+	stdout, _, exitCode := runBuiltCLI(t, "cmd/compat-cutover", configPath)
+	if exitCode != 1 {
+		t.Fatalf("expected exit 1 for schema + schema_ref, got %d\nstdout:\n%s", exitCode, stdout)
+	}
+	parsed := firstErrorJSONLine(t, stdout)
+	if code, _ := parsed["code"].(string); code != "ERR_CONFIG" {
+		t.Fatalf("expected code=ERR_CONFIG, got %v\nstdout:\n%s", parsed["code"], stdout)
+	}
+}
+
+// TestCutoverRejectsMissingSchemaAndSchemaRef verifies that a config specifying
+// neither an inline schema nor a schema_ref is rejected with ERR_CONFIG (exit 1),
+// instead of running with an empty schema (the prior silent-degradation bug).
+func TestCutoverRejectsMissingSchemaAndSchemaRef(t *testing.T) {
+	dir := t.TempDir()
+	config := map[string]any{
+		"source_dsn":      "file:" + filepath.ToSlash(filepath.Join(dir, "src.db")),
+		"destination_dsn": postgresTestDSN,
+		"contract":        cutoverContract(),
+	}
+	configPath := writeCutoverConfig(t, dir, "cutover.json", config)
+
+	stdout, _, exitCode := runBuiltCLI(t, "cmd/compat-cutover", configPath)
+	if exitCode != 1 {
+		t.Fatalf("expected exit 1 for missing schema/schema_ref, got %d\nstdout:\n%s", exitCode, stdout)
+	}
+	parsed := firstErrorJSONLine(t, stdout)
+	if code, _ := parsed["code"].(string); code != "ERR_CONFIG" {
+		t.Fatalf("expected code=ERR_CONFIG, got %v\nstdout:\n%s", parsed["code"], stdout)
+	}
+}
+
+// TestCutoverWithSchemaRefSucceeds verifies the happy path for schema_ref: a
+// cutover config that points schema_ref at a JSON file holding the canonical
+// schema (resolved relative to the config file, not the cwd) runs the full
+// cutover against a real PostgreSQL destination and prints status=ready with
+// matching digests.
+func TestCutoverWithSchemaRefSucceeds(t *testing.T) {
+	ctx := context.Background()
+	const table = "schemaref_items"
+	schema := cutoverSchema(table)
+
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "cutover-ref-source.db")
+	source, err := compat.OpenSQLite(compat.Version{Major: 3}, "file:"+filepath.ToSlash(sourcePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO schemaref_items (id, title) VALUES (?, ?), (?, ?)`, 1, "one", 2, "two"); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The schema_ref points at a bare compat.Schema JSON object, sibling to the
+	// config, referenced by a path relative to the config file.
+	schemaData, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "schema.json"), schemaData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	config := map[string]any{
+		"source_dsn":      "file:" + filepath.ToSlash(sourcePath),
+		"destination_dsn": postgresTestDSN,
+		"contract":        cutoverContract(),
+		"schema_ref":      "schema.json",
+		"options": map[string]any{
+			"poll_interval_ms": 10,
+			"drain_polls":      2,
+			"batch_limit":      100,
+		},
+	}
+	configPath := writeCutoverConfig(t, dir, "cutover.json", config)
+
+	stdout, stderr, exitCode := runBuiltCLI(t, "cmd/compat-cutover", configPath)
+	if exitCode != 0 {
+		t.Fatalf("expected exit 0, got %d\nstderr:\n%s\nstdout:\n%s", exitCode, stderr, stdout)
+	}
+	var report struct {
+		Status            string `json:"status"`
+		SourceDigest      string `json:"source_digest"`
+		DestinationDigest string `json:"destination_digest"`
+		ChangesApplied    int    `json:"changes_applied"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &report); err != nil {
+		t.Fatalf("invalid cutover output %q: %v", stdout, err)
+	}
+	if report.Status != "ready" {
+		t.Fatalf("expected status=ready, got %+v\n%s", report, stdout)
+	}
+	if report.SourceDigest == "" || report.SourceDigest != report.DestinationDigest {
+		t.Fatalf("expected matching non-empty digests, got %+v", report)
+	}
+
+	postgres := openPostgres(t)
+	var count int
+	if err := postgres.DB.QueryRowContext(ctx, `SELECT count(*) FROM schemaref_items`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 migrated rows, got %d", count)
 	}
 }

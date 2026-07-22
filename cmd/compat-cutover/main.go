@@ -30,7 +30,8 @@ type cutoverConfig struct {
 	DestinationDSN string          `json:"destination_dsn"`
 	Contract       compat.Contract `json:"contract"`
 	Schema         compat.Schema   `json:"schema"`
-	Options        cutoverOptions  `json:"options"`
+	SchemaRef      string          `json:"schema_ref,omitempty"`
+	Options        cutoverOptions   `json:"options"`
 }
 
 type cutoverOptions struct {
@@ -79,24 +80,25 @@ type planTable struct {
 var cutoverPhases = []string{"install_capture", "snapshot", "catch_up", "verify"}
 
 func main() {
-	args := os.Args[1:]
-	dryRun := false
-	if len(args) > 0 && args[0] == "--dry-run" {
-		dryRun = true
-		args = args[1:]
+	present, positional, unexpected, ok := cliout.SplitArgs([]string{"--dry-run"}, os.Args[1:])
+	if !ok {
+		usage()
+		os.Exit(cliout.EmitError(cliout.ErrUsage, fmt.Sprintf("compat-cutover: unexpected flag %q", unexpected)))
 	}
-	if len(args) != 1 {
+	dryRun := present["--dry-run"]
+	if len(positional) != 1 {
 		usage()
 		os.Exit(cliout.EmitError(cliout.ErrUsage, "usage: compat-cutover [--dry-run] <cutover.json>"))
 	}
-	data, err := os.ReadFile(args[0])
+	var config cutoverConfig
+	if err := cliout.DecodeFileStrict(positional[0], &config); err != nil {
+		fail(cliout.ErrConfig, err)
+	}
+	schema, err := cliout.ResolveSchema(positional[0], config.SchemaRef, config.Schema)
 	if err != nil {
 		fail(cliout.ErrConfig, err)
 	}
-	var config cutoverConfig
-	if err := json.Unmarshal(data, &config); err != nil {
-		fail(cliout.ErrConfig, err)
-	}
+	config.Schema = schema
 	if err := config.Schema.Validate(); err != nil {
 		fail(cliout.ErrSchema, err)
 	}

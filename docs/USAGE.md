@@ -49,7 +49,7 @@ Ejecuta:
 go run ./cmd/compat-copy .\examples\migration.example.json
 ```
 
-El flujo audita las capacidades inferidas, exporta el origen, importa el destino y vuelve a exportarlo para verificar su hash canónico. El destino debe estar vacío para los objetos descritos. El proceso termina con código `1` ante cualquier error o falta de equivalencia exacta, y con código de salida 2 si el número de argumentos no es exactamente uno.
+El flujo audita las capacidades inferidas, exporta el origen, importa el destino y vuelve a exportarlo para verificar su hash canónico. El destino debe estar vacío para los objetos descritos. El proceso termina con código `1` ante cualquier error o falta de equivalencia exacta, y con código de salida 2 si el número de argumentos no es exactamente uno o se pasa un flag inesperado. En lugar de inlinear `schema`, podés usar `schema_ref` (ruta a un JSON con el `compat.Schema` canónico, resuelta relativa al archivo de config); debe haber exactamente uno de `schema` o `schema_ref`, si no `ERR_CONFIG` (ver cutover para el detalle).
 
 ## Usar el paquete Go
 
@@ -190,7 +190,21 @@ if err := postgres.ApplyChangesTolerant(ctx, schema, changes); err != nil {
 go run ./cmd/compat-cutover .\cutover.json
 ```
 
-El flujo: audita las capacidades inferidas (detiene con código `1` si alguna no es exacta), instala captura en el origen, exporta el snapshot y lo importa en el destino, drena el journal leyendo lotes y aplicándolos con `ApplyChangesTolerant` hasta `drain_polls` lecturas vacías consecutivas, y verifica los digests. Si son equivalentes imprime `{"status":"ready","source_digest":...,"destination_digest":...,"changes_applied":N}` y termina con código `0`; si divergen imprime `{"status":"diverged","code":"ERR_VERIFY_DIVERGED",...}` y termina con código `1`. Código de salida `2` si el número de argumentos no es exactamente uno. El corte del DSN de la aplicación NO es responsabilidad de esta herramienta: cortá la conexión de la app manualmente tras recibir `status=ready`.
+En lugar de inlinear el `schema`, podés apuntar `schema_ref` a un archivo JSON que contenga el objeto `compat.Schema` canónico (mismo shape que el campo `schema` inline). La ruta se resuelve **relativa al archivo de config**, no al cwd:
+
+```json
+{
+  "source_dsn": "source.db",
+  "destination_dsn": "postgres://user:password@localhost:5432/database?sslmode=disable",
+  "contract": { "...": "..." },
+  "schema_ref": "schema.json",
+  "options": {"poll_interval_ms": 1000, "drain_polls": 3, "batch_limit": 500}
+}
+```
+
+Debe haber **exactamente uno** de `schema` o `schema_ref`: ambos o ninguno es `ERR_CONFIG`. Un archivo `schema_ref` ilegible o con JSON inválido también es `ERR_CONFIG`. `compat-copy` soporta `schema_ref` igual que `compat-cutover`.
+
+El flujo: audita las capacidades inferidas (detiene con código `1` si alguna no es exacta), instala captura en el origen, exporta el snapshot y lo importa en el destino, drena el journal leyendo lotes y aplicándolos con `ApplyChangesTolerant` hasta `drain_polls` lecturas vacías consecutivas, y verifica los digests. Si son equivalentes imprime `{"status":"ready","source_digest":...,"destination_digest":...,"changes_applied":N}` y termina con código `0`; si divergen imprime `{"status":"diverged","code":"ERR_VERIFY_DIVERGED",...}` y termina con código `1`. Código de salida `2` si el número de argumentos no es exactamente uno o se pasa un flag inesperado. El corte del DSN de la aplicación NO es responsabilidad de esta herramienta: cortá la conexión de la app manualmente tras recibir `status=ready`.
 
 ### Plan de sólo lectura con `--dry-run`
 
@@ -226,8 +240,8 @@ Ramificá por `code`. La taxonomía es cerrada; el CLI elige el código más esp
 
 | Código | Cuándo se emite | Exit |
 |---|---|---|
-| `ERR_USAGE` | Cantidad de argumentos incorrecta (o flag inesperado). | `2` |
-| `ERR_CONFIG` | La config no se puede leer, falla `json.Unmarshal`, o `Audit` rechaza el contrato. | `1` |
+| `ERR_USAGE` | Cantidad de argumentos incorrecta (o flag inesperado: cualquier argumento que empiece con `-` y no sea un flag reconocido, p. ej. `--bogus`). | `2` |
+| `ERR_CONFIG` | La config no se puede leer, falla el decode, o `Audit` rechaza el contrato. Toda config se decodifica con `json.Decoder.DisallowUnknownFields`, así que una key desconocida es un error explícito (no se dropea en silencio); una violación de `schema`/`schema_ref` (ambos, ninguno, o un archivo `schema_ref` ilegible/JSON inválido) también es `ERR_CONFIG`. | `1` |
 | `ERR_AUDIT_NOT_EXACT` | Una feature requerida (o inferida) no es `exact` (`RequireExact` falla). `compat-audit` imprime el arreglo de findings primero y después esta línea. | `1` |
 | `ERR_CONNECT_SOURCE` | No se puede abrir o hacer ping al store origen. | `1` |
 | `ERR_CONNECT_DESTINATION` | No se puede abrir o hacer ping al store destino. | `1` |

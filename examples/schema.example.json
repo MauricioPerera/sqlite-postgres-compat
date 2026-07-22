@@ -1,0 +1,14 @@
+{
+  "tables": [
+    {
+      "name": "entries",
+      "columns": [
+        { "name": "id", "type": { "family": "integer" }, "nullable": false },
+        { "name": "title", "type": { "family": "text" }, "nullable": false }
+      ],
+      "constraints": [
+        { "kind": "primary_key", "columns": ["id"] }
+      ]
+    }
+  ]
+}

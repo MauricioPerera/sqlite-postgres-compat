@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 
@@ -17,21 +16,28 @@ type migrationConfig struct {
 	DestinationDSN string          `json:"destination_dsn"`
 	Contract       compat.Contract `json:"contract"`
 	Schema         compat.Schema   `json:"schema"`
+	SchemaRef      string          `json:"schema_ref,omitempty"`
 }
 
 func main() {
-	if len(os.Args) != 2 {
+	_, positional, unexpected, ok := cliout.SplitArgs(nil, os.Args[1:])
+	if !ok {
+		fmt.Fprintln(os.Stderr, "uso: compat-copy <migration.json>")
+		os.Exit(cliout.EmitError(cliout.ErrUsage, fmt.Sprintf("compat-copy: unexpected flag %q", unexpected)))
+	}
+	if len(positional) != 1 {
 		fmt.Fprintln(os.Stderr, "uso: compat-copy <migration.json>")
 		os.Exit(cliout.EmitError(cliout.ErrUsage, "compat-copy requires exactly one migration JSON argument"))
 	}
-	data, err := os.ReadFile(os.Args[1])
+	var config migrationConfig
+	if err := cliout.DecodeFileStrict(positional[0], &config); err != nil {
+		fail(cliout.ErrConfig, err)
+	}
+	schema, err := cliout.ResolveSchema(positional[0], config.SchemaRef, config.Schema)
 	if err != nil {
 		fail(cliout.ErrConfig, err)
 	}
-	var config migrationConfig
-	if err := json.Unmarshal(data, &config); err != nil {
-		fail(cliout.ErrConfig, err)
-	}
+	config.Schema = schema
 	if err := config.Schema.Validate(); err != nil {
 		fail(cliout.ErrSchema, err)
 	}

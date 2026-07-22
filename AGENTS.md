@@ -174,7 +174,7 @@ The layer never silently degrades. These are rejected with explicit errors:
 
 ## 8. CLIs
 
-All CLIs take exactly one JSON config argument (`compat-cutover` accepts an optional `--dry-run` before it). Exit codes: `0` success; `1` any error or non-exact/non-equivalent result; `2` wrong argument count.
+All CLIs take exactly one JSON config argument (`compat-cutover` accepts an optional `--dry-run` flag). Any argument that begins with `-` and is not a recognized flag (`--dry-run` for `compat-cutover`; none for `compat-audit`/`compat-copy`) is rejected as `ERR_USAGE` (exit 2) — it is never treated as the positional config path. Exit codes: `0` success; `1` any error or non-exact/non-equivalent result; `2` wrong argument count or an unexpected flag.
 
 ### 8.1 Typed error protocol (machine-facing)
 
@@ -189,7 +189,7 @@ The line is always one parseable JSON object (the message is JSON-encoded, so em
 | Code | Emitted when | Exit |
 |---|---|---|
 | `ERR_USAGE` | Wrong argument count (or an unexpected flag). | `2` |
-| `ERR_CONFIG` | The config file is unreadable, fails `json.Unmarshal`, or `compat.Audit` rejects the contract (`Contract.Validate`). | `1` |
+| `ERR_CONFIG` | The config file is unreadable, fails to decode, or `compat.Audit` rejects the contract (`Contract.Validate`). Every config is decoded with `json.Decoder.DisallowUnknownFields`, so an unknown key is an explicit error rather than a silently-dropped key; a `schema`/`schema_ref` violation (both, neither, or an unreadable/invalid `schema_ref` file) is also `ERR_CONFIG`. | `1` |
 | `ERR_AUDIT_NOT_EXACT` | A required (or inferred) feature is not `exact` (`RequireExact` fails). `compat-audit` emits its findings array first, then this line. | `1` |
 | `ERR_CONNECT_SOURCE` | The source store cannot be opened or pinged (`OpenStore`/`Ping` for the source). | `1` |
 | `ERR_CONNECT_DESTINATION` | The destination store cannot be opened or pinged (`OpenStore`/`Ping` for the destination). | `1` |
@@ -218,7 +218,7 @@ Audits a `Contract` (`{source, destination, required_features}`) and prints one 
 
 ### `compat-copy <migration.json>`
 
-Config: `{source_dsn, destination_dsn, contract, schema}`. Infers features from the schema (`InferFeatures`), audits, requires exact, then exports the source snapshot, imports it into the destination, re-exports the destination, and verifies digests. Prints a `VerificationReport` on stdout:
+Config: `{source_dsn, destination_dsn, contract, schema | schema_ref}`. Exactly one of `schema` (an inline `compat.Schema`) or `schema_ref` (a path to a JSON file holding a bare `compat.Schema` object, resolved **relative to the config file**, not the cwd) is required; both or neither is `ERR_CONFIG`, and an unreadable or JSON-invalid `schema_ref` file is `ERR_CONFIG`. Infers features from the schema (`InferFeatures`), audits, requires exact, then exports the source snapshot, imports it into the destination, re-exports the destination, and verifies digests. Prints a `VerificationReport` on stdout:
 
 ```json
 {"source_digest":"...","destination_digest":"...","equivalent":true}
@@ -230,7 +230,7 @@ Config: `{source_dsn, destination_dsn, contract, schema}`. Infers features from 
 
 ### `compat-cutover <cutover.json>`
 
-Config: `{source_dsn, destination_dsn, contract, schema, options}`. `options` is optional with defaults `poll_interval_ms=1000`, `drain_polls=3`, `batch_limit=500`. Orchestrates a zero-window SQLite → PostgreSQL cutover: audit → install change capture on source → export+import snapshot → drain the journal with `ApplyChangesTolerant` until `drain_polls` consecutive empty reads → verify digests. Prints a `cutoverReport` on stdout and progress lines on stderr:
+Config: `{source_dsn, destination_dsn, contract, schema | schema_ref, options}`. Exactly one of `schema` (inline `compat.Schema`) or `schema_ref` (a path to a JSON file holding a bare `compat.Schema` object, resolved **relative to the config file**, not the cwd) is required; both or neither is `ERR_CONFIG`, and an unreadable or JSON-invalid `schema_ref` file is `ERR_CONFIG`. `options` is optional with defaults `poll_interval_ms=1000`, `drain_polls=3`, `batch_limit=500`. Orchestrates a zero-window SQLite → PostgreSQL cutover: audit → install change capture on source → export+import snapshot → drain the journal with `ApplyChangesTolerant` until `drain_polls` consecutive empty reads → verify digests. Prints a `cutoverReport` on stdout and progress lines on stderr:
 
 ```json
 {"status":"ready","source_digest":"...","destination_digest":"...","changes_applied":N}

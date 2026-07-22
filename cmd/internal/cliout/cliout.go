@@ -12,10 +12,13 @@
 package cliout
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"example.com/sqlite-postgres-compat/compat"
 )
@@ -100,6 +103,94 @@ func EmitJSON(v any) error {
 	}
 	_, err = fmt.Fprintln(os.Stdout, string(encoded))
 	return err
+}
+
+// SplitArgs partitions a CLI argument list into recognized boolean flags and
+// positional arguments. Every flag in this CLI surface is value-less (e.g.
+// `--dry-run`), so flags never consume the following token. A token that begins
+// with "-" and is not one of knownFlags is an unexpected flag: ok is false and
+// unexpected is the offending token, so the caller emits ErrUsage (exit 2). This
+// makes ERR_USAGE actually cover "unexpected flag" as the docs claim, instead of
+// letting an unknown flag fall through to the positional config path.
+//
+// present holds the recognized flags that were seen (empty when knownFlags is
+// empty, e.g. for compat-audit/compat-copy). positional holds the non-flag
+// tokens in order; the caller still validates the expected count.
+func SplitArgs(knownFlags []string, args []string) (present map[string]bool, positional []string, unexpected string, ok bool) {
+	known := make(map[string]bool, len(knownFlags))
+	for _, f := range knownFlags {
+		known[f] = true
+	}
+	present = make(map[string]bool)
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			if known[a] {
+				present[a] = true
+				continue
+			}
+			return nil, nil, a, false
+		}
+		positional = append(positional, a)
+	}
+	return present, positional, "", true
+}
+
+// DecodeFileStrict reads path and decodes it into v using a json.Decoder with
+// DisallowUnknownFields, so an unknown key is an explicit error instead of being
+// silently dropped. This closes the silent-degradation gap: a typo'd or
+// unsupported config key is reported (ERR_CONFIG), not ignored, matching the
+// "never silently degrade" principle the project promises.
+func DecodeFileStrict(path string, v any) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
+}
+
+// decodeSchemaRef reads the JSON file referenced by ref (holding a bare
+// compat.Schema object) resolved relative to configPath's directory, and decodes
+// it with DisallowUnknownFields. The path is resolved relative to the config
+// file's location, not the process cwd, so a config and its schema_ref travel
+// together.
+func decodeSchemaRef(configPath, ref string) (compat.Schema, error) {
+	resolved := ref
+	if !filepath.IsAbs(resolved) {
+		resolved = filepath.Join(filepath.Dir(configPath), ref)
+	}
+	var schema compat.Schema
+	if err := DecodeFileStrict(resolved, &schema); err != nil {
+		return compat.Schema{}, fmt.Errorf("schema_ref %q: %w", ref, err)
+	}
+	return schema, nil
+}
+
+// ResolveSchema picks the canonical schema for a cutover/migration config from
+// exactly one of the inline `schema` field or a `schema_ref` path. inline is the
+// decoded inline schema; ref is the schema_ref value. Exactly one must be
+// populated: inline is "populated" when it declares at least one table, and ref
+// is "populated" when non-empty. Both or neither is an error (ERR_CONFIG). When
+// ref is set, the referenced schema file is loaded relative to configPath. The
+// returned error is meant for ERR_CONFIG.
+//
+// Treating an empty inline schema (zero tables) as "absent" is what stops a
+// config that omits both from running with no schema at all — the prior
+// silent-degradation bug.
+func ResolveSchema(configPath, ref string, inline compat.Schema) (compat.Schema, error) {
+	hasInline := len(inline.Tables) > 0
+	hasRef := ref != ""
+	switch {
+	case hasInline && hasRef:
+		return compat.Schema{}, errors.New("config must specify exactly one of schema or schema_ref, not both")
+	case !hasInline && !hasRef:
+		return compat.Schema{}, errors.New("config must specify exactly one of schema or schema_ref")
+	case hasRef:
+		return decodeSchemaRef(configPath, ref)
+	default:
+		return inline, nil
+	}
 }
 
 // ReplicationCode classifies an error from the catch-up drain loop. A true

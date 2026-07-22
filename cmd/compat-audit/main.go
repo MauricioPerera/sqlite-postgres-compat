@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 
@@ -10,18 +9,18 @@ import (
 )
 
 func main() {
-	if len(os.Args) != 2 {
+	_, positional, unexpected, ok := cliout.SplitArgs(nil, os.Args[1:])
+	if !ok {
+		fmt.Fprintln(os.Stderr, "uso: compat-audit <contract.json>")
+		os.Exit(cliout.EmitError(cliout.ErrUsage, fmt.Sprintf("compat-audit: unexpected flag %q", unexpected)))
+	}
+	if len(positional) != 1 {
 		fmt.Fprintln(os.Stderr, "uso: compat-audit <contract.json>")
 		os.Exit(cliout.EmitError(cliout.ErrUsage, "compat-audit requires exactly one contract JSON argument"))
 	}
 
-	data, err := os.ReadFile(os.Args[1])
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(cliout.EmitError(cliout.ErrConfig, err.Error()))
-	}
 	var contract compat.Contract
-	if err := json.Unmarshal(data, &contract); err != nil {
+	if err := cliout.DecodeFileStrict(positional[0], &contract); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(cliout.EmitError(cliout.ErrConfig, err.Error()))
 	}
