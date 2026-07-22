@@ -1,0 +1,11 @@
+{
+  "source": {
+    "engine": "sqlite",
+    "version": { "major": 3, "minor": 45, "patch": 0 }
+  },
+  "destination": {
+    "engine": "postgres",
+    "version": { "major": 17, "minor": 0, "patch": 0 }
+  },
+  "required_features": ["tables", "foreign_keys", "transactions"]
+}
