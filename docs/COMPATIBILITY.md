@@ -20,6 +20,7 @@
 | Rutinas | Acciones transaccionales del runtime común | Procedimientos SQL/PLpgSQL parametrizados de inserción | Funciones con retorno, modos avanzados y lógica procedural arbitraria |
 | JSON | Texto canónico sin pérdida de representación | Columnas JSON/JSONB se reconocen | Operadores e índices JSON específicos |
 | UUID | Texto canónico | UUID nativo se reconoce | Operadores o extensiones específicas |
+| Vector | `vector(N)` con dimensión canónica | `F32_BLOB(N)` de libSQL y `vector` de pgvector se reconocen | Tipos vectoriales no modelados, índices ANN y funciones de distancia nativas |
 | Timestamp | Texto canónico RFC3339Nano | Tipos timestamp se reconocen | Semántica arbitraria de zona, infinidades y funciones específicas |
 | Búsqueda textual | Tokenización Unicode determinista en Go | No se traduce FTS nativo | Ranking, stemming, diccionarios, FTS5, `tsvector`/`tsquery` arbitrarios |
 
@@ -33,7 +34,8 @@ Las capacidades canónicas exactas actuales son:
 - `canonical_views`;
 - `canonical_triggers`;
 - `canonical_routines`;
-- `canonical_full_text`.
+- `canonical_full_text`;
+- `canonical_vectors`.
 
 Las familias genéricas `foreign_keys`, `check_constraints`, `indexes`, `views`, `triggers`, `stored_routines` y `full_text` permanecen `unknown`, porque representan todas las variantes posibles del SQL nativo.
 
@@ -51,6 +53,7 @@ Las familias genéricas `foreign_keys`, `check_constraints`, `indexes`, `views`,
 | Timestamp | `TEXT` | `TEXT` | Preservar RFC3339Nano sin truncar a microsegundos |
 | JSON | `TEXT` | `TEXT` | Preservar orden, espacios, duplicados y números originales |
 | UUID | `TEXT` | `TEXT` | Preservar la representación textual exacta |
+| Vector | `TEXT` | `vector(N)` | Carrier interoperable texto `'[1,2,3]'`; SQLite (modernc) sin funciones vectoriales, pgvector requiere extensión en el destino |
 
 ## Límite del 100 %
 

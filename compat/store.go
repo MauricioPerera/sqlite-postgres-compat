@@ -134,7 +134,17 @@ func (store *Store) exportTable(ctx context.Context, table Table) ([]Row, error)
 		}
 		row := make(Row, len(table.Columns))
 		for i, column := range table.Columns {
-			value, err := canonicalValue(column.Type.Family, values[i])
+			// Vector values carry a declared dimension in Type.Arguments; pass it
+			// so canonicalValue rejects a value whose component count differs from
+			// the declared dimension before it enters the snapshot. Other families
+			// do not need it and omit the variadic argument.
+			var value Value
+			var err error
+			if column.Type.Family == VectorType {
+				value, err = canonicalValue(column.Type.Family, values[i], column.Type.Arguments...)
+			} else {
+				value, err = canonicalValue(column.Type.Family, values[i])
+			}
 			if err != nil {
 				return nil, fmt.Errorf("export %s.%s: %w", table.Name, column.Name, err)
 			}
@@ -241,7 +251,13 @@ func placeholder(engine Engine, position int) string {
 	return "?"
 }
 
-func canonicalValue(kind TypeFamily, source any) (Value, error) {
+// canonicalValue converts a driver-supplied value into the canonical Value
+// representation for the given type family. The optional dimension is used only
+// by the vector family to reject values whose component count differs from the
+// declared dimension; it is a variadic tail so existing callers (capture and
+// replication, which do not have the dimension at hand) continue to compile and
+// canonicalize vector text faithfully without a dimension cross-check.
+func canonicalValue(kind TypeFamily, source any, dimension ...int) (Value, error) {
 	if source == nil {
 		return Value{Kind: NullValue}, nil
 	}
@@ -305,6 +321,8 @@ func canonicalValue(kind TypeFamily, source any) (Value, error) {
 		return Value{Kind: JSONValue, Value: string(canonical)}, nil
 	case UUIDType:
 		return Value{Kind: UUIDValue, Value: text}, nil
+	case VectorType:
+		return canonicalVectorValue(text, dimension)
 	default:
 		return Value{Kind: TextValue, Value: text}, nil
 	}
@@ -348,6 +366,37 @@ func normalizeFloat(text string) (string, error) {
 		return "", err
 	}
 	return strconv.FormatFloat(parsed, 'g', -1, 64), nil
+}
+
+// canonicalVectorValue parses a textual vector '[c1, c2, ...]' (optional
+// surrounding whitespace and per-component whitespace) into the canonical form
+// '[c1,c2,...]' with no spaces, canonicalizing each component through
+// normalizeFloat so '2.0' and '2' converge. When a declared dimension is
+// supplied it must match the component count, otherwise a mismatched value is
+// rejected rather than entering a snapshot silently. Non-numeric components and
+// text that is not a bracketed list of numbers are explicit errors.
+func canonicalVectorValue(text string, dimension []int) (Value, error) {
+	trimmed := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmed, "[") || !strings.HasSuffix(trimmed, "]") {
+		return Value{}, fmt.Errorf("invalid vector %q: expected '[c1,c2,...]'", text)
+	}
+	inner := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+	var components []string
+	if inner != "" {
+		parts := strings.Split(inner, ",")
+		components = make([]string, 0, len(parts))
+		for _, part := range parts {
+			canonical, err := normalizeFloat(strings.TrimSpace(part))
+			if err != nil {
+				return Value{}, fmt.Errorf("invalid vector component %q: %w", part, err)
+			}
+			components = append(components, canonical)
+		}
+	}
+	if len(dimension) > 0 && dimension[0] > 0 && len(components) != dimension[0] {
+		return Value{}, fmt.Errorf("vector dimension mismatch: declared %d, got %d", dimension[0], len(components))
+	}
+	return Value{Kind: VectorValue, Value: "[" + strings.Join(components, ",") + "]"}, nil
 }
 
 // timestampFormats are the text layouts canonicalValue accepts for a timestamp

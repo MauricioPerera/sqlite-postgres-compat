@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -135,7 +136,14 @@ func (store *Store) inspectSQLiteTable(ctx context.Context, name, definition str
 		if err := rows.Scan(&columnName, &declaredType, &notNull, &defaultSQL, &pk, &hidden); err != nil {
 			return Table{}, nil, err
 		}
-		column := Column{Name: columnName, Type: Type{Family: sqliteTypeFamily(declaredType)}, Nullable: notNull == 0 && pk == 0}
+		declaredFamily := sqliteTypeFamily(declaredType)
+		declaredTypeValue := Type{Family: declaredFamily}
+		if declaredFamily == VectorType {
+			// F32_BLOB(N) carries the dimension inside the declared type text;
+			// extract it so the canonical Type.Arguments matches the declaration.
+			declaredTypeValue.Arguments = parseTypeArguments(declaredType)
+		}
+		column := Column{Name: columnName, Type: declaredTypeValue, Nullable: notNull == 0 && pk == 0}
 		if defaultSQL.Valid {
 			expression, err := parseCatalogExpression(defaultSQL.String)
 			if err != nil {
@@ -308,6 +316,11 @@ func (store *Store) inspectSQLiteIndexes(ctx context.Context, tableName string) 
 func sqliteTypeFamily(declared string) TypeFamily {
 	typ := strings.ToUpper(declared)
 	switch {
+	case strings.Contains(typ, "F32_BLOB"):
+		// libSQL/sqld declares native vectors as F32_BLOB(N). It must be matched
+		// before the generic BLOB affinity below, otherwise a vector column is
+		// silently misread as binary (see VECTOR-COMPAT-REPORT.md §B).
+		return VectorType
 	case strings.Contains(typ, "BOOL"):
 		return BooleanType
 	case strings.Contains(typ, "INT"):
@@ -331,8 +344,30 @@ func sqliteTypeFamily(declared string) TypeFamily {
 	}
 }
 
+// parseTypeArguments extracts the parenthesized integer arguments from a declared
+// type such as "F32_BLOB(3)" or "NUMERIC(38, 18)". It returns nil when the
+// declaration has no argument list or a non-integer component, so callers can
+// treat the dimension as genuinely absent rather than zero.
+func parseTypeArguments(declared string) []int {
+	start := strings.Index(declared, "(")
+	end := strings.LastIndex(declared, ")")
+	if start < 0 || end <= start {
+		return nil
+	}
+	fields := strings.Split(declared[start+1:end], ",")
+	arguments := make([]int, 0, len(fields))
+	for _, field := range fields {
+		value, err := strconv.Atoi(strings.TrimSpace(field))
+		if err != nil {
+			return nil
+		}
+		arguments = append(arguments, value)
+	}
+	return arguments
+}
+
 func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
-	rows, err := store.DB.QueryContext(ctx, `SELECT table_name, column_name, data_type, is_nullable, column_default, is_identity, is_generated
+	rows, err := store.DB.QueryContext(ctx, `SELECT table_name, column_name, data_type, udt_name, atttypmod, is_nullable, column_default, is_identity, is_generated
 		FROM information_schema.columns
 		WHERE table_schema = current_schema() AND table_name NOT IN ($1, $2, $3, $4)
 		AND table_name IN (SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE')
@@ -344,9 +379,10 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 	tables := make(map[string]*Table)
 	var order []string
 	for rows.Next() {
-		var tableName, columnName, dataType, nullable, identity, generated string
+		var tableName, columnName, dataType, udtName, nullable, identity, generated string
 		var defaultSQL sql.NullString
-		if err := rows.Scan(&tableName, &columnName, &dataType, &nullable, &defaultSQL, &identity, &generated); err != nil {
+		var atttypmod int
+		if err := rows.Scan(&tableName, &columnName, &dataType, &udtName, &atttypmod, &nullable, &defaultSQL, &identity, &generated); err != nil {
 			return Inspection{}, err
 		}
 		table := tables[tableName]
@@ -355,7 +391,14 @@ func (store *Store) inspectPostgres(ctx context.Context) (Inspection, error) {
 			tables[tableName] = table
 			order = append(order, tableName)
 		}
-		column := Column{Name: columnName, Type: Type{Family: postgresTypeFamily(dataType)}, Nullable: nullable == "YES"}
+		columnType := postgresType(dataType, udtName, atttypmod)
+		if columnType.Family == VectorType && len(columnType.Arguments) == 0 {
+			// pgvector allows a dimensionless vector column (atttypmod <= 0); the
+			// dimension is genuinely unobtainable there, so surface it explicitly
+			// instead of degrading to a silent binary or text mapping.
+			inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "column", Name: tableName + "." + columnName, Reason: "pgvector vector column has no declared dimension"})
+		}
+		column := Column{Name: columnName, Type: columnType, Nullable: nullable == "YES"}
 		if defaultSQL.Valid {
 			expression, err := parsePostgresCatalogDefault(defaultSQL.String)
 			if err != nil {
@@ -660,6 +703,21 @@ func postgresTypeFamily(dataType string) TypeFamily {
 	default:
 		return TextType
 	}
+}
+
+// postgresType maps an information_schema column to a canonical Type. pgvector
+// columns surface as udt_name='vector'; their dimension is pgvector's typmod
+// (atttypmod), which stores the dimension directly. When the dimension is
+// unavailable (dimensionless vector column) the family is still vector so the
+// caller can emit an explicit unresolved object rather than a silent fallback.
+func postgresType(dataType, udtName string, atttypmod int) Type {
+	if udtName == "vector" {
+		if atttypmod > 0 {
+			return Type{Family: VectorType, Arguments: []int{atttypmod}}
+		}
+		return Type{Family: VectorType}
+	}
+	return Type{Family: postgresTypeFamily(dataType)}
 }
 
 func extractCheckExpressions(definition string) []string {

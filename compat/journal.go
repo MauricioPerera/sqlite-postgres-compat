@@ -28,6 +28,7 @@ const (
 	TimestampValue ValueKind = "timestamp"
 	JSONValue      ValueKind = "json"
 	UUIDValue      ValueKind = "uuid"
+	VectorValue    ValueKind = "vector"
 )
 
 type Row map[string]Value

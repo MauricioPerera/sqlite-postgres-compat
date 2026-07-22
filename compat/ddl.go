@@ -130,6 +130,14 @@ func compileType(engine Engine, typ Type) (string, error) {
 			return "REAL", nil
 		case TextType, DateType, TimestampType, UUIDType, JSONType:
 			return "TEXT", nil
+		case VectorType:
+			// The default SQLite engine (modernc) has no native vector functions,
+			// so the interoperable carrier is canonical text '[1,2,3]'. This was
+			// validated against libSQL/sqld and pgvector in VECTOR-COMPAT-REPORT.md:
+			// text crosses both engines, while the native F32_BLOB/bytea binary
+			// route is not usable as a pgvector vector. TEXT preserves the
+			// canonical value byte-for-byte without requiring a vector extension.
+			return "TEXT", nil
 		case BinaryType:
 			return "BLOB", nil
 		}
@@ -162,6 +170,13 @@ func compileType(engine Engine, typ Type) (string, error) {
 			// Native UUID normalizes textual representation. TEXT preserves the
 			// exact canonical value used by both engines.
 			return "TEXT", nil
+		case VectorType:
+			// Requires the pgvector extension in the destination. If it is not
+			// installed the CREATE TABLE fails with a clear engine error, which is
+			// acceptable: the canonical schema declares the capability explicitly
+			// rather than silently degrading to text. The dimension is Arguments[0]
+			// and is guaranteed to be a single positive value by Schema.Validate.
+			return "vector" + args(), nil
 		}
 	}
 	return "", fmt.Errorf("type family %q is not supported by %s", typ.Family, engine)

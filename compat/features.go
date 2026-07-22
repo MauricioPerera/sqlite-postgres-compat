@@ -24,6 +24,7 @@ const (
 	CanonicalRoutines    Feature = "canonical_routines"
 	FullText             Feature = "full_text"
 	CanonicalFullText    Feature = "canonical_full_text"
+	CanonicalVectors     Feature = "canonical_vectors"
 )
 
 type MappingStatus string
@@ -57,7 +58,7 @@ func Audit(contract Contract) ([]Finding, error) {
 
 func assess(feature Feature) Finding {
 	switch feature {
-	case Tables, PrimaryKeys, Transactions, CanonicalForeignKeys, CanonicalChecks, CanonicalIndexes, CanonicalViews, CanonicalTriggers, CanonicalRoutines, CanonicalFullText:
+	case Tables, PrimaryKeys, Transactions, CanonicalForeignKeys, CanonicalChecks, CanonicalIndexes, CanonicalViews, CanonicalTriggers, CanonicalRoutines, CanonicalFullText, CanonicalVectors:
 		return Finding{Feature: feature, Status: Exact}
 	case JSONValues, UUIDValues:
 		return Finding{Feature: feature, Status: Exact, Reason: "lossless canonical text representation"}
@@ -104,6 +105,8 @@ func InferFeatures(schema Schema) []Feature {
 				seen[JSONValues] = struct{}{}
 			case UUIDType:
 				seen[UUIDValues] = struct{}{}
+			case VectorType:
+				seen[CanonicalVectors] = struct{}{}
 			}
 		}
 		for _, constraint := range table.Constraints {

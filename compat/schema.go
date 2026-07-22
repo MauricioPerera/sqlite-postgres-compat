@@ -46,6 +46,7 @@ const (
 	TimestampType TypeFamily = "timestamp"
 	JSONType      TypeFamily = "json"
 	UUIDType      TypeFamily = "uuid"
+	VectorType    TypeFamily = "vector"
 )
 
 type Constraint struct {
@@ -202,6 +203,14 @@ func (s Schema) Validate() error {
 			}
 			if column.Type.Family == "" {
 				return fmt.Errorf("column %q.%q has no type", table.Name, column.Name)
+			}
+			if column.Type.Family == VectorType {
+				// A vector is declared as vector(N); the single argument is the
+				// fixed dimension and must be positive. Without it the canonical
+				// type is meaningless and the DDL/value layers cannot compile.
+				if len(column.Type.Arguments) != 1 || column.Type.Arguments[0] <= 0 {
+					return fmt.Errorf("column %q.%q vector type requires a single positive dimension", table.Name, column.Name)
+				}
 			}
 			if _, exists := columns[column.Name]; exists {
 				return fmt.Errorf("duplicate column %q.%q", table.Name, column.Name)
