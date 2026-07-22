@@ -54,3 +54,64 @@ func TestParsePostgresCatalogTriggerRejectsNonPublicSchema(t *testing.T) {
 		t.Fatalf("expected unsupported error naming schema, got %q", err.Error())
 	}
 }
+
+// TestParsePostgresCatalogTriggerSchemaEquivalence covers the case-sensitive
+// semantics of quoted PostgreSQL identifiers. A quoted qualifier is a distinct
+// schema unless it is exactly lowercase "public"; an unquoted qualifier is
+// folded to lowercase by PostgreSQL, so any case variant matches public.
+func TestParsePostgresCatalogTriggerSchemaEquivalence(t *testing.T) {
+	body := `BEGIN INSERT INTO audit (code) VALUES (NEW.code); RETURN NEW; END`
+	cases := []struct {
+		name       string
+		definition string
+		wantErr    bool
+		wantTable  string
+		errSubstr  string
+	}{
+		{
+			name:       `quoted "Public" rejected`,
+			definition: `CREATE TRIGGER capture_product AFTER INSERT ON "Public".products FOR EACH ROW EXECUTE FUNCTION capture_product_fn()`,
+			wantErr:    true,
+			errSubstr:  "Public",
+		},
+		{
+			name:       `quoted "public" accepted`,
+			definition: `CREATE TRIGGER capture_product AFTER INSERT ON "public".products FOR EACH ROW EXECUTE FUNCTION capture_product_fn()`,
+			wantTable:  "products",
+		},
+		{
+			name:       `unquoted PUBLIC accepted`,
+			definition: `CREATE TRIGGER capture_product AFTER INSERT ON PUBLIC.products FOR EACH ROW EXECUTE FUNCTION capture_product_fn()`,
+			wantTable:  "products",
+		},
+		{
+			name:       `unquoted otherschema rejected`,
+			definition: `CREATE TRIGGER capture_product AFTER INSERT ON otherschema.products FOR EACH ROW EXECUTE FUNCTION capture_product_fn()`,
+			wantErr:    true,
+			errSubstr:  "otherschema",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			trigger, err := parsePostgresCatalogTrigger(tc.definition, body)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got trigger %+v", trigger)
+				}
+				if !strings.Contains(err.Error(), "unsupported") {
+					t.Fatalf("expected unsupported error, got %q", err.Error())
+				}
+				if !strings.Contains(err.Error(), tc.errSubstr) {
+					t.Fatalf("expected error to name schema %q, got %q", tc.errSubstr, err.Error())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if trigger.Table != tc.wantTable {
+				t.Fatalf("expected Table %q, got %q", tc.wantTable, trigger.Table)
+			}
+		})
+	}
+}

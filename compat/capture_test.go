@@ -200,3 +200,52 @@ func TestCompileCaptureTriggersUsesRoundTripFloatEncodingOnSQLite(t *testing.T) 
 		t.Fatalf("postgres capture trigger must keep CAST for float/decimal text:\n%s", postgresJoined)
 	}
 }
+
+// TestDecodeCapturedRowRejectsMissingColumn guards the defensive error added in
+// place of the former silent skip: a journal payload that omits a table column
+// must surface an explicit error naming both the table and the missing column,
+// rather than letting a partial row enter the replication stream. The normal
+// capture path always emits every column, so this is only reachable on schema
+// drift, but the skip must not stay silent.
+func TestDecodeCapturedRowRejectsMissingColumn(t *testing.T) {
+	table := Table{
+		Name: "captured_items",
+		Columns: []Column{
+			{Name: "id", Type: Type{Family: IntegerType}},
+			{Name: "title", Type: Type{Family: TextType}},
+		},
+	}
+	cases := []struct {
+		name    string
+		payload string
+		wantOK  bool
+		missing string
+	}{
+		{name: "all columns present", payload: `{"id":"1","title":"first"}`, wantOK: true},
+		{name: "missing title", payload: `{"id":"1"}`, wantOK: false, missing: "title"},
+		{name: "missing id", payload: `{"title":"first"}`, wantOK: false, missing: "id"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			row, err := decodeCapturedRow(tc.payload, table, true)
+			if tc.wantOK {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if len(row) != len(table.Columns) {
+					t.Fatalf("expected %d columns, got %d", len(table.Columns), len(row))
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error for missing column, got row %+v", row)
+			}
+			if !strings.Contains(err.Error(), "captured_items") {
+				t.Fatalf("expected error to name table captured_items, got %q", err.Error())
+			}
+			if !strings.Contains(err.Error(), tc.missing) {
+				t.Fatalf("expected error to name missing column %q, got %q", tc.missing, err.Error())
+			}
+		})
+	}
+}

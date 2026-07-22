@@ -56,10 +56,21 @@ func parsePostgresCatalogTrigger(definition, functionBody string) (Trigger, erro
 	// Only the default "public" schema qualifier is accepted (and dropped, as
 	// it carries no information here). Any other schema is rejected explicitly
 	// instead of being discarded silently, matching parseCatalogSelect's
-	// rejection of qualified names.
+	// rejection of qualified names. In PostgreSQL an unquoted identifier is
+	// folded to lowercase, so any case variant (public, PUBLIC, PuBlIc) is the
+	// public schema. A quoted identifier is case-sensitive instead: "Public" and
+	// "PUBLIC" name distinct schemas and must be rejected, while "public"
+	// (exactly lowercase) is still public. EqualFold must therefore apply only to
+	// unquoted qualifiers.
 	if schemaQualifier := strings.TrimSpace(match[4]); schemaQualifier != "" {
-		schema := unquoteCatalogIdentifier(strings.TrimSuffix(schemaQualifier, "."))
-		if !strings.EqualFold(schema, "public") {
+		schemaName := strings.TrimSuffix(schemaQualifier, ".")
+		quoted := len(schemaName) >= 2 && schemaName[0] == '"' && schemaName[len(schemaName)-1] == '"'
+		schema := unquoteCatalogIdentifier(schemaName)
+		isPublic := schema == "public"
+		if !quoted {
+			isPublic = strings.EqualFold(schema, "public")
+		}
+		if !isPublic {
 			return Trigger{}, fmt.Errorf("unsupported trigger schema %q: only \"public\" is allowed", schema)
 		}
 	}

@@ -207,7 +207,7 @@ func (store *Store) ReadCapturedChanges(ctx context.Context, schema Schema, afte
 		if err != nil {
 			return nil, err
 		}
-		primary, err := decodeCapturedRow(primaryJSON, table)
+		primary, err := decodeCapturedRow(primaryJSON, table, false)
 		if err != nil {
 			return nil, err
 		}
@@ -217,13 +217,13 @@ func (store *Store) ReadCapturedChanges(ctx context.Context, schema Schema, afte
 			return nil, err
 		}
 		if beforeJSON.Valid {
-			change.Before, err = decodeCapturedRow(beforeJSON.String, table)
+			change.Before, err = decodeCapturedRow(beforeJSON.String, table, true)
 			if err != nil {
 				return nil, err
 			}
 		}
 		if afterJSON.Valid {
-			change.After, err = decodeCapturedRow(afterJSON.String, table)
+			change.After, err = decodeCapturedRow(afterJSON.String, table, true)
 			if err != nil {
 				return nil, err
 			}
@@ -236,7 +236,7 @@ func (store *Store) ReadCapturedChanges(ctx context.Context, schema Schema, afte
 	return changes, rows.Err()
 }
 
-func decodeCapturedRow(payload string, table Table) (Row, error) {
+func decodeCapturedRow(payload string, table Table, requireAllColumns bool) (Row, error) {
 	var raw map[string]*string
 	if err := json.Unmarshal([]byte(payload), &raw); err != nil {
 		return nil, err
@@ -245,6 +245,17 @@ func decodeCapturedRow(payload string, table Table) (Row, error) {
 	for _, column := range table.Columns {
 		value, exists := raw[column.Name]
 		if !exists {
+			// The primary-key payload is intentionally a subset (only the key
+			// columns are journaled), so a missing non-key column is expected there
+			// and requireAllColumns is false. Full before/after rows are emitted by
+			// captureJSONExpression with every table column, so a missing key there
+			// means the journal payload does not match the schema (e.g. replaying a
+			// stale capture against a table that later gained a column). Surface it
+			// explicitly rather than silently dropping the column, which would let a
+			// partial row enter the replication stream.
+			if requireAllColumns {
+				return nil, fmt.Errorf("captured row for table %q is missing column %q", table.Name, column.Name)
+			}
 			continue
 		}
 		if value == nil {
