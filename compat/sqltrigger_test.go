@@ -21,3 +21,13 @@ func TestParsePostgresCatalogTrigger(t *testing.T) {
 		t.Fatalf("unexpected trigger: %+v", trigger)
 	}
 }
+
+func TestParseCatalogTriggerUpdateAndDeleteActions(t *testing.T) {
+	actions, err := parseCatalogTriggerActions(`UPDATE audit SET code = NEW.code WHERE code = OLD.code; DELETE FROM stale_audit WHERE code = OLD.code;`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 2 || actions[0].Kind != "update" || actions[0].Where == nil || actions[1].Kind != "delete" || actions[1].Where == nil {
+		t.Fatalf("unexpected actions: %+v", actions)
+	}
+}

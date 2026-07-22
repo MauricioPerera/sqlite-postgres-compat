@@ -735,6 +735,8 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 			`CREATE TABLE native_products (code TEXT NOT NULL, price INTEGER NOT NULL DEFAULT 3, active BOOLEAN NOT NULL DEFAULT TRUE, status TEXT NOT NULL DEFAULT 'new', CHECK (price >= 0))`,
 			`CREATE TABLE native_audit (product_code TEXT NOT NULL)`,
 			`CREATE TRIGGER native_product_audit AFTER INSERT ON native_products FOR EACH ROW BEGIN INSERT INTO native_audit (product_code) VALUES (NEW.code); END`,
+			`CREATE TRIGGER native_product_audit_update AFTER UPDATE ON native_products FOR EACH ROW BEGIN UPDATE native_audit SET product_code = NEW.code WHERE product_code = OLD.code; END`,
+			`CREATE TRIGGER native_product_audit_delete AFTER DELETE ON native_products FOR EACH ROW BEGIN DELETE FROM native_audit WHERE product_code = OLD.code; END`,
 			`CREATE UNIQUE INDEX native_products_code ON native_products (code ASC)`,
 			`CREATE INDEX native_products_active_price ON native_products (price DESC) WHERE active = TRUE`,
 			`CREATE VIEW native_active_products AS SELECT code AS product_code, price FROM native_products WHERE active = TRUE`,
@@ -747,6 +749,10 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 			`CREATE TABLE native_audit (product_code TEXT NOT NULL)`,
 			`CREATE FUNCTION native_product_audit_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO native_audit (product_code) VALUES (NEW.code); RETURN NEW; END $$`,
 			`CREATE TRIGGER native_product_audit AFTER INSERT ON native_products FOR EACH ROW EXECUTE FUNCTION native_product_audit_fn()`,
+			`CREATE FUNCTION native_product_audit_update_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN UPDATE native_audit SET product_code = NEW.code WHERE product_code = OLD.code; RETURN NEW; END $$`,
+			`CREATE TRIGGER native_product_audit_update AFTER UPDATE ON native_products FOR EACH ROW EXECUTE FUNCTION native_product_audit_update_fn()`,
+			`CREATE FUNCTION native_product_audit_delete_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN DELETE FROM native_audit WHERE product_code = OLD.code; RETURN OLD; END $$`,
+			`CREATE TRIGGER native_product_audit_delete AFTER DELETE ON native_products FOR EACH ROW EXECUTE FUNCTION native_product_audit_delete_fn()`,
 			`CREATE UNIQUE INDEX native_products_code ON native_products (code ASC)`,
 			`CREATE INDEX native_products_active_price ON native_products (price DESC) WHERE active = TRUE`,
 			`CREATE VIEW native_active_products AS SELECT code AS product_code, price FROM native_products WHERE active = TRUE`,
@@ -818,7 +824,13 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 		if !activeView || !aggregateView {
 			t.Fatalf("%s native view was not reconstructed: %+v", store.Target.Engine, inspection.Schema.Views)
 		}
-		if len(inspection.Schema.Triggers) != 1 || inspection.Schema.Triggers[0].Name != "native_product_audit" || len(inspection.Schema.Triggers[0].Actions) != 1 {
+		triggerKinds := map[string]bool{}
+		for _, trigger := range inspection.Schema.Triggers {
+			if len(trigger.Actions) == 1 {
+				triggerKinds[trigger.Actions[0].Kind] = true
+			}
+		}
+		if len(inspection.Schema.Triggers) != 3 || !triggerKinds["insert"] || !triggerKinds["update"] || !triggerKinds["delete"] {
 			t.Fatalf("%s native trigger was not reconstructed: %+v", store.Target.Engine, inspection.Schema.Triggers)
 		}
 		if _, err := store.DB.ExecContext(ctx, `INSERT INTO native_products (code) VALUES ('A')`); err != nil {
@@ -833,6 +845,12 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 		if err := store.DB.QueryRowContext(ctx, `SELECT product_code FROM native_audit`).Scan(&auditedCode); err != nil || auditedCode != "A" {
 			t.Fatalf("%s native trigger behavior differs: code=%q error=%v", store.Target.Engine, auditedCode, err)
 		}
+		if _, err := store.DB.ExecContext(ctx, `UPDATE native_products SET code = 'B' WHERE code = 'A'`); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.DB.QueryRowContext(ctx, `SELECT product_code FROM native_audit`).Scan(&auditedCode); err != nil || auditedCode != "B" {
+			t.Fatalf("%s native update trigger differs: code=%q error=%v", store.Target.Engine, auditedCode, err)
+		}
 		if _, err := store.DB.ExecContext(ctx, `INSERT INTO native_parents (id, tenant, code) VALUES (1, 7, 'P')`); err != nil {
 			t.Fatal(err)
 		}
@@ -842,6 +860,13 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 		var tenant, childCount int64
 		if err := store.DB.QueryRowContext(ctx, `SELECT tenant, child_count FROM native_parent_counts`).Scan(&tenant, &childCount); err != nil || tenant != 7 || childCount != 1 {
 			t.Fatalf("%s joined aggregate view differs: tenant=%d count=%d error=%v", store.Target.Engine, tenant, childCount, err)
+		}
+		if _, err := store.DB.ExecContext(ctx, `DELETE FROM native_products WHERE code = 'B'`); err != nil {
+			t.Fatal(err)
+		}
+		var deletedAuditRows int
+		if err := store.DB.QueryRowContext(ctx, `SELECT count(*) FROM native_audit WHERE product_code = 'B'`).Scan(&deletedAuditRows); err != nil || deletedAuditRows != 0 {
+			t.Fatalf("%s native delete trigger left %d rows, error=%v", store.Target.Engine, deletedAuditRows, err)
 		}
 		if store.Target.Engine == compat.Postgres {
 			if _, err := store.DB.ExecContext(ctx, `CREATE PROCEDURE native_write_audit(p_code TEXT) LANGUAGE plpgsql AS $$ BEGIN INSERT INTO native_audit (product_code) VALUES (p_code); END $$`); err != nil {

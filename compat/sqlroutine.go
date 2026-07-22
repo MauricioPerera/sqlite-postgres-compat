@@ -48,6 +48,9 @@ func parsePostgresCatalogRoutine(name, body, arguments, resultType, language, ki
 		return Routine{}, err
 	}
 	for _, triggerAction := range actions {
+		if triggerAction.Kind != "insert" {
+			return Routine{}, fmt.Errorf("routine action %q is outside the canonical command grammar", triggerAction.Kind)
+		}
 		action := RoutineAction{Kind: triggerAction.Kind, Table: triggerAction.Table}
 		for _, assignment := range triggerAction.Assignments {
 			expression, err := routineCatalogExpression(assignment.Value, parameterNames)

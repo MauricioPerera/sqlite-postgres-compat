@@ -444,26 +444,64 @@ func compileTrigger(engine Engine, trigger Trigger) ([]string, error) {
 }
 
 func compileTriggerAction(engine Engine, action TriggerAction) (string, error) {
-	if action.Kind != "insert" {
-		return "", fmt.Errorf("unsupported trigger action %q", action.Kind)
+	if action.Table == "" {
+		return "", fmt.Errorf("trigger action table is required")
 	}
-	if action.Table == "" || len(action.Assignments) == 0 {
-		return "", fmt.Errorf("insert trigger action requires table and assignments")
-	}
-	columns := make([]string, len(action.Assignments))
-	values := make([]string, len(action.Assignments))
-	for i, assignment := range action.Assignments {
-		if assignment.Column == "" {
-			return "", fmt.Errorf("trigger assignment column is required")
+	compileAssignments := func() ([]string, []string, error) {
+		columns := make([]string, len(action.Assignments))
+		values := make([]string, len(action.Assignments))
+		for i, assignment := range action.Assignments {
+			if assignment.Column == "" {
+				return nil, nil, fmt.Errorf("trigger assignment column is required")
+			}
+			value, err := compileExpression(engine, assignment.Value)
+			if err != nil {
+				return nil, nil, err
+			}
+			columns[i] = quoteIdentifier(assignment.Column)
+			values[i] = value
 		}
-		value, err := compileExpression(engine, assignment.Value)
+		return columns, values, nil
+	}
+	switch action.Kind {
+	case "insert":
+		if len(action.Assignments) == 0 {
+			return "", fmt.Errorf("insert trigger action requires assignments")
+		}
+		columns, values, err := compileAssignments()
 		if err != nil {
 			return "", err
 		}
-		columns[i] = quoteIdentifier(assignment.Column)
-		values[i] = value
+		return "INSERT INTO " + quoteIdentifier(action.Table) + " (" + strings.Join(columns, ", ") + ") VALUES (" + strings.Join(values, ", ") + ")", nil
+	case "update":
+		if len(action.Assignments) == 0 || action.Where == nil {
+			return "", fmt.Errorf("update trigger action requires assignments and predicate")
+		}
+		columns, values, err := compileAssignments()
+		if err != nil {
+			return "", err
+		}
+		sets := make([]string, len(columns))
+		for i := range columns {
+			sets[i] = columns[i] + " = " + values[i]
+		}
+		where, err := compileExpression(engine, *action.Where)
+		if err != nil {
+			return "", err
+		}
+		return "UPDATE " + quoteIdentifier(action.Table) + " SET " + strings.Join(sets, ", ") + " WHERE " + where, nil
+	case "delete":
+		if action.Where == nil {
+			return "", fmt.Errorf("delete trigger action requires predicate")
+		}
+		where, err := compileExpression(engine, *action.Where)
+		if err != nil {
+			return "", err
+		}
+		return "DELETE FROM " + quoteIdentifier(action.Table) + " WHERE " + where, nil
+	default:
+		return "", fmt.Errorf("unsupported trigger action %q", action.Kind)
 	}
-	return "INSERT INTO " + quoteIdentifier(action.Table) + " (" + strings.Join(columns, ", ") + ") VALUES (" + strings.Join(values, ", ") + ")", nil
 }
 
 func quoteIdentifier(identifier string) string {

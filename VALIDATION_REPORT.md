@@ -25,6 +25,7 @@ La batería se ejecutó contra SQLite real y PostgreSQL 17.5 real proporcionado 
 - Reconstrucción de vistas externas con proyecciones, alias, filtros, agrupación, orden, límite y desplazamiento dentro de la gramática `SELECT` común.
 - Reconstrucción de vistas con joins `INNER`, `LEFT` y `CROSS`, condiciones compuestas y agregaciones `COUNT`, `SUM`, `AVG`, `MIN` y `MAX`.
 - Reconstrucción de triggers externos `BEFORE`/`AFTER` para `INSERT`, `UPDATE` y `DELETE` con condición e inserciones de auditoría basadas en `NEW`/`OLD`.
+- Acciones canónicas `INSERT`, `UPDATE` y `DELETE` dentro de triggers, con predicados y asignaciones basadas en `NEW`/`OLD`.
 - Detección explícita de funciones y procedimientos PostgreSQL independientes todavía no traducidos.
 - Traducción de procedimientos PostgreSQL `SQL`/`PLpgSQL` parametrizados con inserciones canónicas y ejecución equivalente mediante el runtime común sobre SQLite y PostgreSQL.
 - Detección explícita de defaults no portables, identidades y columnas generadas.
@@ -49,7 +50,7 @@ La prueba de cobertura integral falla porque el sistema aún no proporciona equi
 - Claves foráneas con modos `MATCH`, diferimiento u otras extensiones específicas.
 - Restricciones `CHECK`.
 - Índices y expresiones de índice.
-- Triggers con acciones distintas de inserciones canónicas o sintaxis procedural arbitraria.
+- Triggers con control de flujo, SQL dinámico u otra sintaxis procedural arbitraria.
 - Vistas con subconsultas, operaciones de conjuntos, ventanas u otras extensiones todavía fuera del parser común.
 - Funciones con retorno, parámetros avanzados o lógica procedural fuera de las inserciones canónicas.
 - Búsqueda de texto completo.

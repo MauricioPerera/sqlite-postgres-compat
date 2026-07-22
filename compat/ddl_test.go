@@ -188,3 +188,21 @@ func TestCompileCanonicalForeignKeyActions(t *testing.T) {
 		}
 	}
 }
+
+func TestCompileCanonicalTriggerUpdateAndDeleteActions(t *testing.T) {
+	predicate := Expression{Kind: "eq", Args: []Expression{{Kind: "column", Value: "code"}, {Kind: "column", Value: "old.code"}}}
+	for _, action := range []TriggerAction{
+		{Kind: "update", Table: "audit", Assignments: []Assignment{{Column: "code", Value: Expression{Kind: "column", Value: "new.code"}}}, Where: &predicate},
+		{Kind: "delete", Table: "audit", Where: &predicate},
+	} {
+		for _, engine := range []Engine{SQLite, Postgres} {
+			compiled, err := compileTriggerAction(engine, action)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(compiled, strings.ToUpper(action.Kind)) || !strings.Contains(compiled, " WHERE ") {
+				t.Fatalf("%s %s action was not compiled: %s", engine, action.Kind, compiled)
+			}
+		}
+	}
+}
