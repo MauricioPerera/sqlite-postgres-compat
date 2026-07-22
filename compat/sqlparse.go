@@ -2,6 +2,7 @@ package compat
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -18,14 +19,26 @@ func parseCatalogExpression(input string) (Expression, error) {
 		return Expression{}, fmt.Errorf("empty expression")
 	}
 
-	for _, level := range [][]catalogOperator{
+	levels := [][]catalogOperator{
 		{{"OR", "or"}},
 		{{"AND", "and"}},
 		{{"IS NOT NULL", "is_not_null"}, {"IS NULL", "is_null"}},
 		{{"<=", "lte"}, {">=", "gte"}, {"<>", "ne"}, {"!=", "ne"}, {"=", "eq"}, {"<", "lt"}, {">", "gt"}, {"LIKE", "like"}},
 		{{"+", "add"}, {"-", "sub"}},
 		{{"*", "mul"}, {"/", "div"}},
-	} {
+	}
+	for index, level := range levels {
+		// NOT sits between AND and the IS NULL / comparison levels: it binds
+		// looser than IS NULL, LIKE and the comparison operators, but tighter
+		// than AND/OR. Handling it here (instead of after every binary level)
+		// makes "NOT a = b" parse as not(eq(a, b)) rather than eq(not(a), b).
+		if index == 2 && hasKeywordPrefix(text, "NOT") {
+			argument, err := parseCatalogExpression(strings.TrimSpace(text[3:]))
+			if err != nil {
+				return Expression{}, err
+			}
+			return Expression{Kind: "not", Args: []Expression{argument}}, nil
+		}
 		if left, operator, right, found := splitCatalogOperator(text, level); found {
 			leftExpression, err := parseCatalogExpression(left)
 			if err != nil {
@@ -42,13 +55,6 @@ func parseCatalogExpression(input string) (Expression, error) {
 		}
 	}
 
-	if hasKeywordPrefix(text, "NOT") {
-		argument, err := parseCatalogExpression(strings.TrimSpace(text[3:]))
-		if err != nil {
-			return Expression{}, err
-		}
-		return Expression{Kind: "not", Args: []Expression{argument}}, nil
-	}
 	upper := strings.ToUpper(text)
 	switch upper {
 	case "NULL":
@@ -60,6 +66,12 @@ func parseCatalogExpression(input string) (Expression, error) {
 	}
 	if text[0] == '\'' && text[len(text)-1] == '\'' {
 		return Expression{Kind: "string", Value: strings.ReplaceAll(text[1:len(text)-1], "''", "'")}, nil
+	}
+	if value, ok, err := catalogHexLiteral(text); ok {
+		if err != nil {
+			return Expression{}, err
+		}
+		return Expression{Kind: "integer", Value: value}, nil
 	}
 	if isCatalogNumber(text) {
 		kind := "integer"
@@ -282,4 +294,36 @@ func parseCatalogIdentifier(text string) (string, bool) {
 		parts[i] = part
 	}
 	return strings.Join(parts, "."), true
+}
+
+// catalogHexLiteral recognizes a SQLite hexadecimal integer literal such as
+// 0x10 or 0XABCDEF and returns its decimal value. It returns handled=false for
+// input that is not a hex literal (so callers fall through to other grammar
+// rules), and an error when the literal exceeds the 64-bit range that SQLite
+// supports. The decimal value is emitted so the expression compiles to
+// PostgreSQL as a plain integer instead of a quoted identifier.
+func catalogHexLiteral(text string) (value string, handled bool, err error) {
+	if len(text) < 3 || text[0] != '0' || (text[1] != 'x' && text[1] != 'X') {
+		return "", false, nil
+	}
+	digits := text[2:]
+	if digits == "" {
+		return "", false, nil
+	}
+	for _, character := range digits {
+		if !isHexDigit(character) {
+			return "", false, nil
+		}
+	}
+	decimal, parseErr := strconv.ParseUint(digits, 16, 64)
+	if parseErr != nil {
+		return "", true, fmt.Errorf("unsupported catalog hexadecimal literal %q", text)
+	}
+	return strconv.FormatUint(decimal, 10), true, nil
+}
+
+func isHexDigit(character rune) bool {
+	return unicode.IsDigit(character) ||
+		(character >= 'a' && character <= 'f') ||
+		(character >= 'A' && character <= 'F')
 }
