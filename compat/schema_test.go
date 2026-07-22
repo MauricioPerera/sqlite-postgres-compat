@@ -78,3 +78,32 @@ func TestSchemaValidateRejectsUnknownTypeFamilyOnRoutineParameter(t *testing.T) 
 		}
 	}
 }
+
+func TestValidReferentialActionAcceptsCanonicalActions(t *testing.T) {
+	for _, action := range []ReferentialAction{"", NoAction, Restrict, Cascade, SetNull, SetDefault} {
+		if !validReferentialAction(action) {
+			t.Fatalf("expected action %q to be valid", action)
+		}
+	}
+}
+
+func TestValidReferentialActionRejectsUnknownActions(t *testing.T) {
+	tests := []struct {
+		name   string
+		action ReferentialAction
+	}{
+		{name: "postgres spelled no action", action: ReferentialAction("no action")},
+		{name: "upper case cascade", action: ReferentialAction("CASCADE")},
+		{name: "restrict with trailing space", action: ReferentialAction("restrict ")},
+		{name: "arbitrary value", action: ReferentialAction("bogus")},
+		{name: "whitespace only", action: ReferentialAction(" ")},
+		{name: "set null with space", action: ReferentialAction("set null")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if validReferentialAction(tt.action) {
+				t.Fatalf("expected action %q to be invalid", tt.action)
+			}
+		})
+	}
+}
