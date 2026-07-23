@@ -61,7 +61,7 @@ Las familias genéricas `foreign_keys`, `check_constraints`, `indexes`, `views`,
 | Float | `REAL` | `DOUBLE PRECISION` | Valor de punto flotante explícito |
 | Text | `TEXT` | `TEXT` | Representación común |
 | Binary | `BLOB` | `BYTEA` | Journal en hexadecimal y artefacto canónico en base64 |
-| Date | `TEXT` | `DATE` | Conversión mediante el adaptador |
+| Date | `TEXT` | `TEXT` | Preserva el valor canónico exacto (`DATE` nativo haría que pgx devuelva `time.Time` y se pliegue a timestamp, divergiendo del origen) |
 | Timestamp | `TEXT` | `TEXT` | Preservar RFC3339Nano sin truncar a microsegundos |
 | JSON | `TEXT` | `TEXT` | Preservar orden, espacios, duplicados y números originales |
 | UUID | `TEXT` | `TEXT` | Preservar la representación textual exacta |

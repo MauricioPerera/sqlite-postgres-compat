@@ -290,6 +290,78 @@ func TestParseCatalogExpressionNotPrecedence(t *testing.T) {
 	}
 }
 
+// TestParseCatalogExpressionIsNullToleratesInternalWhitespace covers the
+// AUDIT7-A MEDIA H1 fix: SQLite and Postgres treat any run of whitespace as a
+// separator, so the multi-word operators "IS NULL" and "IS NOT NULL" must parse
+// identically whether their words are separated by a single space, multiple
+// spaces or a tab. The existing comparison/AND/OR paths already tolerate this
+// via keywordMatchSpan; the expression operators had been left strict.
+func TestParseCatalogExpressionIsNullToleratesInternalWhitespace(t *testing.T) {
+	column := func(name string) Expression { return Expression{Kind: "column", Value: name} }
+	wantNull := Expression{Kind: "is_null", Args: []Expression{column("col")}}
+	wantNotNull := Expression{Kind: "is_not_null", Args: []Expression{column("col")}}
+
+	tests := []struct {
+		name  string
+		input string
+		want  Expression
+	}{
+		{"IS NULL single space", "col IS NULL", wantNull},
+		{"IS NULL double space", "col IS  NULL", wantNull},
+		{"IS NULL tab separator", "col IS\tNULL", wantNull},
+		{"IS NULL newline separator", "col IS\nNULL", wantNull},
+		{"IS NOT NULL single space", "col IS NOT NULL", wantNotNull},
+		{"IS NOT NULL double spaces", "col IS  NOT  NULL", wantNotNull},
+		{"IS NOT NULL tab separators", "col IS\tNOT\tNULL", wantNotNull},
+		{"IS NOT NULL mixed whitespace", "col IS \t NOT \t NULL", wantNotNull},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseCatalogExpression(test.input)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("got %#v, want %#v", got, test.want)
+			}
+			// The compiled output must be the canonical single-space form for
+			// both engines regardless of the input whitespace.
+			for _, engine := range []Engine{SQLite, Postgres} {
+				compiled, err := compileExpression(engine, got)
+				if err != nil {
+					t.Fatalf("%s compile error: %v", engine, err)
+				}
+				wantSub := "IS NULL"
+				if got.Kind == "is_not_null" {
+					wantSub = "IS NOT NULL"
+				}
+				if !strings.Contains(compiled, `("col" `+wantSub+`)`) {
+					t.Fatalf("%s compiled %q, want substring %q", engine, compiled, `("col" `+wantSub+`)`)
+				}
+			}
+		})
+	}
+}
+
+// TestParseCatalogExpressionIsNullWhitespaceInCompound verifies the flexible
+// whitespace works inside larger expressions (precedence with AND/OR and
+// comparisons), not only as a standalone predicate.
+func TestParseCatalogExpressionIsNullWhitespaceInCompound(t *testing.T) {
+	column := func(name string) Expression { return Expression{Kind: "column", Value: name} }
+	want := Expression{Kind: "and", Args: []Expression{
+		{Kind: "is_not_null", Args: []Expression{column("a")}},
+		{Kind: "eq", Args: []Expression{column("b"), {Kind: "integer", Value: "1"}}},
+	}}
+	got, err := parseCatalogExpression("a IS  NOT  NULL AND b = 1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+}
+
 // TestParseCatalogExpressionNumericVersusIdentifier covers the MEDIA-1 fix:
 // a bare exponent such as "E5" or "e10" has no mantissa digit before the e/E,
 // so SQLite treats it as an identifier (column), not a number. The previous

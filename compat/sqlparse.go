@@ -242,8 +242,8 @@ func splitCatalogOperator(text string, operators []catalogOperator) (string, cat
 			continue
 		}
 		for _, operator := range operators {
-			start := i - len(operator.token) + 1
-			if start < 0 || !strings.EqualFold(text[start:i+1], operator.token) {
+			start, ok := catalogOperatorSpan(text, i, operator.token)
+			if !ok {
 				continue
 			}
 			if catalogWordOperator(operator.token) && (!wordBoundary(text, start-1) || !wordBoundary(text, i+1)) {
@@ -258,6 +258,46 @@ func splitCatalogOperator(text string, operators []catalogOperator) (string, cat
 		}
 	}
 	return "", catalogOperator{}, "", false
+}
+
+// catalogOperatorSpan reports whether an operator token matches text ending at
+// index end (inclusive) and returns the index where the operator begins.
+//
+// Symbol operators and single-word operators ("AND", "OR", "LIKE") match
+// verbatim with a fixed width. Multi-word operators ("IS NULL", "IS NOT NULL")
+// allow any run of whitespace wherever the token has a single separating space,
+// mirroring keywordMatchSpan (which matches left to right): SQLite and Postgres
+// treat "x IS  NULL" and "x IS\tNOT\tNULL" the same as "x IS NULL". The match
+// ends exactly at end, so the right-to-left scan in splitCatalogOperator still
+// selects the rightmost operator and keeps left-associative splits.
+func catalogOperatorSpan(text string, end int, token string) (int, bool) {
+	if !strings.Contains(token, " ") {
+		start := end - len(token) + 1
+		if start < 0 || !strings.EqualFold(text[start:end+1], token) {
+			return 0, false
+		}
+		return start, true
+	}
+	words := strings.Split(token, " ")
+	i := end + 1 // exclusive end, just past the last matched character
+	for w := len(words) - 1; w >= 0; w-- {
+		word := words[w]
+		if w < len(words)-1 {
+			// A separator (>= 1 whitespace) must sit between this word and the
+			// already-matched word to its right, matching keywordMatchSpan.
+			if i == 0 || !unicode.IsSpace(rune(text[i-1])) {
+				return 0, false
+			}
+			for i > 0 && unicode.IsSpace(rune(text[i-1])) {
+				i--
+			}
+		}
+		if i-len(word) < 0 || !strings.EqualFold(text[i-len(word):i], word) {
+			return 0, false
+		}
+		i -= len(word)
+	}
+	return i, true
 }
 
 func hasOuterParentheses(text string) bool {

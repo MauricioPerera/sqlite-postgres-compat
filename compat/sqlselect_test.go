@@ -210,6 +210,60 @@ func TestParseCatalogSelectKeywordWhitespaceDoesNotReachStringLiterals(t *testin
 	}
 }
 
+// TestParseCatalogSelectHeaderToleratesAsSelectWhitespace covers the AUDIT7-A
+// BAJA H3 fix (same class as MEDIA H1): the view header boundary "AS SELECT"
+// must tolerate any run of whitespace between AS and SELECT, exactly as the
+// clause keywords tolerate it via keywordMatchSpan. SQLite and Postgres accept
+// "AS  SELECT" and "AS\tSELECT"; the parser previously required a single space.
+func TestParseCatalogSelectHeaderToleratesAsSelectWhitespace(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"AS SELECT single space", "CREATE VIEW v AS SELECT a FROM t"},
+		{"AS SELECT double space", "CREATE VIEW v AS  SELECT a FROM t"},
+		{"AS SELECT tab separator", "CREATE VIEW v AS\tSELECT a FROM t"},
+		{"AS SELECT newline separator", "CREATE VIEW v AS\nSELECT a FROM t"},
+		{"AS SELECT with trailing clauses", "CREATE VIEW v AS  SELECT a FROM t WHERE a IS  NOT  NULL"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseCatalogSelect(test.input)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.From.Table != "t" {
+				t.Fatalf("expected FROM t, got %+v", got.From)
+			}
+			if len(got.Columns) != 1 {
+				t.Fatalf("expected one projection, got %d", len(got.Columns))
+			}
+			// The whitespace-tolerant form must produce the same query as the
+			// canonical single-space form.
+			single := strings.ReplaceAll(test.input, "AS  SELECT", "AS SELECT")
+			single = strings.ReplaceAll(single, "AS\tSELECT", "AS SELECT")
+			single = strings.ReplaceAll(single, "AS\nSELECT", "AS SELECT")
+			single = strings.ReplaceAll(single, "IS  NOT  NULL", "IS NOT NULL")
+			ref, err := parseCatalogSelect(single)
+			if err != nil {
+				t.Fatalf("canonical form errored: %v", err)
+			}
+			if !reflect.DeepEqual(got, ref) {
+				t.Fatalf("whitespace form differs from single-space form:\ngot  %+v\nwant %+v", got, ref)
+			}
+		})
+	}
+}
+
+// TestParseCatalogSelectRejectsMissingAsSelect confirms a CREATE header
+// without an AS SELECT boundary is still rejected (the flexible matcher did
+// not loosen the required boundary).
+func TestParseCatalogSelectRejectsMissingAsSelect(t *testing.T) {
+	if _, err := parseCatalogSelect("CREATE VIEW v SELECT a FROM t"); err == nil {
+		t.Fatal("expected error for missing AS SELECT, got nil")
+	}
+}
+
 // TestParseCatalogSelectJoinInternalWhitespace covers the JOIN keyword path of
 // the MEDIA-2 fix: "LEFT OUTER JOIN" and "INNER JOIN" with extra whitespace
 // between words must parse identically to the single-space form.

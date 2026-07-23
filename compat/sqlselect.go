@@ -71,11 +71,16 @@ func stripCatalogSelectHeader(definition string) (body string, distinct bool, er
 	text := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(definition), ";"))
 	upper := strings.ToUpper(text)
 	if strings.HasPrefix(upper, "CREATE ") {
-		position := strings.Index(upper, " AS SELECT ")
+		// Find the "AS SELECT" boundary with the same whitespace tolerance the
+		// rest of the parser uses for multi-word keywords (keywordMatchSpan), so
+		// "AS  SELECT" or "AS\tSELECT" is accepted just like "AS SELECT". Both
+		// SQLite and Postgres treat any run of whitespace as a separator here.
+		position := topLevelKeyword(text, "AS SELECT")
 		if position < 0 {
 			return "", false, fmt.Errorf("view definition has no AS SELECT")
 		}
-		text = strings.TrimSpace(text[position+len(" AS "):])
+		end, _ := keywordMatchSpan(text, position, "AS SELECT")
+		text = strings.TrimSpace(text[end-len("SELECT"):])
 	}
 	if !strings.HasPrefix(strings.ToUpper(text), "SELECT ") {
 		return "", false, fmt.Errorf("view definition is not SELECT")
