@@ -291,6 +291,14 @@ func updateRow(ctx context.Context, tx *sql.Tx, engine Engine, table Table, prim
 	arguments := make([]any, 0, len(table.Columns)+len(primaryKey))
 	position := 1
 	for _, column := range table.Columns {
+		// A generated (STORED) column is recomputed by the engine from the base
+		// columns; it cannot appear in a SET list (both engines reject it). Skip it
+		// here — after the base columns are updated the engine recomputes it, and
+		// position only advances for columns actually assigned, so the $N sequence
+		// stays gap-free on PostgreSQL.
+		if column.Generated != nil {
+			continue
+		}
 		value, exists := after[column.Name]
 		if !exists {
 			return fmt.Errorf("update %s missing column %q", table.Name, column.Name)

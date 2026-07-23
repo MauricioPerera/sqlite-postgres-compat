@@ -84,7 +84,16 @@ func compileTable(engine Engine, table Table) (string, error) {
 		if !column.Nullable {
 			definition += " NOT NULL"
 		}
-		if column.Default != nil {
+		if column.Generated != nil {
+			// `GENERATED ALWAYS AS (<expr>) STORED` is byte-identical syntax in
+			// SQLite (>= 3.31) and PostgreSQL (>= 12). Schema.Validate guarantees
+			// Stored is true and Default is nil, so the two are mutually exclusive.
+			generatedSQL, err := compileExpression(engine, column.Generated.Expression)
+			if err != nil {
+				return "", fmt.Errorf("%s.%s generated: %w", table.Name, column.Name, err)
+			}
+			definition += " GENERATED ALWAYS AS (" + generatedSQL + ") STORED"
+		} else if column.Default != nil {
 			defaultSQL, err := compileExpression(engine, *column.Default)
 			if err != nil {
 				return "", fmt.Errorf("%s.%s default: %w", table.Name, column.Name, err)

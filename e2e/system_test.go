@@ -1801,3 +1801,175 @@ func TestCopyCLIDivergedStderrOnce(t *testing.T) {
 		t.Fatalf("expected the error line once on stderr, got %d\nstderr:\n%s", got, stderr)
 	}
 }
+
+// generatedColumnE2ESchema declares a table with an integer STORED generated
+// column total = price * quantity. Integer arithmetic is exact and deterministic
+// in both engines, so the destination-recomputed value is the equivalence proof.
+func generatedColumnE2ESchema(name string) compat.Schema {
+	return compat.Schema{Tables: []compat.Table{{
+		Name: name,
+		Columns: []compat.Column{
+			{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+			{Name: "price", Type: compat.Type{Family: compat.IntegerType}},
+			{Name: "quantity", Type: compat.Type{Family: compat.IntegerType}},
+			{Name: "total", Type: compat.Type{Family: compat.IntegerType}, Generated: &compat.GeneratedColumn{
+				Stored: true,
+				Expression: compat.Expression{Kind: "mul", Args: []compat.Expression{
+					{Kind: "column", Value: "price"},
+					{Kind: "column", Value: "quantity"},
+				}},
+			}},
+		},
+		Constraints: []compat.Constraint{{Kind: compat.PrimaryKey, Columns: []string{"id"}}},
+	}}}
+}
+
+// TestSystemGeneratedStoredColumnSnapshotCopyEquivalent copies a SQLite table
+// with a STORED generated column into real PostgreSQL and verifies the snapshots
+// are equivalent, with PostgreSQL having recomputed the generated value itself
+// (the INSERT never writes the generated column).
+func TestSystemGeneratedStoredColumnSnapshotCopyEquivalent(t *testing.T) {
+	ctx := context.Background()
+	schema := generatedColumnE2ESchema("cuboa3_copy_lines")
+
+	source := openSQLite(t, filepath.Join(t.TempDir(), "generated-copy.db"))
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO cuboa3_copy_lines (id, price, quantity) VALUES (1, 6, 7), (2, 3, 4)`); err != nil {
+		t.Fatal(err)
+	}
+	sourceSnapshot, err := source.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	postgres := openPostgres(t)
+	// The e2e PG database is shared; keep the import additive into an empty table.
+	_, _ = postgres.DB.ExecContext(ctx, `DROP TABLE IF EXISTS cuboa3_copy_lines`)
+	t.Cleanup(func() { _, _ = postgres.DB.ExecContext(context.Background(), `DROP TABLE IF EXISTS cuboa3_copy_lines`) })
+	if err := postgres.ImportSnapshot(ctx, sourceSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	postgresSnapshot, err := postgres.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEquivalent(t, sourceSnapshot, postgresSnapshot)
+
+	// Spot-check that PostgreSQL computed the generated column from the base
+	// columns it received, not from any value the copy tried to write.
+	var total int64
+	if err := postgres.DB.QueryRowContext(ctx, `SELECT total FROM cuboa3_copy_lines WHERE id = 1`).Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != 42 {
+		t.Fatalf("postgres generated total: want 42, got %d", total)
+	}
+}
+
+// TestSystemGeneratedStoredColumnIncrementalReplication replays an INSERT and an
+// UPDATE captured on SQLite onto real PostgreSQL and verifies PostgreSQL recomputes
+// the STORED generated column with no spurious conflict (the cross-engine before
+// image, which carries the source-computed generated value, matches PostgreSQL's
+// own recomputation), leaving the two stores equivalent.
+func TestSystemGeneratedStoredColumnIncrementalReplication(t *testing.T) {
+	ctx := context.Background()
+	schema := generatedColumnE2ESchema("cuboa3_incremental_lines")
+
+	sqlite := openSQLite(t, filepath.Join(t.TempDir(), "generated-incremental.db"))
+	postgres := openPostgres(t)
+	_, _ = postgres.DB.ExecContext(ctx, `DROP TABLE IF EXISTS cuboa3_incremental_lines`)
+	t.Cleanup(func() {
+		_, _ = postgres.DB.ExecContext(context.Background(), `DROP TABLE IF EXISTS cuboa3_incremental_lines`)
+	})
+	for _, store := range []*compat.Store{sqlite, postgres} {
+		if err := store.ApplySchema(ctx, schema); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Capture is installed on the SQLite source only; the change stream is read
+	// from the isolated per-test SQLite journal and applied to real PostgreSQL.
+	if err := sqlite.InstallChangeCapture(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlite.DB.ExecContext(ctx, `INSERT INTO cuboa3_incremental_lines (id, price, quantity) VALUES (1, 6, 7)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlite.DB.ExecContext(ctx, `UPDATE cuboa3_incremental_lines SET quantity = 9 WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := sqlite.ReadCapturedChanges(ctx, schema, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 2 || changes[0].Kind != compat.Insert || changes[1].Kind != compat.Update {
+		t.Fatalf("unexpected captured stream: %+v", changes)
+	}
+	if got := changes[1].After["total"].Value; got != "54" {
+		t.Fatalf("captured update total: want 54, got %q", got)
+	}
+	// Strict ApplyChanges: no conflict must be raised even though before/after
+	// carry the source-computed generated value and PostgreSQL recomputes its own.
+	if err := postgres.ApplyChanges(ctx, schema, changes); err != nil {
+		t.Fatalf("generated-column incremental replication must apply without conflict: %v", err)
+	}
+	var price, quantity, total int64
+	if err := postgres.DB.QueryRowContext(ctx, `SELECT price, quantity, total FROM cuboa3_incremental_lines WHERE id = 1`).Scan(&price, &quantity, &total); err != nil {
+		t.Fatal(err)
+	}
+	if price != 6 || quantity != 9 || total != 54 {
+		t.Fatalf("postgres did not recompute generated column: price=%d quantity=%d total=%d", price, quantity, total)
+	}
+	assertStoreSnapshotsEquivalent(t, ctx, schema, sqlite, postgres)
+}
+
+// TestSystemGeneratedStoredColumnNativeInspectionRoundTrip inspects a STORED
+// generated column created with raw DDL (no canonical metadata) on both engines
+// and confirms it round-trips as exact with the generation expression recovered.
+// It recreates the public schema first so no canonical metadata short-circuits
+// the native catalog path; run last so it does not disturb earlier tests.
+func TestSystemGeneratedStoredColumnNativeInspectionRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	sqlite := openSQLite(t, filepath.Join(t.TempDir(), "generated-native.db"))
+	postgres := openPostgres(t)
+	if _, err := postgres.DB.ExecContext(ctx, `DROP SCHEMA public CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := postgres.DB.ExecContext(ctx, `CREATE SCHEMA public`); err != nil {
+		t.Fatal(err)
+	}
+	ddl := map[compat.Engine]string{
+		compat.SQLite:   `CREATE TABLE cuboa3_native_lines (id INTEGER PRIMARY KEY, price INTEGER NOT NULL, quantity INTEGER NOT NULL, total INTEGER GENERATED ALWAYS AS (price * quantity) STORED)`,
+		compat.Postgres: `CREATE TABLE cuboa3_native_lines (id BIGINT PRIMARY KEY, price BIGINT NOT NULL, quantity BIGINT NOT NULL, total BIGINT GENERATED ALWAYS AS (price * quantity) STORED)`,
+	}
+	for _, store := range []*compat.Store{sqlite, postgres} {
+		if _, err := store.DB.ExecContext(ctx, ddl[store.Target.Engine]); err != nil {
+			t.Fatalf("%s native DDL: %v", store.Target.Engine, err)
+		}
+		inspection, err := store.InspectSchema(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !inspection.Exact || len(inspection.Unresolved) != 0 {
+			t.Fatalf("%s generated column not inspected as exact: %+v", store.Target.Engine, inspection)
+		}
+		var total *compat.Column
+		for i := range inspection.Schema.Tables {
+			if inspection.Schema.Tables[i].Name != "cuboa3_native_lines" {
+				continue
+			}
+			for j := range inspection.Schema.Tables[i].Columns {
+				if inspection.Schema.Tables[i].Columns[j].Name == "total" {
+					total = &inspection.Schema.Tables[i].Columns[j]
+				}
+			}
+		}
+		if total == nil || total.Generated == nil || !total.Generated.Stored {
+			t.Fatalf("%s total not reconstructed as STORED generated: %+v", store.Target.Engine, inspection.Schema.Tables)
+		}
+		if total.Generated.Expression.Kind != "mul" || len(total.Generated.Expression.Args) != 2 {
+			t.Fatalf("%s generation expression not reconstructed: %+v", store.Target.Engine, total.Generated.Expression)
+		}
+	}
+}

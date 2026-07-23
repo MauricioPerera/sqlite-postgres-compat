@@ -24,6 +24,79 @@ func TestSchemaValidateRejectsUnknownTypeFamily(t *testing.T) {
 	}
 }
 
+// TestSchemaValidateAcceptsGeneratedStoredColumn confirms a well-formed STORED
+// generated column (no default, not in the primary key) validates.
+func TestSchemaValidateAcceptsGeneratedStoredColumn(t *testing.T) {
+	if err := generatedColumnTestSchema("gen_ok").Validate(); err != nil {
+		t.Fatalf("valid STORED generated column must pass validation: %v", err)
+	}
+}
+
+// TestSchemaValidateRejectsInvalidGeneratedColumns freezes the three canonical
+// rejections: VIRTUAL (Stored=false), generated + default together, and a
+// generated column inside a primary key. All three are refused by both engines.
+func TestSchemaValidateRejectsInvalidGeneratedColumns(t *testing.T) {
+	genExpr := func() *GeneratedColumn {
+		return &GeneratedColumn{Stored: true, Expression: Expression{Kind: "mul", Args: []Expression{
+			{Kind: "column", Value: "price"},
+			{Kind: "column", Value: "quantity"},
+		}}}
+	}
+	baseColumns := func() []Column {
+		return []Column{
+			{Name: "id", Type: Type{Family: IntegerType}},
+			{Name: "price", Type: Type{Family: IntegerType}},
+			{Name: "quantity", Type: Type{Family: IntegerType}},
+		}
+	}
+	cases := []struct {
+		name  string
+		table Table
+		want  string
+	}{
+		{
+			name: "virtual",
+			table: Table{
+				Name:        "gen_virtual",
+				Columns:     append(baseColumns(), Column{Name: "total", Type: Type{Family: IntegerType}, Generated: &GeneratedColumn{Stored: false, Expression: Expression{Kind: "column", Value: "price"}}}),
+				Constraints: []Constraint{{Kind: PrimaryKey, Columns: []string{"id"}}},
+			},
+			want: "STORED",
+		},
+		{
+			name: "generated_with_default",
+			table: Table{
+				Name: "gen_default",
+				Columns: append(baseColumns(), Column{Name: "total", Type: Type{Family: IntegerType},
+					Default:   &Expression{Kind: "integer", Value: "0"},
+					Generated: genExpr()}),
+				Constraints: []Constraint{{Kind: PrimaryKey, Columns: []string{"id"}}},
+			},
+			want: "default",
+		},
+		{
+			name: "generated_in_primary_key",
+			table: Table{
+				Name:        "gen_pk",
+				Columns:     append(baseColumns(), Column{Name: "total", Type: Type{Family: IntegerType}, Generated: genExpr()}),
+				Constraints: []Constraint{{Kind: PrimaryKey, Columns: []string{"total"}}},
+			},
+			want: "primary key",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := (Schema{Tables: []Table{tc.table}}).Validate()
+			if err == nil {
+				t.Fatalf("expected %s to be rejected", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q must mention %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
 func TestSchemaValidateAcceptsEveryKnownTypeFamily(t *testing.T) {
 	for _, family := range []TypeFamily{
 		BooleanType, IntegerType, DecimalType, FloatType, TextType,

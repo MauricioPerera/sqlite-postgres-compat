@@ -259,6 +259,106 @@ func replicationTestSchema(name string) Schema {
 	}}}
 }
 
+// generatedColumnTestSchema declares an integer STORED generated column
+// `total = price * quantity`. Integer arithmetic is exact and deterministic in
+// both engines, so the recomputed destination value is the equivalence proof.
+func generatedColumnTestSchema(name string) Schema {
+	return Schema{Tables: []Table{{
+		Name: name,
+		Columns: []Column{
+			{Name: "id", Type: Type{Family: IntegerType}},
+			{Name: "price", Type: Type{Family: IntegerType}},
+			{Name: "quantity", Type: Type{Family: IntegerType}},
+			{Name: "total", Type: Type{Family: IntegerType}, Generated: &GeneratedColumn{
+				Stored: true,
+				Expression: Expression{Kind: "mul", Args: []Expression{
+					{Kind: "column", Value: "price"},
+					{Kind: "column", Value: "quantity"},
+				}},
+			}},
+		},
+		Constraints: []Constraint{{Kind: PrimaryKey, Columns: []string{"id"}}},
+	}}}
+}
+
+// TestApplyChangesRecomputesGeneratedStoredColumnEndToEnd proves the data chain
+// excludes a STORED generated column from the INSERT/UPDATE it applies and lets
+// the destination recompute it: capture on the source journals the row (including
+// the source-computed total), ApplyChanges replays insert+update, and the
+// destination's own generation produces the identical value with no spurious
+// conflict. VerifySnapshots confirms equivalence over the generated column too.
+func TestApplyChangesRecomputesGeneratedStoredColumnEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	schema := generatedColumnTestSchema("generated_fidelity_items")
+
+	source, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	destination, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destination.Close()
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := destination.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.InstallChangeCapture(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+
+	// Only the base columns are written; total is computed by the engine.
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO generated_fidelity_items (id, price, quantity) VALUES (1, 6, 7)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.ExecContext(ctx, `UPDATE generated_fidelity_items SET quantity = 9 WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := source.ReadCapturedChanges(ctx, schema, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 2 {
+		t.Fatalf("expected insert+update, got %d changes", len(changes))
+	}
+	// The captured after-state already carries the source-computed generated value.
+	if got := changes[0].After["total"].Value; got != "42" {
+		t.Fatalf("captured insert total: want 42, got %q", got)
+	}
+	if got := changes[1].After["total"].Value; got != "54" {
+		t.Fatalf("captured update total: want 54, got %q", got)
+	}
+	if err := destination.ApplyChanges(ctx, schema, changes); err != nil {
+		t.Fatalf("generated-column replication must apply without conflict: %v", err)
+	}
+	var price, quantity, total int
+	if err := destination.DB.QueryRowContext(ctx, `SELECT price, quantity, total FROM generated_fidelity_items WHERE id = 1`).Scan(&price, &quantity, &total); err != nil {
+		t.Fatal(err)
+	}
+	if price != 6 || quantity != 9 || total != 54 {
+		t.Fatalf("destination did not recompute generated column: price=%d quantity=%d total=%d", price, quantity, total)
+	}
+	sourceSnapshot, err := source.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationSnapshot, err := destination.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := VerifySnapshots(sourceSnapshot, destinationSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Equivalent {
+		t.Fatalf("snapshots including the generated column must be equivalent: %+v", report)
+	}
+}
+
 // decimalTestSchema declares a DECIMAL column so the capture trigger uses the
 // typeof-gated printf path for REAL storage and the raw CAST path for TEXT.
 func decimalTestSchema(name string) Schema {

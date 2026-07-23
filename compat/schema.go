@@ -24,6 +24,29 @@ type Column struct {
 	Type     Type        `json:"type"`
 	Nullable bool        `json:"nullable"`
 	Default  *Expression `json:"default,omitempty"`
+	// Generated, when set, makes this a STORED generated column whose value is
+	// computed from Expression rather than supplied on INSERT/UPDATE. It is an
+	// additive, omitempty field: a column without it stays byte-identical in the
+	// canonical JSON and in every emitted statement. See GeneratedColumn.
+	Generated *GeneratedColumn `json:"generated,omitempty"`
+}
+
+// GeneratedColumn describes a STORED generated column:
+// `col TYPE GENERATED ALWAYS AS (<expression>) STORED`. Only STORED is
+// supported because it is computed and physically stored identically by SQLite
+// (>= 3.31) and PostgreSQL (>= 12) with this exact syntax; the value is
+// recomputed on the destination from the same deterministic expression, which
+// is the equivalence proof. VIRTUAL is deliberately not supported (PostgreSQL
+// cannot express it), so Stored must be true — a false Stored is rejected by
+// Schema.Validate rather than silently emitting divergent DDL. Expression uses
+// the canonical grammar (compat/sqlparse.go, parseCatalogExpression) and is
+// compiled by the same compileExpression path as any other expression, so an
+// out-of-grammar expression fails at compile time with an explicit error. A
+// generated column cannot also carry a Default and cannot be part of a
+// canonical primary key (both engines restrict this).
+type GeneratedColumn struct {
+	Expression Expression `json:"expression"`
+	Stored     bool       `json:"stored"`
 }
 
 type Type struct {
@@ -297,7 +320,24 @@ func validateTable(table Table, tables map[string]struct{}, tableColumns map[str
 			return err
 		}
 	}
+	generated := make(map[string]struct{})
+	for _, column := range table.Columns {
+		if column.Generated != nil {
+			generated[column.Name] = struct{}{}
+		}
+	}
 	for _, constraint := range table.Constraints {
+		if constraint.Kind == PrimaryKey {
+			// A generated column cannot be part of a primary key in either engine
+			// (SQLite: "STORED/VIRTUAL columns may not be part of the PRIMARY KEY";
+			// PostgreSQL rejects a generated column in a primary key). Reject it here
+			// rather than emitting DDL that one or both engines refuse.
+			for _, name := range constraint.Columns {
+				if _, ok := generated[name]; ok {
+					return fmt.Errorf("table %q primary key includes generated column %q", table.Name, name)
+				}
+			}
+		}
 		if constraint.Kind != ForeignKey || constraint.References == nil {
 			continue
 		}
@@ -327,6 +367,19 @@ func validateTableColumn(tableName string, column Column, columns map[string]str
 		// type is meaningless and the DDL/value layers cannot compile.
 		if len(column.Type.Arguments) != 1 || column.Type.Arguments[0] <= 0 {
 			return fmt.Errorf("column %q.%q vector type requires a single positive dimension", tableName, column.Name)
+		}
+	}
+	if column.Generated != nil {
+		if !column.Generated.Stored {
+			// VIRTUAL is not representable across both engines, so the only valid
+			// generated column is STORED. A false Stored (an attempt to model
+			// VIRTUAL) is rejected rather than silently coerced.
+			return fmt.Errorf("column %q.%q generated column must be STORED (VIRTUAL is not supported)", tableName, column.Name)
+		}
+		if column.Default != nil {
+			// A column is either supplied (with an optional DEFAULT) or computed
+			// (GENERATED ALWAYS AS ...); both engines reject a column that is both.
+			return fmt.Errorf("column %q.%q cannot have both a default and a generated expression", tableName, column.Name)
 		}
 	}
 	if _, exists := columns[column.Name]; exists {

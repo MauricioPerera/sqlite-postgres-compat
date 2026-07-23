@@ -53,6 +53,34 @@ func TestSQLiteDecimalUsesLosslessTextStorage(t *testing.T) {
 	}
 }
 
+// TestCompileGeneratedStoredColumnForBothEngines freezes the emitted DDL for a
+// STORED generated column: `col TYPE GENERATED ALWAYS AS (<expr>) STORED`, which
+// is byte-identical syntax in SQLite (>= 3.31) and PostgreSQL (>= 12). The base
+// type differs per engine (INTEGER vs BIGINT) but the generation clause does not,
+// and the generated column carries no DEFAULT.
+func TestCompileGeneratedStoredColumnForBothEngines(t *testing.T) {
+	schema := generatedColumnTestSchema("invoice_lines")
+	sqlite, err := CompileDDL(Target{Engine: SQLite, Version: Version{Major: 3}}, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postgres, err := CompileDDL(Target{Engine: Postgres, Version: Version{Major: 17}}, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSQLite := `"total" INTEGER NOT NULL GENERATED ALWAYS AS (("price" * "quantity")) STORED`
+	wantPostgres := `"total" BIGINT NOT NULL GENERATED ALWAYS AS (("price" * "quantity")) STORED`
+	if !strings.Contains(sqlite[0], wantSQLite) {
+		t.Fatalf("sqlite generated column DDL missing %q: %s", wantSQLite, sqlite[0])
+	}
+	if !strings.Contains(postgres[0], wantPostgres) {
+		t.Fatalf("postgres generated column DDL missing %q: %s", wantPostgres, postgres[0])
+	}
+	if strings.Contains(sqlite[0], `STORED DEFAULT`) || strings.Contains(postgres[0], `STORED DEFAULT`) {
+		t.Fatalf("generated column must not also emit DEFAULT: %s / %s", sqlite[0], postgres[0])
+	}
+}
+
 func TestPostgresTimestampUsesLosslessTextStorage(t *testing.T) {
 	typ, err := compileType(Postgres, Type{Family: TimestampType})
 	if err != nil {

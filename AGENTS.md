@@ -30,6 +30,18 @@ Rules (from `Schema.Validate` and `compileType`):
 
 A vector column infers the `canonical_vectors` feature (see `InferFeatures`).
 
+### Generated columns (STORED)
+
+A `Column` may carry an additive `Generated` field (`*GeneratedColumn{Expression, Stored}`, JSON `generated` with `omitempty`), compiled by `compileTable` (`compat/ddl.go`) to `col TYPE GENERATED ALWAYS AS (<expr>) STORED` — byte-identical syntax in SQLite (≥ 3.31) and PostgreSQL (≥ 12). `Expression` is a catalog expression (Section 3). The destination recomputes the value deterministically, which is the equivalence proof; the data chain never writes a generated column (it is excluded from every `INSERT`/`UPDATE` column list in snapshot import and replication).
+
+Rules (from `Schema.Validate`; both engines enforce them):
+
+- `Stored` must be `true`. **`VIRTUAL` is rejected** — PostgreSQL cannot express it — so a `Stored=false` generated column fails validation and is never emitted.
+- A generated column must not also have a `Default`.
+- A generated column must not be part of a `primary_key`.
+
+Native inspection reconstructs a STORED generated column as `exact` (SQLite `pragma_table_xinfo` hidden=3, expression recovered from the `CREATE TABLE` text; PostgreSQL `is_generated='ALWAYS'`, expression from `generation_expression`). A `VIRTUAL` (SQLite hidden=2), identity, or out-of-grammar generation expression column is placed in `Inspection.Unresolved` and blocks `Inspection.Exact`.
+
 ## 2. Constraint forms
 
 `Constraint{Kind, Columns, References, Expression}` (`compat/schema.go`, compiled in `compat/ddl.go`):
@@ -194,6 +206,7 @@ The layer never silently degrades. These are rejected with explicit errors:
 - Unsupported PostgreSQL `DEFAULT` casts (only a known set is accepted: `text`, `character varying`, `character`, `boolean`, `smallint`, `integer`, `bigint`, `numeric`, `real`, `double precision`, `date`, `timestamp without time zone`, `timestamp with time zone`, `uuid`, `json`, `jsonb`).
 - Routines with a non-void return, languages other than `plpgsql`/`sql`, or parameters with `DEFAULT`/`=`.
 - `vector` without exactly one positive dimension argument.
+- A `VIRTUAL` generated column (`Generated.Stored = false`), a generated column that also has a `Default`, or a generated column that is part of a `primary_key`.
 - `Version{0,0,0}` as a source/destination version (invalid dedup key).
 - Trigger/routine actions outside the three canonical forms.
 

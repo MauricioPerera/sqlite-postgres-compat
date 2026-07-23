@@ -10,7 +10,7 @@
 
 | Familia | AST canónico | Catálogo externo traducible | Fuera de cobertura actual |
 |---|---|---|---|
-| Tablas y columnas | Tipos escalares del modelo | Afinidades SQLite y tipos PostgreSQL conocidos | Tipos de usuario, dominios, arrays y semántica específica no modelada |
+| Tablas y columnas | Tipos escalares del modelo; columnas generadas `STORED` (`GENERATED ALWAYS AS (<expr>) STORED`) con expresión en la gramática canónica | Afinidades SQLite y tipos PostgreSQL conocidos; columnas generadas `STORED` reconstruidas desde el catálogo (`pragma_table_xinfo` hidden=3 en SQLite, `is_generated='ALWAYS'` en PostgreSQL) | Tipos de usuario, dominios, arrays y semántica específica no modelada; columnas generadas `VIRTUAL` (PostgreSQL no las soporta), de identidad, y expresiones de generación fuera de la gramática (quedan `No resuelto`) |
 | Clave primaria y `UNIQUE` | Simples y compuestas | Pragmas SQLite y `pg_constraint` | Diferimiento y extensiones específicas |
 | Clave foránea | Compuesta; `NO ACTION`, `RESTRICT`, `CASCADE`, `SET NULL`, `SET DEFAULT` | Acciones comunes de ambos catálogos | `MATCH` no común, diferimiento y extensiones del motor |
 | `CHECK` | Expresiones del AST común | Operadores, literales y funciones comunes reconocidas | Expresiones arbitrarias del dialecto |
@@ -23,6 +23,12 @@
 | Vector | `vector(N)` con dimensión canónica | `F32_BLOB(N)` de libSQL y `vector` de pgvector se reconocen | Tipos vectoriales no modelados, índices ANN y funciones de distancia nativas |
 | Timestamp | Texto canónico RFC3339Nano | Tipos timestamp se reconocen | Semántica arbitraria de zona, infinidades y funciones específicas |
 | Búsqueda textual | Tokenización Unicode determinista en Go | No se traduce FTS nativo | Ranking, stemming, diccionarios, FTS5, `tsvector`/`tsquery` arbitrarios |
+
+## Columnas generadas
+
+Se soportan columnas generadas **`STORED`** (`col TIPO GENERATED ALWAYS AS (<expr>) STORED`), sintaxis idéntica en SQLite (≥ 3.31) y PostgreSQL (≥ 12). La expresión de generación usa la gramática canónica de expresiones (misma que `CHECK`/`DEFAULT`). Ambos motores recomputan el valor de forma determinista en el destino: esa recomputación idéntica **es** la prueba de equivalencia. La cadena de datos nunca escribe una columna generada — se excluye de la lista de columnas de todo `INSERT`/`UPDATE` (snapshot y replicación) y el motor destino la recalcula.
+
+Restricciones (validadas en `Schema.Validate`, ambos motores las imponen): una columna generada no puede tener `DEFAULT` a la vez, no puede formar parte de una clave primaria, y **`VIRTUAL` se rechaza explícitamente** (PostgreSQL no lo soporta) — nunca se emite; en inspección nativa una columna `VIRTUAL`, de identidad o con expresión fuera de la gramática queda `No resuelto` (`Exact = false`), no degradada en silencio.
 
 ## Gramática de expresiones y funciones
 

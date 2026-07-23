@@ -225,7 +225,16 @@ func insertRow(ctx context.Context, tx *sql.Tx, engine Engine, table Table, row 
 	columns := make([]string, 0, len(table.Columns))
 	placeholders := make([]string, 0, len(table.Columns))
 	arguments := make([]any, 0, len(table.Columns))
-	for index, column := range table.Columns {
+	for _, column := range table.Columns {
+		// A generated (STORED) column is computed by the engine and cannot appear
+		// in the column list of an INSERT — both engines reject writing to it. Its
+		// captured/snapshot value is intentionally not sent; the destination
+		// recomputes it from the same deterministic expression. Placeholders are
+		// numbered by insertion order (len(arguments)+1), so skipping a generated
+		// column leaves no gap in the $N sequence on PostgreSQL.
+		if column.Generated != nil {
+			continue
+		}
 		value, ok := row[column.Name]
 		if !ok {
 			return fmt.Errorf("import %s: missing column %q", table.Name, column.Name)
@@ -235,7 +244,7 @@ func insertRow(ctx context.Context, tx *sql.Tx, engine Engine, table Table, row 
 			return fmt.Errorf("import %s.%s: %w", table.Name, column.Name, err)
 		}
 		columns = append(columns, quoteIdentifier(column.Name))
-		placeholders = append(placeholders, placeholder(engine, index+1))
+		placeholders = append(placeholders, placeholder(engine, len(arguments)+1))
 		arguments = append(arguments, argument)
 	}
 	statement := "INSERT INTO " + quoteIdentifier(table.Name) + " (" + strings.Join(columns, ", ") + ") VALUES (" + strings.Join(placeholders, ", ") + ")"

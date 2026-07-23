@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 type CatalogObject struct {
@@ -152,8 +153,22 @@ func (store *Store) inspectSQLiteTable(ctx context.Context, name, definition str
 				column.Default = &expression
 			}
 		}
-		if hidden != 0 {
-			unresolved = append(unresolved, CatalogObject{Kind: "generated_column", Name: name + "." + columnName, Reason: "generated and hidden columns require canonical generation semantics"})
+		// pragma_table_xinfo.hidden: 0 normal, 1 hidden, 2 VIRTUAL generated,
+		// 3 STORED generated. Only STORED (3) is canonical; recover its generation
+		// expression from the CREATE TABLE SQL (the pragma does not expose it) and
+		// parse it with the canonical grammar. VIRTUAL (2) and hidden (1) columns
+		// stay unresolved so the inspection is not reported as exact.
+		if hidden == 3 {
+			exprText, ok := extractGeneratedExpression(definition, columnName)
+			if !ok {
+				unresolved = append(unresolved, CatalogObject{Kind: "generated_column", Name: name + "." + columnName, Reason: "generated column expression could not be recovered from the table definition"})
+			} else if expression, err := parseCatalogExpression(exprText); err != nil {
+				unresolved = append(unresolved, CatalogObject{Kind: "generated_column", Name: name + "." + columnName, Definition: exprText, Reason: err.Error()})
+			} else {
+				column.Generated = &GeneratedColumn{Expression: expression, Stored: true}
+			}
+		} else if hidden != 0 {
+			unresolved = append(unresolved, CatalogObject{Kind: "generated_column", Name: name + "." + columnName, Reason: "VIRTUAL generated and hidden columns require canonical generation semantics"})
 		}
 		table.Columns = append(table.Columns, column)
 		if pk > 0 {
@@ -422,7 +437,7 @@ func (store *Store) inspectPostgresColumns(ctx context.Context, inspection *Insp
 					JOIN pg_namespace n ON n.oid = cl.relnamespace
 					WHERE n.nspname = c.table_schema AND cl.relname = c.table_name AND a.attname = c.column_name AND NOT a.attisdropped), -1)
 				ELSE -1 END AS atttypmod,
-			c.is_nullable, c.column_default, c.is_identity, c.is_generated
+			c.is_nullable, c.column_default, c.is_identity, c.is_generated, c.generation_expression
 			FROM information_schema.columns c
 			WHERE c.table_schema = current_schema() AND c.table_name NOT IN ($1, $2, $3, $4)
 			AND c.table_name IN (SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE')
@@ -434,9 +449,9 @@ func (store *Store) inspectPostgresColumns(ctx context.Context, inspection *Insp
 	var order []string
 	for rows.Next() {
 		var tableName, columnName, dataType, udtName, nullable, identity, generated string
-		var defaultSQL sql.NullString
+		var defaultSQL, generationExpr sql.NullString
 		var atttypmod int
-		if err := rows.Scan(&tableName, &columnName, &dataType, &udtName, &atttypmod, &nullable, &defaultSQL, &identity, &generated); err != nil {
+		if err := rows.Scan(&tableName, &columnName, &dataType, &udtName, &atttypmod, &nullable, &defaultSQL, &identity, &generated, &generationExpr); err != nil {
 			return nil, nil, err
 		}
 		table := tables[tableName]
@@ -461,8 +476,21 @@ func (store *Store) inspectPostgresColumns(ctx context.Context, inspection *Insp
 				column.Default = &expression
 			}
 		}
-		if identity == "YES" || generated != "NEVER" {
-			inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "generated_column", Name: tableName + "." + columnName, Reason: "identity and generated columns require canonical generation semantics"})
+		// is_identity='YES' is an identity column (no canonical form). is_generated
+		// ='ALWAYS' is a STORED generated column (PostgreSQL only supports STORED);
+		// reconstruct it from generation_expression using the same canonical default
+		// parser (it strips the deparser's casts and wrapping parens). Anything that
+		// does not parse stays unresolved.
+		if identity == "YES" {
+			inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "generated_column", Name: tableName + "." + columnName, Reason: "identity columns require canonical generation semantics"})
+		} else if generated == "ALWAYS" {
+			if !generationExpr.Valid {
+				inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "generated_column", Name: tableName + "." + columnName, Reason: "generated column has no readable generation expression"})
+			} else if expression, err := parsePostgresCatalogDefault(generationExpr.String); err != nil {
+				inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "generated_column", Name: tableName + "." + columnName, Definition: generationExpr.String, Reason: err.Error()})
+			} else {
+				column.Generated = &GeneratedColumn{Expression: expression, Stored: true}
+			}
 		}
 		table.Columns = append(table.Columns, column)
 	}
@@ -827,6 +855,96 @@ func extractCheckExpressions(definition string) []string {
 		offset = end + 1
 	}
 	return expressions
+}
+
+// extractGeneratedExpression returns the generation expression text of the named
+// column from a CREATE TABLE definition — the parenthesized <expr> in
+// `<column> ... GENERATED ALWAYS AS (<expr>) [STORED|VIRTUAL]`. SQLite's
+// pragma_table_xinfo reports that a column is generated (hidden = 2 VIRTUAL,
+// 3 STORED) but not the expression itself, so it is recovered from the stored
+// SQL. It reports false when the column is not found or has no GENERATED clause.
+func extractGeneratedExpression(definition, column string) (string, bool) {
+	open := strings.IndexByte(definition, '(')
+	if open < 0 {
+		return "", false
+	}
+	end := matchingParenthesis(definition, open)
+	if end < 0 {
+		return "", false
+	}
+	for _, segment := range splitTopLevelCommas(definition[open+1 : end]) {
+		name, rest, ok := leadingIdentifier(segment)
+		if !ok || !strings.EqualFold(name, column) {
+			continue
+		}
+		gen := indexWord(rest, "GENERATED")
+		if gen < 0 {
+			return "", false
+		}
+		paren := strings.IndexByte(rest[gen:], '(')
+		if paren < 0 {
+			return "", false
+		}
+		paren += gen
+		close := matchingParenthesis(rest, paren)
+		if close < 0 {
+			return "", false
+		}
+		return strings.TrimSpace(rest[paren+1 : close]), true
+	}
+	return "", false
+}
+
+// leadingIdentifier splits a column-definition segment into its leading column
+// name and the remainder. The name may be double-quoted (with "" escapes) or a
+// bare identifier terminated by whitespace. It reports false when the segment has
+// no identifier (e.g. a table-level CONSTRAINT/PRIMARY KEY/CHECK/FOREIGN clause).
+func leadingIdentifier(segment string) (string, string, bool) {
+	text := strings.TrimLeft(segment, " \t\r\n")
+	if text == "" {
+		return "", "", false
+	}
+	if text[0] == '"' {
+		var builder strings.Builder
+		for i := 1; i < len(text); i++ {
+			if text[i] == '"' {
+				if i+1 < len(text) && text[i+1] == '"' {
+					builder.WriteByte('"')
+					i++
+					continue
+				}
+				return builder.String(), text[i+1:], true
+			}
+			builder.WriteByte(text[i])
+		}
+		return "", "", false
+	}
+	i := 0
+	for i < len(text) && (unicode.IsLetter(rune(text[i])) || unicode.IsDigit(rune(text[i])) || text[i] == '_') {
+		i++
+	}
+	if i == 0 {
+		return "", "", false
+	}
+	return text[:i], text[i:], true
+}
+
+// indexWord returns the index of keyword in text at a word boundary (case
+// insensitive), or -1. It prevents matching "GENERATED" inside a longer token.
+func indexWord(text, keyword string) int {
+	upper := strings.ToUpper(text)
+	keyword = strings.ToUpper(keyword)
+	for offset := 0; ; {
+		position := strings.Index(upper[offset:], keyword)
+		if position < 0 {
+			return -1
+		}
+		position += offset
+		if wordBoundary(text, position-1) && wordBoundary(text, position+len(keyword)) {
+			return position
+		}
+		offset = position + len(keyword)
+	}
 }
 
 func extractIndexPredicate(definition string) string {

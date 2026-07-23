@@ -72,6 +72,57 @@ func TestInspectExternalSQLiteCatalog(t *testing.T) {
 	}
 }
 
+// TestInspectExternalSQLiteGeneratedStoredColumn proves native catalog inspection
+// reconstructs a STORED generated column exactly (Exact, no Unresolved) with its
+// generation expression recovered from the CREATE TABLE SQL, while a VIRTUAL
+// generated column is reported unresolved (never silently accepted).
+func TestInspectExternalSQLiteGeneratedStoredColumn(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.DB.Exec(`CREATE TABLE gen_items (id INTEGER PRIMARY KEY, price INTEGER NOT NULL, quantity INTEGER NOT NULL, total INTEGER GENERATED ALWAYS AS (price * quantity) STORED)`); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := store.InspectSchema(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inspection.Exact || len(inspection.Unresolved) != 0 {
+		t.Fatalf("STORED generated column must inspect as exact: %+v", inspection)
+	}
+	var total *Column
+	for i := range inspection.Schema.Tables[0].Columns {
+		if inspection.Schema.Tables[0].Columns[i].Name == "total" {
+			total = &inspection.Schema.Tables[0].Columns[i]
+		}
+	}
+	if total == nil || total.Generated == nil || !total.Generated.Stored {
+		t.Fatalf("total column was not reconstructed as STORED generated: %+v", inspection.Schema.Tables[0].Columns)
+	}
+	if total.Generated.Expression.Kind != "mul" || len(total.Generated.Expression.Args) != 2 {
+		t.Fatalf("generation expression not reconstructed: %+v", total.Generated.Expression)
+	}
+
+	virtual, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer virtual.Close()
+	if _, err := virtual.DB.Exec(`CREATE TABLE gen_virtual (id INTEGER PRIMARY KEY, price INTEGER NOT NULL, doubled INTEGER GENERATED ALWAYS AS (price * 2) VIRTUAL)`); err != nil {
+		t.Fatal(err)
+	}
+	vi, err := virtual.InspectSchema(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vi.Exact || len(vi.Unresolved) == 0 {
+		t.Fatalf("VIRTUAL generated column must be unresolved, not exact: %+v", vi)
+	}
+}
+
 func TestReservedMetadataTableIsRejected(t *testing.T) {
 	for _, name := range []string{schemaMetadataTable, appliedChangesTable, captureStateTable, changeJournalTable} {
 		schema := Schema{Tables: []Table{{Name: name, Columns: []Column{{Name: "x", Type: Type{Family: TextType}}}}}}
