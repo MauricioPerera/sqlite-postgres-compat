@@ -864,3 +864,48 @@ func TestCutoverWithSchemaRefSucceeds(t *testing.T) {
 		t.Fatalf("expected 2 migrated rows, got %d", count)
 	}
 }
+
+// TestCutoverCLINotExactStderrOnce guards AUDIT5 §4.6 on the cutover
+// ERR_AUDIT_NOT_EXACT path: the []Finding array and the error line must each
+// appear on stderr EXACTLY ONCE (the former code printed the error line twice —
+// once explicitly and once via cliout.Die), with the typed envelope on stdout
+// and exit 1. The audit fails before any store is opened, so this needs no
+// PostgreSQL and does not pass --dry-run.
+func TestCutoverCLINotExactStderrOnce(t *testing.T) {
+	dir := t.TempDir()
+	schema := cutoverSchema("fixb5_cutover_notexact")
+	configuration := map[string]any{
+		"source_dsn":      "file:" + filepath.ToSlash(filepath.Join(dir, "src.db")),
+		"destination_dsn": "file:/nonexistent/not-reached.db",
+		"contract": compat.Contract{
+			Source:           compat.Target{Engine: compat.SQLite, Version: compat.Version{Major: 3}},
+			Destination:      compat.Target{Engine: compat.Postgres, Version: compat.Version{Major: 17, Minor: 5}},
+			RequiredFeatures: []compat.Feature{compat.Views},
+		},
+		"schema": schema,
+	}
+	configPath := writeCutoverConfig(t, dir, "cutover.json", configuration)
+
+	stdout, stderr, exitCode := runBuiltCLI(t, "cmd/compat", "cutover", configPath)
+	if exitCode != 1 {
+		t.Fatalf("expected exit 1 for not-exact cutover, got %d\nstdout:\n%s\nstderr:\n%s", exitCode, stdout, stderr)
+	}
+	parsed := firstErrorJSONLine(t, stdout)
+	if code, _ := parsed["code"].(string); code != "ERR_AUDIT_NOT_EXACT" {
+		t.Fatalf("expected code=ERR_AUDIT_NOT_EXACT, got %v\nstdout:\n%s", parsed["code"], stdout)
+	}
+	// The structured []Finding payload is a single JSON line on stderr.
+	findingsLines := 0
+	for _, line := range strings.Split(stderr, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "[") {
+			findingsLines++
+		}
+	}
+	if findingsLines != 1 {
+		t.Fatalf("expected exactly one findings JSON line on stderr, got %d\nstderr:\n%s", findingsLines, stderr)
+	}
+	// The error line appears exactly once on stderr (not twice).
+	if got := strings.Count(stderr, `feature "views" is unknown`); got != 1 {
+		t.Fatalf("expected the error line once on stderr, got %d\nstderr:\n%s", got, stderr)
+	}
+}

@@ -145,9 +145,9 @@ func TestEmitJSON(t *testing.T) {
 
 func TestSplitArgs(t *testing.T) {
 	t.Run("known flags and positionals", func(t *testing.T) {
-		present, positional, unexpected, ok := SplitArgs([]string{"--dry-run"}, []string{"--dry-run", "cfg.json"})
-		if !ok || unexpected != "" {
-			t.Fatalf("ok=%v unexpected=%q", ok, unexpected)
+		present, positional, unexpected, dup, ok := SplitArgs([]string{"--dry-run"}, []string{"--dry-run", "cfg.json"})
+		if !ok || unexpected != "" || dup != "" {
+			t.Fatalf("ok=%v unexpected=%q dup=%q", ok, unexpected, dup)
 		}
 		if !present["--dry-run"] {
 			t.Errorf("present[--dry-run]=false, want true")
@@ -157,16 +157,19 @@ func TestSplitArgs(t *testing.T) {
 		}
 	})
 	t.Run("unknown flag rejected", func(t *testing.T) {
-		_, _, unexpected, ok := SplitArgs(nil, []string{"--bogus"})
+		_, _, unexpected, dup, ok := SplitArgs(nil, []string{"--bogus"})
 		if ok {
 			t.Errorf("ok=true, want false")
 		}
 		if unexpected != "--bogus" {
 			t.Errorf("unexpected=%q, want --bogus", unexpected)
 		}
+		if dup != "" {
+			t.Errorf("dup=%q, want empty", dup)
+		}
 	})
 	t.Run("empty known flags accepts only positionals", func(t *testing.T) {
-		present, positional, _, ok := SplitArgs(nil, []string{"a.json", "b.json"})
+		present, positional, _, _, ok := SplitArgs(nil, []string{"a.json", "b.json"})
 		if !ok {
 			t.Fatalf("ok=false")
 		}
@@ -178,12 +181,55 @@ func TestSplitArgs(t *testing.T) {
 		}
 	})
 	t.Run("flag never consumes following token", func(t *testing.T) {
-		_, positional, _, ok := SplitArgs([]string{"--dry-run"}, []string{"--dry-run", "--bogus"})
+		_, positional, _, _, ok := SplitArgs([]string{"--dry-run"}, []string{"--dry-run", "--bogus"})
 		// --bogus is unknown even though it follows --dry-run: value-less flags.
 		if ok {
 			t.Errorf("ok=true, want false (unknown flag --bogus)")
 		}
 		_ = positional
+	})
+	t.Run("duplicate recognized flag rejected", func(t *testing.T) {
+		_, _, unexpected, dup, ok := SplitArgs([]string{"--dry-run"}, []string{"--dry-run", "--dry-run", "x.json"})
+		if ok {
+			t.Errorf("ok=true, want false (duplicate --dry-run)")
+		}
+		if dup != "--dry-run" {
+			t.Errorf("dup=%q, want --dry-run", dup)
+		}
+		if unexpected != "" {
+			t.Errorf("unexpected=%q, want empty (duplicate not unexpected)", unexpected)
+		}
+	})
+	t.Run("dash-dash ends flags", func(t *testing.T) {
+		// Everything after "--" is positional even if it starts with "-".
+		present, positional, unexpected, dup, ok := SplitArgs([]string{"--dry-run"}, []string{"--dry-run", "--", "--raro.json"})
+		if !ok || unexpected != "" || dup != "" {
+			t.Fatalf("ok=%v unexpected=%q dup=%q", ok, unexpected, dup)
+		}
+		if !present["--dry-run"] {
+			t.Errorf("present[--dry-run]=false, want true")
+		}
+		if len(positional) != 1 || positional[0] != "--raro.json" {
+			t.Errorf("positional=%v, want [--raro.json]", positional)
+		}
+	})
+	t.Run("dash-dash itself is discarded", func(t *testing.T) {
+		_, positional, _, _, ok := SplitArgs(nil, []string{"--", "x.json"})
+		if !ok {
+			t.Fatalf("ok=false")
+		}
+		if len(positional) != 1 || positional[0] != "x.json" {
+			t.Errorf("positional=%v, want [x.json]", positional)
+		}
+	})
+	t.Run("dash-dash with no following token yields no positionals", func(t *testing.T) {
+		_, positional, _, _, ok := SplitArgs(nil, []string{"--"})
+		if !ok {
+			t.Fatalf("ok=false")
+		}
+		if len(positional) != 0 {
+			t.Errorf("positional=%v, want empty", positional)
+		}
 	})
 }
 
@@ -308,7 +354,7 @@ func TestReplicationCode(t *testing.T) {
 
 func TestParseArgsStrict_Happy(t *testing.T) {
 	present, positional := ParseArgsStrict([]string{"--dry-run"}, []string{"--dry-run", "cutover.json"}, 1,
-		"hint", "unexpected flag %q", "needs one arg")
+		"hint", "unexpected flag %q", "duplicate flag %q", "needs one arg")
 	if !present["--dry-run"] {
 		t.Errorf("present[--dry-run]=false")
 	}
@@ -317,9 +363,16 @@ func TestParseArgsStrict_Happy(t *testing.T) {
 	}
 
 	// No flags, single positional.
-	_, positional = ParseArgsStrict(nil, []string{"contract.json"}, 1, "h", "uf %q", "cm")
+	_, positional = ParseArgsStrict(nil, []string{"contract.json"}, 1, "h", "uf %q", "dup %q", "cm")
 	if len(positional) != 1 || positional[0] != "contract.json" {
 		t.Errorf("positional=%v", positional)
+	}
+
+	// "--" separator: a later "-"-prefixed token is positional, not a flag.
+	_, positional = ParseArgsStrict([]string{"--dry-run"}, []string{"--dry-run", "--", "--raro.json"}, 1,
+		"h", "uf %q", "dup %q", "cm")
+	if len(positional) != 1 || positional[0] != "--raro.json" {
+		t.Errorf("positional=%v, want [--raro.json]", positional)
 	}
 }
 
@@ -364,7 +417,7 @@ func envelopeFrom(t *testing.T, stdout string) errorEnvelope {
 
 func TestParseArgsStrict_UnexpectedFlagExits2(t *testing.T) {
 	code, stdout, stderr := runSubprocess(t, "unexpected", func() {
-		ParseArgsStrict(nil, []string{"--bogus"}, 1, "uso: prog <cfg>", "prog: unexpected flag %q", "prog needs one arg")
+		ParseArgsStrict(nil, []string{"--bogus"}, 1, "uso: prog <cfg>", "prog: unexpected flag %q", "prog: duplicate flag %q", "prog needs one arg")
 	})
 	if code != 2 {
 		t.Errorf("exit code = %d, want 2\nstdout=%q stderr=%q", code, stdout, stderr)
@@ -378,9 +431,54 @@ func TestParseArgsStrict_UnexpectedFlagExits2(t *testing.T) {
 	}
 }
 
+// TestParseArgsStrict_DuplicateFlagExits2 guards AUDIT5 §4.3: a recognized
+// boolean flag repeated (e.g. --dry-run --dry-run) is ERR_USAGE (exit 2) with a
+// "duplicate flag" envelope message, instead of being silently deduplicated.
+func TestParseArgsStrict_DuplicateFlagExits2(t *testing.T) {
+	code, stdout, stderr := runSubprocess(t, "duplicate", func() {
+		ParseArgsStrict([]string{"--dry-run"}, []string{"--dry-run", "--dry-run", "x.json"}, 1,
+			"uso: prog [--dry-run] <cfg>", "prog: unexpected flag %q", "prog: duplicate flag %q", "prog needs one arg")
+	})
+	if code != 2 {
+		t.Errorf("exit code = %d, want 2\nstdout=%q stderr=%q", code, stdout, stderr)
+	}
+	env := envelopeFrom(t, stdout)
+	if env.Status != "error" || env.Code != ErrUsage || env.Message != `prog: duplicate flag "--dry-run"` {
+		t.Errorf("envelope = %+v, want duplicate flag --dry-run", env)
+	}
+	if !strings.Contains(stderr, "uso: prog [--dry-run] <cfg>") {
+		t.Errorf("stderr missing usage hint: %q", stderr)
+	}
+}
+
+// TestDispatchUsageMessage guards AUDIT5 §4.5: a leading flag (a token starting
+// with "-" that is not help-ish) yields the orienting "flags must follow the
+// subcommand" message; an unknown subcommand name, an empty token, and a
+// help-ish flag all keep the generic "missing or unknown subcommand" message.
+func TestDispatchUsageMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		arg  string
+		want string
+	}{
+		{"leading flag", "--dry-run", "compat: flags must follow the subcommand (e.g. compat cutover --dry-run <config>)"},
+		{"single dash flag", "-x", "compat: flags must follow the subcommand (e.g. compat cutover --dry-run <config>)"},
+		{"unknown subcommand", "bogus", "compat: missing or unknown subcommand"},
+		{"empty", "", "compat: missing or unknown subcommand"},
+		{"help-ish --help", "--help", "compat: missing or unknown subcommand"},
+		{"help-ish -h", "-h", "compat: missing or unknown subcommand"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := DispatchUsageMessage(tc.arg); got != tc.want {
+				t.Errorf("DispatchUsageMessage(%q) = %q, want %q", tc.arg, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestParseArgsStrict_WrongCountExits2(t *testing.T) {
 	code, stdout, stderr := runSubprocess(t, "count", func() {
-		ParseArgsStrict(nil, []string{}, 1, "uso: prog <cfg>", "prog: unexpected flag %q", "prog needs one arg")
+		ParseArgsStrict(nil, []string{}, 1, "uso: prog <cfg>", "prog: unexpected flag %q", "prog: duplicate flag %q", "prog needs one arg")
 	})
 	if code != 2 {
 		t.Errorf("exit code = %d, want 2", code)

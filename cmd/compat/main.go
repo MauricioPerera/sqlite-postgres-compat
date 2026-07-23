@@ -35,7 +35,16 @@ subcomandos:
 func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
-		usageFail()
+		usageFail("")
+	}
+	// A leading "--" is the standard end-of-flags separator. At the dispatch
+	// level it means "the following token is the subcommand, not a flag", so
+	// `compat -- audit x.json` dispatches to audit just like `compat audit x.json`.
+	if args[0] == "--" {
+		args = args[1:]
+		if len(args) == 0 {
+			usageFail("")
+		}
 	}
 	switch args[0] {
 	case "audit":
@@ -47,15 +56,18 @@ func main() {
 	default:
 		// Any leading token that is not a known subcommand — including --help-ish
 		// flags like --help/-h and unknown subcommand names — is an ERR_USAGE
-		// (exit 2), never silently treated as a positional config path.
-		usageFail()
+		// (exit 2), never silently treated as a positional config path. A leading
+		// "-" that is not help-ish is a flag placed before the subcommand; the
+		// message orients the user to put flags after the subcommand.
+		usageFail(args[0])
 	}
 }
 
 // usageFail prints the top-level usage hint to stderr and emits a typed
-// ERR_USAGE envelope to stdout, exiting 2. It is the dispatch-level counterpart
-// to each subcommand's ParseArgsStrict usage path.
-func usageFail() {
+// ERR_USAGE envelope to stdout, exiting 2. firstArg is the leading token that
+// was not a recognized subcommand (empty when there was no token at all); it
+// selects the envelope message via cliout.DispatchUsageMessage.
+func usageFail(firstArg string) {
 	fmt.Fprintln(os.Stderr, usageHint)
-	cliout.Die(cliout.ErrUsage, errors.New("compat: missing or unknown subcommand"))
+	cliout.Die(cliout.ErrUsage, errors.New(cliout.DispatchUsageMessage(firstArg)))
 }

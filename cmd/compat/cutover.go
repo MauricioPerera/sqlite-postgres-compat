@@ -84,6 +84,7 @@ func runCutover(args []string) {
 	present, positional := cliout.ParseArgsStrict([]string{"--dry-run"}, args, 1,
 		"uso: compat cutover [--dry-run] <cutover.json>\nel corte del DSN de la aplicación no es responsabilidad de esta herramienta: cortá la conexión de la app manualmente tras recibir status=ready.",
 		"compat cutover: unexpected flag %q",
+		"compat cutover: duplicate flag %q",
 		"compat cutover requires exactly one cutover JSON argument")
 	dryRun := present["--dry-run"]
 	var config cutoverConfig
@@ -108,7 +109,10 @@ func runCutover(args []string) {
 		cliout.Die(cliout.ErrConfig, err)
 	}
 	if err := compat.RequireExact(findings); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		// The findings array is emitted to stderr before the typed error
+		// envelope; the error line itself is printed once (by Die below), not
+		// duplicated, so stderr carries the structured payload plus a single
+		// error line and stdout carries the typed envelope.
 		encoded, _ := json.Marshal(findings)
 		fmt.Fprintln(os.Stderr, string(encoded))
 		cliout.Die(cliout.ErrAuditNotExact, err)

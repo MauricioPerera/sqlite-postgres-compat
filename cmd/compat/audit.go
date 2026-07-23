@@ -13,6 +13,7 @@ func runAudit(args []string) {
 	_, positional := cliout.ParseArgsStrict(nil, args, 1,
 		"uso: compat audit <contract.json>",
 		"compat audit: unexpected flag %q",
+		"compat audit: duplicate flag %q",
 		"compat audit requires exactly one contract JSON argument")
 
 	var contract compat.Contract

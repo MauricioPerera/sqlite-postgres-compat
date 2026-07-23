@@ -49,7 +49,7 @@ Ejecuta:
 go run ./cmd/compat copy .\examples\migration.example.json
 ```
 
-El flujo audita las capacidades inferidas, exporta el origen, importa el destino y vuelve a exportarlo para verificar su hash canónico. El destino debe estar vacío para los objetos descritos. El proceso termina con código `1` ante cualquier error o falta de equivalencia exacta, y con código de salida 2 si el número de argumentos no es exactamente uno o se pasa un flag inesperado. En lugar de inlinear `schema`, podés usar `schema_ref` (ruta a un JSON con el `compat.Schema` canónico, resuelta relativa al archivo de config); debe haber exactamente uno de `schema` o `schema_ref`, si no `ERR_CONFIG` (ver cutover para el detalle). En fallo: en `ERR_AUDIT_NOT_EXACT` imprime el arreglo `[]Finding` a stderr antes del envelope; en `ERR_VERIFY_DIVERGED` (digests distintos) imprime el `VerificationReport` a stderr antes del envelope, así los digests quedan como JSON parseable y no sólo como texto libre en el `message`.
+El flujo audita las capacidades inferidas, exporta el origen, importa el destino y vuelve a exportarlo para verificar su hash canónico. El destino debe estar vacío para los objetos descritos. El proceso termina con código `1` ante cualquier error o falta de equivalencia exacta, y con código de salida 2 si el número de argumentos no es exactamente uno, se pasa un flag inesperado o se repite un flag reconocido. En lugar de inlinear `schema`, podés usar `schema_ref` (ruta a un JSON con el `compat.Schema` canónico, resuelta relativa al archivo de config); debe haber exactamente uno de `schema` o `schema_ref`, si no `ERR_CONFIG` (ver cutover para el detalle). En fallo: en `ERR_AUDIT_NOT_EXACT` imprime el arreglo `[]Finding` a stderr antes del envelope; en `ERR_VERIFY_DIVERGED` (digests distintos) imprime el `VerificationReport` a stderr antes del envelope, así los digests quedan como JSON parseable y no sólo como texto libre en el `message`. En ambos caminos la línea de error aparece en stderr **una sola vez** (no duplicada), junto con el payload estructurado; el envelope tipado va en stdout.
 
 ## Usar el paquete Go
 
@@ -219,7 +219,7 @@ En lugar de inlinear el `schema`, podés apuntar `schema_ref` a un archivo JSON 
 
 Debe haber **exactamente uno** de `schema` o `schema_ref`: ambos o ninguno es `ERR_CONFIG`. Un archivo `schema_ref` ilegible o con JSON inválido también es `ERR_CONFIG`. `compat copy` soporta `schema_ref` igual que `compat cutover`.
 
-El flujo: audita las capacidades inferidas (detiene con código `1` si alguna no es exacta), instala captura en el origen, exporta el snapshot y lo importa en el destino, drena el journal leyendo lotes y aplicándolos con `ApplyChangesTolerant` hasta `drain_polls` lecturas vacías consecutivas, y verifica los digests. Si son equivalentes imprime `{"status":"ready","source_digest":...,"destination_digest":...,"changes_applied":N}` y termina con código `0`; si divergen imprime `{"status":"diverged","code":"ERR_VERIFY_DIVERGED",...}` y termina con código `1`. Código de salida `2` si el número de argumentos no es exactamente uno o se pasa un flag inesperado. El corte del DSN de la aplicación NO es responsabilidad de esta herramienta: cortá la conexión de la app manualmente tras recibir `status=ready`.
+El flujo: audita las capacidades inferidas (detiene con código `1` si alguna no es exacta), instala captura en el origen, exporta el snapshot y lo importa en el destino, drena el journal leyendo lotes y aplicándolos con `ApplyChangesTolerant` hasta `drain_polls` lecturas vacías consecutivas, y verifica los digests. Si son equivalentes imprime `{"status":"ready","source_digest":...,"destination_digest":...,"changes_applied":N}` y termina con código `0`; si divergen imprime `{"status":"diverged","code":"ERR_VERIFY_DIVERGED",...}` y termina con código `1`. Si la auditoría no es exacta, imprime el arreglo `[]Finding` a stderr y la línea de error a stderr **una sola vez**, y el envelope tipado en stdout (código `1`). Código de salida `2` si el número de argumentos no es exactamente uno, se pasa un flag inesperado o se repite un flag reconocido. El corte del DSN de la aplicación NO es responsabilidad de esta herramienta: cortá la conexión de la app manualmente tras recibir `status=ready`.
 
 ### Plan de sólo lectura con `--dry-run`
 
@@ -243,6 +243,10 @@ go run ./cmd/compat cutover --dry-run .\cutover.json
 
 `--dry-run` **no escribe nada** en origen ni destino: no instala captura, no crea tablas, no importa snapshot, no escribe journal. Si la auditoría no es exacta o una conexión falla, emite el JSON de error tipado correspondiente y termina con código `1`.
 
+### Convenciones de parseo de flags
+
+Todos los flags son booleanos sin valor (p. ej. `--dry-run`), válidos en cualquier posición **después** del subcomando; un flag antes del subcomando (`compat --dry-run cutover x`) es `ERR_USAGE` (exit 2) con un mensaje orientador. Un flag reconocido repetido (`--dry-run --dry-run`) es `ERR_USAGE` (exit 2) con `duplicate flag`, no se deduplica en silencio. Un `--` suelto es el separador end-of-flags estándar: todo lo que sigue es posicional aunque empiece con `-` (así `compat audit -- --raro.json` toma `--raro.json` como ruta), y a nivel dispatch `compat -- audit x.json` despacha a `audit`.
+
 ### Códigos de error tipados (los 3 subcomandos)
 
 Ante cualquier fallo, cada subcomando sale con su código actual (`1`, o `2` para `ERR_USAGE`) y emite una señal JSON legible por máquina. La forma de esa señal depende del camino de fallo, así que un agente debe parsear el contrato por caso en vez de asumir un único layout fijo:
@@ -254,13 +258,13 @@ Ante cualquier fallo, cada subcomando sale con su código actual (`1`, o `2` par
 ```
 
 - **`compat cutover` diverged.** `ERR_VERIFY_DIVERGED` emite **una sola** línea JSON en stdout — el `cutoverReport` con el `code` tipado embebido (`{"status":"diverged","code":"ERR_VERIFY_DIVERGED",...}`). No hay un envelope `{"status":"error",...}` separado en este camino.
-- **`compat copy` not-exact o diverged.** Antes del envelope de error simple en stdout, `compat copy` emite a **stderr** un payload JSON estructurado: el arreglo `[]Finding` en `ERR_AUDIT_NOT_EXACT`, o el objeto `VerificationReport` en `ERR_VERIFY_DIVERGED`. El envelope plano igual sigue en stdout con el mismo `code`; un agente lee el detalle estructurado de stderr y el código tipado de stdout.
+- **`compat copy` not-exact o diverged.** Antes del envelope de error simple en stdout, `compat copy` emite a **stderr** un payload JSON estructurado: el arreglo `[]Finding` en `ERR_AUDIT_NOT_EXACT`, o el objeto `VerificationReport` en `ERR_VERIFY_DIVERGED`. La línea de error se imprime a stderr **una sola vez** (junto con el payload), y el envelope plano sigue en stdout con el mismo `code`; un agente lee el detalle estructurado de stderr y el código tipado de stdout. (`compat cutover` not-exact sigue el mismo patrón de stderr-una-vez para su arreglo `[]Finding`.)
 
 Cada línea de envelope es un objeto JSON parseable (el mensaje va JSON-encodeado, así que los newlines embebidos nunca la rompen). Ramificá por `code`. La taxonomía es cerrada; el CLI elige el código más específico aplicable. El detalle libre sigue yendo a stderr para humanos.
 
 | Código | Cuándo se emite | Exit |
 |---|---|---|
-| `ERR_USAGE` | Cantidad de argumentos incorrecta (o flag inesperado: cualquier argumento que empiece con `-` y no sea un flag reconocido, p. ej. `--bogus`). | `2` |
+| `ERR_USAGE` | Cantidad de argumentos incorrecta, flag inesperado (cualquier argumento que empiece con `-` y no sea un flag reconocido, p. ej. `--bogus`), flag reconocido repetido (p. ej. `--dry-run --dry-run`), o subcomando faltante/desconocido. Un flag antes del subcomando (p. ej. `compat --dry-run cutover x`) también es `ERR_USAGE` con un mensaje orientador que indica que los flags van después del subcomando. | `2` |
 | `ERR_CONFIG` | La config no se puede leer, falla el decode, o `Audit` rechaza el contrato. Toda config se decodifica con `json.Decoder.DisallowUnknownFields`, así que una key desconocida es un error explícito (no se dropea en silencio); una violación de `schema`/`schema_ref` (ambos, ninguno, o un archivo `schema_ref` ilegible/JSON inválido) también es `ERR_CONFIG`. | `1` |
 | `ERR_AUDIT_NOT_EXACT` | Una feature requerida (o inferida) no es `exact` (`RequireExact` falla). `compat audit` imprime el arreglo de findings a stdout y después este envelope; `compat copy` y `compat cutover` imprimen el arreglo de findings a stderr y después este envelope. | `1` |
 | `ERR_CONNECT_SOURCE` | No se puede abrir o hacer ping al store origen. | `1` |

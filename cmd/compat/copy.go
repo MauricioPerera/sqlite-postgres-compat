@@ -28,6 +28,7 @@ func runCopy(args []string) {
 	_, positional := cliout.ParseArgsStrict(nil, args, 1,
 		"uso: compat copy <migration.json>",
 		"compat copy: unexpected flag %q",
+		"compat copy: duplicate flag %q",
 		"compat copy requires exactly one migration JSON argument")
 	var config migrationConfig
 	if err := cliout.DecodeFileStrict(positional[0], &config); err != nil {
@@ -50,8 +51,9 @@ func runCopy(args []string) {
 		// The full findings array is emitted to stderr before the typed error
 		// envelope, mirroring compat cutover exactly: an agent debugging a
 		// non-exact audit via compat copy gets every feature verdict, not just
-		// the first failing one carried in the envelope's message.
-		fmt.Fprintln(os.Stderr, err)
+		// the first failing one carried in the envelope's message. The error
+		// line itself is printed once (by Die below); the structured findings
+		// payload and the typed stdout envelope are the machine-readable parts.
 		encoded, _ := json.Marshal(findings)
 		fmt.Fprintln(os.Stderr, string(encoded))
 		cliout.Die(cliout.ErrAuditNotExact, err)
@@ -94,8 +96,9 @@ func runCopy(args []string) {
 		// The structured VerificationReport (carrying both digests) is emitted to
 		// stderr before the typed error envelope, consistent with the findings
 		// path above: the digests survive as parseable JSON rather than only as
-		// free text inside the envelope's message field.
-		fmt.Fprintln(os.Stderr, err)
+		// free text inside the envelope's message field. The error line itself is
+		// printed once (by Die below); the report payload (stderr) and the typed
+		// stdout envelope are the machine-readable parts.
 		encoded, _ := json.Marshal(report)
 		fmt.Fprintln(os.Stderr, string(encoded))
 		cliout.Die(cliout.ErrVerifyDiverged, err)

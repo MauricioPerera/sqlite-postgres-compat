@@ -122,53 +122,81 @@ func EmitJSON(v any) error {
 
 // SplitArgs partitions a CLI argument list into recognized boolean flags and
 // positional arguments. Every flag in this CLI surface is value-less (e.g.
-// `--dry-run`), so flags never consume the following token. A token that begins
-// with "-" and is not one of knownFlags is an unexpected flag: ok is false and
-// unexpected is the offending token, so the caller emits ErrUsage (exit 2). This
-// makes ERR_USAGE actually cover "unexpected flag" as the docs claim, instead of
-// letting an unknown flag fall through to the positional config path.
+// `--dry-run`), so flags never consume the following token.
+//
+// A bare "--" token is the standard end-of-flags separator: once seen, every
+// later token is positional even if it begins with "-" (so `compat audit --
+// --raro.json` treats `--raro.json` as the config path), and "--" itself is
+// discarded. This lets a user pass a config path that starts with "-".
+//
+// A token that begins with "-" (and is not "--") and is not one of knownFlags
+// is an unexpected flag: ok is false and unexpected is the offending token, so
+// the caller emits ErrUsage (exit 2). This makes ERR_USAGE actually cover
+// "unexpected flag" as the docs claim, instead of letting an unknown flag fall
+// through to the positional config path. A recognized flag seen more than once
+// (e.g. `--dry-run --dry-run`) is a duplicate: ok is false and duplicate is the
+// offending token, so the caller emits ErrUsage (exit 2) with a "duplicate flag"
+// message — a repeated boolean flag usually signals a user mistake that should
+// not pass unnoticed.
 //
 // present holds the recognized flags that were seen (empty when knownFlags is
 // empty, e.g. for the audit/copy subcommands). positional holds the non-flag
 // tokens in order; the caller still validates the expected count.
-func SplitArgs(knownFlags []string, args []string) (present map[string]bool, positional []string, unexpected string, ok bool) {
+func SplitArgs(knownFlags []string, args []string) (present map[string]bool, positional []string, unexpected string, duplicate string, ok bool) {
 	known := make(map[string]bool, len(knownFlags))
 	for _, f := range knownFlags {
 		known[f] = true
 	}
 	present = make(map[string]bool)
+	endOfFlags := false
 	for _, a := range args {
+		if endOfFlags {
+			positional = append(positional, a)
+			continue
+		}
+		if a == "--" {
+			endOfFlags = true
+			continue
+		}
 		if strings.HasPrefix(a, "-") {
 			if known[a] {
+				if present[a] {
+					return nil, nil, "", a, false
+				}
 				present[a] = true
 				continue
 			}
-			return nil, nil, a, false
+			return nil, nil, a, "", false
 		}
 		positional = append(positional, a)
 	}
-	return present, positional, "", true
+	return present, positional, "", "", true
 }
 
 // ParseArgsStrict is the shared front-end of every compat CLI: it partitions
 // args into known boolean flags and positional arguments, rejects any unknown
-// leading-dash token as ERR_USAGE (exit 2), and requires exactly wantN
-// positional arguments. On a violation it prints hint to stderr, emits the
-// ERR_USAGE envelope to stdout, and exits — it never returns on a violation. On
-// success it returns the recognized flags that were seen and the positional
-// tokens in order; the caller owns any flag-specific logic (e.g. --dry-run).
+// leading-dash token as ERR_USAGE (exit 2), rejects a duplicated recognized
+// flag as ERR_USAGE (exit 2), and requires exactly wantN positional arguments.
+// On a violation it prints hint to stderr, emits the ERR_USAGE envelope to
+// stdout, and exits — it never returns on a violation. On success it returns
+// the recognized flags that were seen and the positional tokens in order; the
+// caller owns any flag-specific logic (e.g. --dry-run).
 //
 // hint is the stderr usage hint printed before the envelope; unexpectedMsg is
 // the envelope message for an unexpected flag (formatted with %q and the
-// offending token); countMsg is the envelope message for a wrong positional
-// count. They are caller-supplied so each CLI keeps its existing, documented
-// usage strings and envelope messages byte-for-byte — this helper only removes
-// the duplicated SplitArgs + fmt.Fprintln + os.Exit plumbing, never the
-// observable text or exit codes.
-func ParseArgsStrict(knownFlags, args []string, wantN int, hint, unexpectedMsg, countMsg string) (present map[string]bool, positional []string) {
-	present, positional, unexpected, ok := SplitArgs(knownFlags, args)
+// offending token); duplicateMsg is the envelope message for a repeated
+// recognized flag (formatted with %q and the offending token); countMsg is the
+// envelope message for a wrong positional count. They are caller-supplied so
+// each CLI keeps its existing, documented usage strings and envelope messages
+// byte-for-byte — this helper only removes the duplicated SplitArgs +
+// fmt.Fprintln + os.Exit plumbing, never the observable text or exit codes.
+func ParseArgsStrict(knownFlags, args []string, wantN int, hint, unexpectedMsg, duplicateMsg, countMsg string) (present map[string]bool, positional []string) {
+	present, positional, unexpected, duplicate, ok := SplitArgs(knownFlags, args)
 	if !ok {
 		fmt.Fprintln(os.Stderr, hint)
+		if duplicate != "" {
+			Die(ErrUsage, fmt.Errorf(duplicateMsg, duplicate))
+		}
 		Die(ErrUsage, fmt.Errorf(unexpectedMsg, unexpected))
 	}
 	if len(positional) != wantN {
@@ -176,6 +204,36 @@ func ParseArgsStrict(knownFlags, args []string, wantN int, hint, unexpectedMsg, 
 		Die(ErrUsage, errors.New(countMsg))
 	}
 	return present, positional
+}
+
+// DispatchUsageMessage returns the ERR_USAGE envelope message for the top-level
+// compat dispatch when the leading token is not a known subcommand. A leading
+// token that begins with "-" and is not a help-ish token (--help/-h/-help) means
+// a flag was placed before the subcommand; the message orients the user to put
+// flags after the subcommand (e.g. `compat cutover --dry-run <config>`). Every
+// other unrecognized leading token (an unknown subcommand name, an empty arg,
+// or a help-ish flag) keeps the generic "missing or unknown subcommand"
+// message. The caller wraps this in Die(ErrUsage, errors.New(msg)).
+//
+// helpIsh is a fixed set here (not a parameter) so the dispatch and this helper
+// agree on exactly which leading tokens are treated as help requests rather
+// than misplaced flags.
+func DispatchUsageMessage(firstArg string) string {
+	if strings.HasPrefix(firstArg, "-") && !isHelpIsh(firstArg) {
+		return "compat: flags must follow the subcommand (e.g. compat cutover --dry-run <config>)"
+	}
+	return "compat: missing or unknown subcommand"
+}
+
+// isHelpIsh reports whether a leading token is a help-style request rather than
+// a misplaced value flag, so the dispatch keeps the generic usage message for it
+// instead of the "flags must follow the subcommand" orientation.
+func isHelpIsh(a string) bool {
+	switch a {
+	case "--help", "-h", "-help":
+		return true
+	}
+	return false
 }
 
 // DecodeFileStrict reads path and decodes it into v using a json.Decoder with

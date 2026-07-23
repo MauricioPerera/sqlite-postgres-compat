@@ -177,9 +177,9 @@ The layer never silently degrades. These are rejected with explicit errors:
 
 A single `compat` binary dispatches three subcommands — `audit`, `copy`, `cutover` — that previously lived in three separate binaries (`compat-audit`, `compat-copy`, `compat-cutover`). Each subcommand preserves the observable behavior of its former binary byte-for-byte (same JSON envelopes, exit codes, streams, line order, findings/reports/dry-run plan) with one deliberate exception: the message prefixes changed from `compat-audit:` / `compat-copy:` / `compat-cutover:` to `compat audit:` / `compat copy:` / `compat cutover:`.
 
-Invoked with no subcommand, an unknown subcommand, or any `--help`-ish leading token, `compat` prints a shared usage hint to stderr and emits a typed `ERR_USAGE` JSON envelope to stdout, exiting 2 — the same style as each subcommand's own usage path.
+Invoked with no subcommand, an unknown subcommand, or any `--help`-ish leading token, `compat` prints a shared usage hint to stderr and emits a typed `ERR_USAGE` JSON envelope to stdout, exiting 2 — the same style as each subcommand's own usage path. A leading token that begins with `-` and is not `--help`-ish is a flag placed before the subcommand; it is still `ERR_USAGE` (exit 2) but the envelope message orients the user: `compat: flags must follow the subcommand (e.g. compat cutover --dry-run <config>)`. A leading `--` is the standard end-of-flags separator at the dispatch level too: `compat -- audit x.json` dispatches to `audit` like `compat audit x.json`.
 
-Each subcommand takes exactly one JSON config argument (`compat cutover` accepts an optional `--dry-run` flag, in any position after the subcommand). Any argument that begins with `-` and is not a recognized flag (`--dry-run` for `compat cutover`; none for `compat audit`/`compat copy`) is rejected as `ERR_USAGE` (exit 2) — it is never treated as the positional config path. Exit codes: `0` success; `1` any error or non-exact/non-equivalent result; `2` wrong argument count, an unexpected flag, or a missing/unknown subcommand.
+Each subcommand takes exactly one JSON config argument (`compat cutover` accepts an optional `--dry-run` flag, in any position after the subcommand). Any argument that begins with `-` and is not a recognized flag (`--dry-run` for `compat cutover`; none for `compat audit`/`compat copy`) is rejected as `ERR_USAGE` (exit 2) — it is never treated as the positional config path. A recognized flag repeated (e.g. `compat cutover --dry-run --dry-run x`) is also `ERR_USAGE` (exit 2) with a `duplicate flag` message, rather than silently deduplicated. A bare `--` token is the standard end-of-flags separator: once seen, every later argument is positional even if it begins with `-` (so `compat audit -- --raro.json` treats `--raro.json` as the config path), and `--` itself is discarded. Exit codes: `0` success; `1` any error or non-exact/non-equivalent result; `2` wrong argument count, an unexpected or duplicate flag, or a missing/unknown subcommand.
 
 ### 8.1 Typed error protocol (machine-facing)
 
@@ -192,13 +192,13 @@ On any failure each CLI exits with its current code (`1`, or `2` for `ERR_USAGE`
 ```
 
 - **`compat cutover` diverged.** `ERR_VERIFY_DIVERGED` emits exactly **one** JSON line on stdout — the `cutoverReport` with the typed `code` embedded (`{"status":"diverged","code":"ERR_VERIFY_DIVERGED",...}`). There is no separate `{"status":"error",...}` envelope on this path.
-- **`compat copy` not-exact or diverged.** Before the simple error envelope on stdout, `compat copy` emits a structured JSON payload to **stderr**: the `[]Finding` array on `ERR_AUDIT_NOT_EXACT`, or the `VerificationReport` object on `ERR_VERIFY_DIVERGED`. The plain error envelope still follows on stdout with the same `code`; an agent reads the structured detail from stderr and the typed code from stdout.
+- **`compat copy` not-exact or diverged.** Before the simple error envelope on stdout, `compat copy` emits a structured JSON payload to **stderr**: the `[]Finding` array on `ERR_AUDIT_NOT_EXACT`, or the `VerificationReport` object on `ERR_VERIFY_DIVERGED`. The error line itself is printed to stderr **exactly once** (alongside the payload), and the plain error envelope follows on stdout with the same `code`; an agent reads the structured detail from stderr and the typed code from stdout. (`compat cutover` not-exact follows the same stderr-once pattern for its `[]Finding` array.)
 
 Each envelope line is one parseable JSON object (the message is JSON-encoded, so embedded newlines never break it). An agent branches on `code`. The taxonomy is closed; the CLI picks the most specific applicable code. Free-text diagnostics also go to stderr for humans.
 
 | Code | Emitted when | Exit |
 |---|---|---|
-| `ERR_USAGE` | Wrong argument count, an unexpected flag, or a missing/unknown subcommand at the top level. | `2` |
+| `ERR_USAGE` | Wrong argument count, an unexpected flag, a duplicated recognized flag, or a missing/unknown subcommand at the top level. | `2` |
 | `ERR_CONFIG` | The config file is unreadable, fails to decode, or `compat.Audit` rejects the contract (`Contract.Validate`). Every config is decoded with `json.Decoder.DisallowUnknownFields`, so an unknown key is an explicit error rather than a silently-dropped key; a `schema`/`schema_ref` violation (both, neither, or an unreadable/invalid `schema_ref` file) is also `ERR_CONFIG`. | `1` |
 | `ERR_AUDIT_NOT_EXACT` | A required (or inferred) feature is not `exact` (`RequireExact` fails). `compat audit` emits its findings array to stdout, then this envelope; `compat copy` and `compat cutover` emit the findings array to stderr, then this envelope. | `1` |
 | `ERR_CONNECT_SOURCE` | The source store cannot be opened or pinged (`OpenStore`/`Ping` for the source). | `1` |
@@ -235,8 +235,8 @@ Config: `{source_dsn, destination_dsn, contract, schema | schema_ref}`. Exactly 
 ```
 
 - Exit `0`: `equivalent == true`.
-- Exit `1`: any typed error (see 8.1). On `ERR_AUDIT_NOT_EXACT` the `[]Finding` array is printed to stderr before the envelope; on `ERR_VERIFY_DIVERGED` (digests differ) the `VerificationReport` is printed to stderr before the envelope, so the digests are recoverable as JSON rather than only as free text in the message.
-- Exit `2`: wrong argument count (`ERR_USAGE`). The destination must be empty for the described objects (import is additive).
+- Exit `1`: any typed error (see 8.1). On `ERR_AUDIT_NOT_EXACT` the `[]Finding` array is printed to stderr before the envelope; on `ERR_VERIFY_DIVERGED` (digests differ) the `VerificationReport` is printed to stderr before the envelope, so the digests are recoverable as JSON rather than only as free text in the message. In both cases the error line is printed to stderr exactly once (not duplicated).
+- Exit `2`: wrong argument count, an unexpected flag, or a duplicated recognized flag (`ERR_USAGE`). The destination must be empty for the described objects (import is additive).
 
 ### `compat cutover <cutover.json>`
 
@@ -247,8 +247,8 @@ Config: `{source_dsn, destination_dsn, contract, schema | schema_ref, options}`.
 ```
 
 - Exit `0`: digests match → `status=ready`.
-- Exit `1`: `status=diverged` (digests differ — the report keeps its shape and adds `"code":"ERR_VERIFY_DIVERGED"`), a required feature is not exact (`ERR_AUDIT_NOT_EXACT`, findings also printed to stderr), or any typed error.
-- Exit `2`: wrong argument count (`ERR_USAGE`).
+- Exit `1`: `status=diverged` (digests differ — the report keeps its shape and adds `"code":"ERR_VERIFY_DIVERGED"`), a required feature is not exact (`ERR_AUDIT_NOT_EXACT`, findings also printed to stderr once, with the error line once), or any typed error.
+- Exit `2`: wrong argument count, an unexpected flag, or a duplicated recognized flag (`ERR_USAGE`).
 - Cutting the application's DSN over to the destination is **manual** and is not this tool's responsibility; do it after `status=ready`.
 
 The `diverged` report carries the typed code inline:

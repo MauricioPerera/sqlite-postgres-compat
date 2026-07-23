@@ -1237,3 +1237,138 @@ func TestCLIUsageCountMessageConsistent(t *testing.T) {
 		})
 	}
 }
+
+// TestCopyCLINotExactStderrOnce guards AUDIT5 §4.6: on the ERR_AUDIT_NOT_EXACT
+// path, compat copy must emit the []Finding array to stderr and the error line
+// to stderr EXACTLY ONCE (the former code printed the error line twice — once
+// explicitly and once via cliout.Die), with the typed envelope on stdout. The
+// audit fails before any store is opened, so this needs no PostgreSQL.
+func TestCopyCLINotExactStderrOnce(t *testing.T) {
+	dir := t.TempDir()
+	schema := compat.Schema{Tables: []compat.Table{{
+		Name: "fixb5_notexact",
+		Columns: []compat.Column{
+			{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+			{Name: "title", Type: compat.Type{Family: compat.TextType}},
+		},
+		Constraints: []compat.Constraint{{Kind: compat.PrimaryKey, Columns: []string{"id"}}},
+	}}}
+	// "views" is a generic family that audits as unknown, so RequireExact fails
+	// at the audit step, before the destination DSN is ever used.
+	configuration := map[string]any{
+		"source_dsn":      "file:" + filepath.ToSlash(filepath.Join(dir, "src.db")),
+		"destination_dsn": "file:/nonexistent/not-reached.db",
+		"contract": compat.Contract{
+			Source:           compat.Target{Engine: compat.SQLite, Version: compat.Version{Major: 3}},
+			Destination:      compat.Target{Engine: compat.Postgres, Version: compat.Version{Major: 17, Minor: 5}},
+			RequiredFeatures: []compat.Feature{compat.Views},
+		},
+		"schema": schema,
+	}
+	data, err := json.Marshal(configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "migration.json")
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, exitCode := runBuiltCLI(t, "cmd/compat", "copy", configPath)
+	if exitCode != 1 {
+		t.Fatalf("expected exit 1 for not-exact copy, got %d\nstdout:\n%s\nstderr:\n%s", exitCode, stdout, stderr)
+	}
+	parsed := firstErrorJSONLine(t, stdout)
+	if code, _ := parsed["code"].(string); code != "ERR_AUDIT_NOT_EXACT" {
+		t.Fatalf("expected code=ERR_AUDIT_NOT_EXACT, got %v\nstdout:\n%s", parsed["code"], stdout)
+	}
+	// The structured []Finding payload is a single JSON line on stderr.
+	findingsLines := 0
+	for _, line := range strings.Split(stderr, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "[") {
+			findingsLines++
+		}
+	}
+	if findingsLines != 1 {
+		t.Fatalf("expected exactly one findings JSON line on stderr, got %d\nstderr:\n%s", findingsLines, stderr)
+	}
+	// The error line appears exactly once on stderr (not twice).
+	if got := strings.Count(stderr, `feature "views" is unknown`); got != 1 {
+		t.Fatalf("expected the error line once on stderr, got %d\nstderr:\n%s", got, stderr)
+	}
+}
+
+// TestCopyCLIDivergedStderrOnce guards AUDIT5 §4.6 on the ERR_VERIFY_DIVERGED
+// path against real PostgreSQL: compat copy must emit the VerificationReport to
+// stderr and the error line to stderr EXACTLY ONCE (the former code printed the
+// error line twice), with the typed envelope on stdout and exit 1. The
+// divergence is genuine and reproducible: a NUMERIC(38,18) column pads "0.10" to
+// the declared scale ("0.100000000000000000") on Postgres, so the destination
+// digest differs from the SQLite TEXT source digest. This is a fixture for the
+// diverged stderr contract, not a claim about decimal-migration correctness.
+func TestCopyCLIDivergedStderrOnce(t *testing.T) {
+	ctx := context.Background()
+	schema := compat.Schema{Tables: []compat.Table{{
+		Name: "fixb5_div",
+		Columns: []compat.Column{
+			{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+			{Name: "amount", Type: compat.Type{Family: compat.DecimalType, Arguments: []int{38, 18}}},
+		},
+		Constraints: []compat.Constraint{{Kind: compat.PrimaryKey, Columns: []string{"id"}}},
+	}}}
+
+	sourcePath := filepath.Join(t.TempDir(), "div-source.db")
+	source, err := compat.OpenSQLite(compat.Version{Major: 3}, "file:"+filepath.ToSlash(sourcePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO fixb5_div (id, amount) VALUES (?, ?)`, 1, "0.10"); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	configuration := map[string]any{
+		"source_dsn":      "file:" + filepath.ToSlash(sourcePath),
+		"destination_dsn": postgresTestDSN,
+		"contract": compat.Contract{
+			Source:      compat.Target{Engine: compat.SQLite, Version: compat.Version{Major: 3}},
+			Destination: compat.Target{Engine: compat.Postgres, Version: compat.Version{Major: 17, Minor: 5}},
+		},
+		"schema": schema,
+	}
+	data, err := json.Marshal(configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "div-migration.json")
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The destination must be empty for the described objects (import is
+	// additive); other tests share the e2e PG database, so drop the table first.
+	postgres := openPostgres(t)
+	_, _ = postgres.DB.ExecContext(ctx, `DROP TABLE IF EXISTS fixb5_div`)
+
+	stdout, stderr, exitCode := runBuiltCLI(t, "cmd/compat", "copy", configPath)
+	if exitCode != 1 {
+		t.Fatalf("expected exit 1 for diverged copy, got %d\nstdout:\n%s\nstderr:\n%s", exitCode, stdout, stderr)
+	}
+	parsed := firstErrorJSONLine(t, stdout)
+	if code, _ := parsed["code"].(string); code != "ERR_VERIFY_DIVERGED" {
+		t.Fatalf("expected code=ERR_VERIFY_DIVERGED, got %v\nstdout:\n%s", parsed["code"], stdout)
+	}
+	// The structured VerificationReport is emitted to stderr exactly once.
+	if got := strings.Count(stderr, `"equivalent":false`); got != 1 {
+		t.Fatalf("expected the VerificationReport once on stderr, got %d\nstderr:\n%s", got, stderr)
+	}
+	// The error line appears exactly once on stderr (not twice).
+	if got := strings.Count(stderr, `snapshot mismatch: source`); got != 1 {
+		t.Fatalf("expected the error line once on stderr, got %d\nstderr:\n%s", got, stderr)
+	}
+}
