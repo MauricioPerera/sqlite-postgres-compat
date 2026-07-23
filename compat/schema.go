@@ -138,13 +138,21 @@ type View struct {
 }
 
 type SelectQuery struct {
-	Distinct bool         `json:"distinct,omitempty"`
-	Columns  []Projection `json:"columns"`
-	From     TableSource  `json:"from"`
-	Joins    []Join       `json:"joins,omitempty"`
-	Where    *Expression  `json:"where,omitempty"`
-	GroupBy  []Expression `json:"group_by,omitempty"`
-	Having   *Expression  `json:"having,omitempty"`
+	// With is the list of non-recursive common table expressions (CTEs) that
+	// precede this query: WITH name AS (SELECT ...), ... <query>. Each CTE query
+	// is itself a SelectQuery in the same bounded grammar. WITH RECURSIVE is
+	// deliberately not modeled and is rejected at parse time, because its
+	// termination and row-ordering semantics are hard to guarantee byte-identical
+	// between SQLite and PostgreSQL. Absent CTEs leave the query byte-identical,
+	// and the field is omitted from JSON so existing view snapshots do not change.
+	With     []CommonTableExpr `json:"with,omitempty"`
+	Distinct bool              `json:"distinct,omitempty"`
+	Columns  []Projection      `json:"columns"`
+	From     TableSource       `json:"from"`
+	Joins    []Join            `json:"joins,omitempty"`
+	Where    *Expression       `json:"where,omitempty"`
+	GroupBy  []Expression      `json:"group_by,omitempty"`
+	Having   *Expression       `json:"having,omitempty"`
 	// Compounds is the left-associative chain of set operations applied after
 	// this (the leading) SELECT: q0 op1 q1 op2 q2 ... The trailing OrderBy,
 	// Limit and Offset below apply to the whole compound, not to the last
@@ -170,14 +178,31 @@ type CompoundSelect struct {
 	Query    SelectQuery `json:"query"`
 }
 
+// CommonTableExpr is one named, non-recursive common table expression: the CTE
+// name and the query it binds. Referenced from a FROM clause by its name like an
+// ordinary table, a CTE has identical materialized-result semantics in SQLite and
+// PostgreSQL. A CTE name shadows a real table of the same name for the duration of
+// the query in both engines (standard SQL), so no special resolution is needed.
+type CommonTableExpr struct {
+	Name  string      `json:"name"`
+	Query SelectQuery `json:"query"`
+}
+
 type Projection struct {
 	Expression Expression `json:"expression"`
 	Alias      string     `json:"alias,omitempty"`
 }
 
+// TableSource is a FROM/JOIN source: either a named table (Table) or a derived
+// table (Subquery). Exactly one of Table or Subquery is set. A derived table is
+// a full SelectQuery evaluated as a table; both engines give it identical
+// results (it cannot be correlated with the enclosing query in standard SQL). A
+// derived table requires an Alias. Subquery is omitted from JSON when absent, so
+// existing table-source snapshots do not change.
 type TableSource struct {
-	Table string `json:"table"`
-	Alias string `json:"alias,omitempty"`
+	Table    string       `json:"table,omitempty"`
+	Alias    string       `json:"alias,omitempty"`
+	Subquery *SelectQuery `json:"subquery,omitempty"`
 }
 
 type Join struct {
@@ -353,7 +378,7 @@ func validateViews(views []View, tables map[string]struct{}) error {
 			return fmt.Errorf("duplicate view %q", view.Name)
 		}
 		viewNames[view.Name] = struct{}{}
-		if view.Query.From.Table == "" {
+		if view.Query.From.Table == "" && view.Query.From.Subquery == nil {
 			return fmt.Errorf("view %q has no source table", view.Name)
 		}
 		if len(view.Query.Columns) == 0 {

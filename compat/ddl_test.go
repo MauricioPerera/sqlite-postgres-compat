@@ -631,6 +631,120 @@ func TestCompileCompoundRejectsInvalidChains(t *testing.T) {
 	})
 }
 
+// TestCompileFromSubqueryForBothEngines freezes the exact SQL a derived table
+// (FROM-subquery) compiles to. The syntax is identical for SQLite and
+// PostgreSQL: the subquery is wrapped in parentheses and given its alias.
+func TestCompileFromSubqueryForBothEngines(t *testing.T) {
+	query := SelectQuery{
+		Columns: []Projection{{Expression: Expression{Kind: "column", Value: "s.id"}}},
+		From: TableSource{Alias: "s", Subquery: &SelectQuery{
+			Columns: []Projection{{Expression: Expression{Kind: "column", Value: "id"}}},
+			From:    TableSource{Table: "t"},
+			Where: &Expression{Kind: "eq", Args: []Expression{
+				{Kind: "column", Value: "active"},
+				{Kind: "boolean", Value: "true"},
+			}},
+		}},
+	}
+	want := `SELECT "s"."id" FROM (SELECT "id" FROM "t" WHERE ("active" = TRUE)) AS "s"`
+	for _, engine := range []Engine{SQLite, Postgres} {
+		got, err := compileSelect(engine, query)
+		if err != nil {
+			t.Fatalf("%s: %v", engine, err)
+		}
+		if got != want {
+			t.Fatalf("%s derived table SQL:\n got %q\nwant %q", engine, got, want)
+		}
+	}
+}
+
+// TestCompileCTEForBothEngines freezes the exact SQL a non-recursive CTE compiles
+// to. The WITH syntax is identical for SQLite and PostgreSQL.
+func TestCompileCTEForBothEngines(t *testing.T) {
+	query := SelectQuery{
+		With: []CommonTableExpr{{
+			Name: "a",
+			Query: SelectQuery{
+				Columns: []Projection{{Expression: Expression{Kind: "column", Value: "id"}}},
+				From:    TableSource{Table: "t"},
+			},
+		}},
+		Columns: []Projection{{Expression: Expression{Kind: "column", Value: "id"}}},
+		From:    TableSource{Table: "a"},
+	}
+	want := `WITH "a" AS (SELECT "id" FROM "t") SELECT "id" FROM "a"`
+	for _, engine := range []Engine{SQLite, Postgres} {
+		got, err := compileSelect(engine, query)
+		if err != nil {
+			t.Fatalf("%s: %v", engine, err)
+		}
+		if got != want {
+			t.Fatalf("%s CTE SQL:\n got %q\nwant %q", engine, got, want)
+		}
+	}
+}
+
+// TestCompileMultipleCTEsForBothEngines freezes a two-CTE clause feeding a joined
+// main query, confirming the comma-separated WITH list and the join both compile.
+func TestCompileMultipleCTEsForBothEngines(t *testing.T) {
+	cte := func(name, table string) CommonTableExpr {
+		return CommonTableExpr{Name: name, Query: SelectQuery{
+			Columns: []Projection{{Expression: Expression{Kind: "column", Value: "id"}}},
+			From:    TableSource{Table: table},
+		}}
+	}
+	query := SelectQuery{
+		With:    []CommonTableExpr{cte("a", "t"), cte("b", "u")},
+		Columns: []Projection{{Expression: Expression{Kind: "column", Value: "a.id"}}},
+		From:    TableSource{Table: "a"},
+		Joins: []Join{{Kind: "inner", Table: TableSource{Table: "b"}, On: Expression{Kind: "eq", Args: []Expression{
+			{Kind: "column", Value: "b.id"},
+			{Kind: "column", Value: "a.id"},
+		}}}},
+	}
+	want := `WITH "a" AS (SELECT "id" FROM "t"), "b" AS (SELECT "id" FROM "u") SELECT "a"."id" FROM "a" INNER JOIN "b" ON ("b"."id" = "a"."id")`
+	for _, engine := range []Engine{SQLite, Postgres} {
+		got, err := compileSelect(engine, query)
+		if err != nil {
+			t.Fatalf("%s: %v", engine, err)
+		}
+		if got != want {
+			t.Fatalf("%s multi-CTE SQL:\n got %q\nwant %q", engine, got, want)
+		}
+	}
+}
+
+// TestCompileFromSubqueryKeepsPerEngineExpressionMapping confirms an expression
+// inside a derived table still maps per engine (LIKE becomes ILIKE on Postgres),
+// proving the subquery compiles through the normal expression path.
+func TestCompileFromSubqueryKeepsPerEngineExpressionMapping(t *testing.T) {
+	query := SelectQuery{
+		Columns: []Projection{{Expression: Expression{Kind: "column", Value: "s.name"}}},
+		From: TableSource{Alias: "s", Subquery: &SelectQuery{
+			Columns: []Projection{{Expression: Expression{Kind: "column", Value: "name"}}},
+			From:    TableSource{Table: "t"},
+			Where: &Expression{Kind: "like", Args: []Expression{
+				{Kind: "column", Value: "name"},
+				{Kind: "string", Value: "a%"},
+			}},
+		}},
+	}
+	sqlite, err := compileSelect(SQLite, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postgres, err := compileSelect(Postgres, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(sqlite, " LIKE ") || strings.Contains(sqlite, "ILIKE") {
+		t.Fatalf("SQLite derived table lost LIKE: %q", sqlite)
+	}
+	if !strings.Contains(postgres, " ILIKE ") {
+		t.Fatalf("Postgres derived table did not map to ILIKE: %q", postgres)
+	}
+}
+
 func TestSchemaRejectsIndexOnUnknownColumn(t *testing.T) {
 	schema := Schema{
 		Tables:  []Table{{Name: "products", Columns: []Column{{Name: "id", Type: Type{Family: IntegerType}}}}},

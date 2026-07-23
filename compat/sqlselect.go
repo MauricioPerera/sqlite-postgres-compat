@@ -32,6 +32,24 @@ func parseCatalogSelect(definition string) (SelectQuery, error) {
 	if err != nil {
 		return SelectQuery{}, err
 	}
+	with, bodyText, err := stripCatalogWith(selectText)
+	if err != nil {
+		return SelectQuery{}, err
+	}
+	head, err := parseCatalogSelectBody(bodyText)
+	if err != nil {
+		return SelectQuery{}, err
+	}
+	head.With = with
+	return head, nil
+}
+
+// parseCatalogSelectBody parses the SELECT-or-compound portion of a query, after
+// any leading WITH clause has been stripped by the caller. It handles a single
+// SELECT or a left-associative chain of set operations (UNION [ALL] / INTERSECT /
+// EXCEPT); the trailing ORDER BY / LIMIT / OFFSET, if present, apply to the whole
+// compound and are hoisted onto the leading query.
+func parseCatalogSelectBody(selectText string) (SelectQuery, error) {
 	segments, operators := splitCompoundSelect(selectText)
 	if len(operators) == 0 {
 		return parseSingleCatalogSelect(selectText)
@@ -217,21 +235,105 @@ func parseSingleCatalogSelect(selectText string) (SelectQuery, error) {
 func stripCatalogViewPrefix(definition string) (string, error) {
 	text := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(definition), ";"))
 	if strings.HasPrefix(strings.ToUpper(text), "CREATE ") {
-		// Find the "AS SELECT" boundary with the same whitespace tolerance the
-		// rest of the parser uses for multi-word keywords (keywordMatchSpan), so
-		// "AS  SELECT" or "AS\tSELECT" is accepted just like "AS SELECT". Both
-		// SQLite and Postgres treat any run of whitespace as a separator here.
-		position := topLevelKeyword(text, "AS SELECT")
+		// Find the view's "AS <body>" boundary with the same whitespace tolerance
+		// the rest of the parser uses for multi-word keywords (keywordMatchSpan),
+		// so "AS  SELECT"/"AS\tSELECT" is accepted just like "AS SELECT". The body
+		// begins with either SELECT (a plain query) or WITH (a query preceded by
+		// common table expressions); a CTE's own inner "AS (" never matches either
+		// "AS SELECT" or "AS WITH", so the earliest of the two top-level matches is
+		// the real boundary. Both SQLite and Postgres treat any run of whitespace
+		// as a separator here.
+		position, keyword := earliestKeyword(text, "AS SELECT", "AS WITH")
 		if position < 0 {
 			return "", fmt.Errorf("view definition has no AS SELECT")
 		}
-		end, _ := keywordMatchSpan(text, position, "AS SELECT")
-		text = strings.TrimSpace(text[end-len("SELECT"):])
+		end, _ := keywordMatchSpan(text, position, keyword)
+		bodyKeyword := keyword[len("AS "):] // "SELECT" or "WITH"
+		text = strings.TrimSpace(text[end-len(bodyKeyword):])
 	}
-	if !strings.HasPrefix(strings.ToUpper(text), "SELECT ") {
+	if !catalogBodyStartsAQuery(text) {
 		return "", fmt.Errorf("view definition is not SELECT")
 	}
 	return text, nil
+}
+
+// earliestKeyword returns the position and text of whichever keyword occurs
+// first at the top level of text, or (-1, "") if none is present.
+func earliestKeyword(text string, keywords ...string) (int, string) {
+	best := -1
+	bestKeyword := ""
+	for _, keyword := range keywords {
+		if position := topLevelKeyword(text, keyword); position >= 0 && (best < 0 || position < best) {
+			best = position
+			bestKeyword = keyword
+		}
+	}
+	return best, bestKeyword
+}
+
+// catalogBodyStartsAQuery reports whether text begins with a query keyword the
+// grammar can parse: SELECT (a plain query) or WITH (CTEs then a query).
+func catalogBodyStartsAQuery(text string) bool {
+	upper := strings.ToUpper(text)
+	return strings.HasPrefix(upper, "SELECT ") || catalogKeywordPrefix(text, "WITH")
+}
+
+// catalogKeywordPrefix reports whether text begins with keyword at a word
+// boundary (case-insensitive, whitespace-tolerant inside a multi-word keyword).
+func catalogKeywordPrefix(text, keyword string) bool {
+	end, ok := keywordMatchSpan(text, 0, keyword)
+	return ok && wordBoundary(text, end)
+}
+
+// stripCatalogWith parses and removes a leading, non-recursive WITH clause,
+// returning the parsed common table expressions and the remaining query text. If
+// text does not begin with WITH, it returns (nil, text, nil). WITH RECURSIVE is
+// rejected explicitly: its termination and observable row ordering are hard to
+// guarantee byte-identical between SQLite and PostgreSQL, so such a view becomes
+// an unresolved object rather than divergent SQL. Each CTE is `name AS ( query )`;
+// entries are separated by top-level commas and the main query begins after the
+// last CTE's closing parenthesis.
+func stripCatalogWith(text string) ([]CommonTableExpr, string, error) {
+	text = strings.TrimSpace(text)
+	if !catalogKeywordPrefix(text, "WITH") {
+		return nil, text, nil
+	}
+	end, _ := keywordMatchSpan(text, 0, "WITH")
+	rest := strings.TrimSpace(text[end:])
+	if catalogKeywordPrefix(rest, "RECURSIVE") {
+		return nil, "", fmt.Errorf("WITH RECURSIVE is outside the canonical grammar: recursive CTE termination and ordering are not guaranteed identical between SQLite and PostgreSQL")
+	}
+	var ctes []CommonTableExpr
+	for {
+		asPosition := topLevelKeyword(rest, "AS")
+		if asPosition < 0 {
+			return nil, "", fmt.Errorf("common table expression has no AS")
+		}
+		name, ok := parseCatalogIdentifier(strings.TrimSpace(rest[:asPosition]))
+		if !ok || strings.Contains(name, ".") {
+			return nil, "", fmt.Errorf("unsupported common table expression name %q", strings.TrimSpace(rest[:asPosition]))
+		}
+		asEnd, _ := keywordMatchSpan(rest, asPosition, "AS")
+		body := strings.TrimSpace(rest[asEnd:])
+		if len(body) == 0 || body[0] != '(' {
+			return nil, "", fmt.Errorf("common table expression %q must be parenthesized", name)
+		}
+		close := matchingParenthesis(body, 0)
+		if close < 0 {
+			return nil, "", fmt.Errorf("common table expression %q has unbalanced parentheses", name)
+		}
+		query, err := parseCatalogSelect(strings.TrimSpace(body[1:close]))
+		if err != nil {
+			return nil, "", err
+		}
+		ctes = append(ctes, CommonTableExpr{Name: name, Query: query})
+		tail := strings.TrimSpace(body[close+1:])
+		if strings.HasPrefix(tail, ",") {
+			rest = strings.TrimSpace(tail[1:])
+			continue
+		}
+		return ctes, tail, nil
+	}
 }
 
 // stripCatalogSelectKeyword removes the leading SELECT keyword and an optional
@@ -502,6 +604,15 @@ func splitProjectionAlias(text string) (string, string) {
 }
 
 func parseCatalogTableSource(text string) (TableSource, error) {
+	text = strings.TrimSpace(text)
+	// A derived table: ( <select> ) [AS] alias. The leading parenthesis holds a
+	// full subquery (which cannot be correlated with the enclosing query in
+	// standard SQL, so both engines materialize it identically); an alias is
+	// required, matching PostgreSQL's rule and giving the derived table a stable
+	// canonical name.
+	if strings.HasPrefix(text, "(") {
+		return parseCatalogSubquerySource(text)
+	}
 	if strings.ContainsAny(text, ",()") {
 		return TableSource{}, fmt.Errorf("compound table source is outside the canonical grammar")
 	}
@@ -525,6 +636,35 @@ func parseCatalogTableSource(text string) (TableSource, error) {
 		return TableSource{}, fmt.Errorf("unsupported table alias %q", text)
 	}
 	return source, nil
+}
+
+// parseCatalogSubquerySource parses a derived table `( <select> ) [AS] alias`.
+// The parenthesized query is parsed with the same bounded grammar (recursively,
+// so it may itself carry CTEs, compounds or nested derived tables). An alias is
+// required and must be a simple identifier.
+func parseCatalogSubquerySource(text string) (TableSource, error) {
+	close := matchingParenthesis(text, 0)
+	if close < 0 {
+		return TableSource{}, fmt.Errorf("derived table has unbalanced parentheses")
+	}
+	subquery, err := parseCatalogSelect(strings.TrimSpace(text[1:close]))
+	if err != nil {
+		return TableSource{}, err
+	}
+	rest := strings.TrimSpace(text[close+1:])
+	fields := strings.Fields(rest)
+	var alias string
+	var ok bool
+	switch {
+	case len(fields) == 1:
+		alias, ok = parseCatalogIdentifier(fields[0])
+	case len(fields) == 2 && strings.EqualFold(fields[0], "AS"):
+		alias, ok = parseCatalogIdentifier(fields[1])
+	}
+	if !ok || alias == "" || strings.Contains(alias, ".") {
+		return TableSource{}, fmt.Errorf("derived table requires a simple alias, got %q", rest)
+	}
+	return TableSource{Subquery: &subquery, Alias: alias}, nil
 }
 
 func parseCatalogFrom(text string) (TableSource, []Join, error) {

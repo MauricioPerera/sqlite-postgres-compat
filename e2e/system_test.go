@@ -1384,6 +1384,147 @@ func TestSystemCompoundViewsProduceEquivalentResults(t *testing.T) {
 	}
 }
 
+// TestSystemDerivedTableAndCTEViewsProduceEquivalentResults drives the
+// FEAT-CUBOA-2B extensions (FROM-subquery / derived tables and non-recursive
+// CTEs) through the real engines. It applies a canonical schema whose views use
+// each construct over a real table, imports it into real PostgreSQL, and compares
+// the rows each view returns on SQLite versus PostgreSQL. A green ImportSnapshot
+// proves real PostgreSQL accepts every compiled derived-table and WITH view DDL;
+// the row comparison proves the materialized-table semantics coincide. It then
+// re-creates the same two views as raw native DDL on both engines and inspects
+// them without canonical metadata, asserting canonical_views stays exact — i.e.
+// each engine's own deparse of a derived-table / CTE view round-trips through the
+// parser back to a resolved SelectQuery.
+func TestSystemDerivedTableAndCTEViewsProduceEquivalentResults(t *testing.T) {
+	ctx := context.Background()
+	col := func(name string) compat.Expression { return compat.Expression{Kind: "column", Value: name} }
+	activeFilter := &compat.Expression{Kind: "eq", Args: []compat.Expression{
+		col("active"), {Kind: "boolean", Value: "true"},
+	}}
+	// The inner query carries a WHERE so PostgreSQL keeps it as a genuine
+	// subquery / CTE in pg_get_viewdef rather than flattening it away.
+	innerActive := compat.SelectQuery{
+		Columns: []compat.Projection{{Expression: col("id")}, {Expression: col("name")}},
+		From:    compat.TableSource{Table: "sub_items"},
+		Where:   activeFilter,
+	}
+	schema := compat.Schema{
+		Tables: []compat.Table{{
+			Name: "sub_items",
+			Columns: []compat.Column{
+				{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+				{Name: "name", Type: compat.Type{Family: compat.TextType}},
+				{Name: "active", Type: compat.Type{Family: compat.BooleanType}},
+			},
+			Constraints: []compat.Constraint{{Kind: compat.PrimaryKey, Columns: []string{"id"}}},
+		}},
+		Views: []compat.View{
+			{
+				// Derived table: SELECT s.id, s.name FROM (SELECT ... WHERE active) AS s
+				Name: "sub_derived",
+				Query: compat.SelectQuery{
+					Columns: []compat.Projection{{Expression: col("s.id")}, {Expression: col("s.name")}},
+					From:    compat.TableSource{Alias: "s", Subquery: cloneSelect(innerActive)},
+				},
+			},
+			{
+				// CTE: WITH a AS (SELECT ... WHERE active) SELECT id, name FROM a
+				Name: "sub_cte",
+				Query: compat.SelectQuery{
+					With:    []compat.CommonTableExpr{{Name: "a", Query: innerActive}},
+					Columns: []compat.Projection{{Expression: col("id")}, {Expression: col("name")}},
+					From:    compat.TableSource{Table: "a"},
+				},
+			},
+		},
+	}
+
+	source := openSQLite(t, filepath.Join(t.TempDir(), "subcte.db"))
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO sub_items (id, name, active) VALUES (1,'a',1),(2,'b',0),(3,'c',1)`); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := source.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postgres := openPostgres(t)
+	if err := postgres.ImportSnapshot(ctx, snapshot); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both views must return exactly the active rows, identically on both engines.
+	for _, view := range []string{"sub_derived", "sub_cte"} {
+		query := `SELECT id, name FROM ` + view + ` ORDER BY id, name`
+		sqliteRows := queryIDNameRows(t, source.DB, query)
+		postgresRows := queryIDNameRows(t, postgres.DB, query)
+		if fmt.Sprint(sqliteRows) != fmt.Sprint(postgresRows) {
+			t.Fatalf("%s diverged: sqlite=%v postgres=%v", view, sqliteRows, postgresRows)
+		}
+		if len(sqliteRows) != 2 {
+			t.Fatalf("%s expected 2 active rows, got %v", view, sqliteRows)
+		}
+	}
+
+	// Round-trip through each engine's native catalog: recreate the same two
+	// views as raw DDL in a metadata-free schema and confirm the inspector parses
+	// both back to resolved SelectQueries (canonical_views stays exact).
+	nativeSQLite := openSQLite(t, filepath.Join(t.TempDir(), "subcte-native.db"))
+	nativePostgres := openPostgres(t)
+	if _, err := nativePostgres.DB.ExecContext(ctx, `DROP SCHEMA public CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nativePostgres.DB.ExecContext(ctx, `CREATE SCHEMA public`); err != nil {
+		t.Fatal(err)
+	}
+	nativeDDL := map[compat.Engine][]string{
+		compat.SQLite: {
+			`CREATE TABLE sub_items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, active BOOLEAN NOT NULL)`,
+			`CREATE VIEW sub_derived AS SELECT s.id, s.name FROM (SELECT id, name FROM sub_items WHERE active = TRUE) AS s`,
+			`CREATE VIEW sub_cte AS WITH a AS (SELECT id, name FROM sub_items WHERE active = TRUE) SELECT id, name FROM a`,
+		},
+		compat.Postgres: {
+			`CREATE TABLE sub_items (id BIGINT PRIMARY KEY, name TEXT NOT NULL, active BOOLEAN NOT NULL)`,
+			`CREATE VIEW sub_derived AS SELECT s.id, s.name FROM (SELECT id, name FROM sub_items WHERE active = TRUE) AS s`,
+			`CREATE VIEW sub_cte AS WITH a AS (SELECT id, name FROM sub_items WHERE active = TRUE) SELECT id, name FROM a`,
+		},
+	}
+	for _, store := range []*compat.Store{nativeSQLite, nativePostgres} {
+		for _, statement := range nativeDDL[store.Target.Engine] {
+			if _, err := store.DB.ExecContext(ctx, statement); err != nil {
+				t.Fatalf("%s native DDL: %v", store.Target.Engine, err)
+			}
+		}
+		inspection, err := store.InspectSchema(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !inspection.Exact || len(inspection.Unresolved) != 0 {
+			t.Fatalf("%s native derived-table/CTE views were not translated exactly: %+v", store.Target.Engine, inspection)
+		}
+		var derived, cte bool
+		for _, view := range inspection.Schema.Views {
+			if view.Name == "sub_derived" && view.Query.From.Subquery != nil && view.Query.From.Alias == "s" {
+				derived = true
+			}
+			if view.Name == "sub_cte" && len(view.Query.With) == 1 && view.Query.With[0].Name == "a" && view.Query.From.Table == "a" {
+				cte = true
+			}
+		}
+		if !derived || !cte {
+			t.Fatalf("%s native derived-table/CTE views not reconstructed: %+v", store.Target.Engine, inspection.Schema.Views)
+		}
+	}
+}
+
+// cloneSelect returns a heap copy of q so a SelectQuery can be shared as a
+// derived-table subquery pointer without aliasing another use of the same value.
+func cloneSelect(q compat.SelectQuery) *compat.SelectQuery {
+	return &q
+}
+
 func queryIDNameRows(t *testing.T, db *sql.DB, query string) []string {
 	t.Helper()
 	rows, err := db.Query(query)

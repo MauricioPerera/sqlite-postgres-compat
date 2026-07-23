@@ -104,6 +104,7 @@ SQLite's `LIKE` is case-insensitive (ASCII) by default; PostgreSQL's `LIKE` is c
 Parser: `compat/sqlselect.go` (`parseCatalogSelect`). A view definition is `CREATE VIEW name AS <select>`; the parser strips the `CREATE ... AS SELECT ` prefix and requires a `SELECT`.
 
 ```
+[WITH cte_name AS ( <query> ) [, cte_name AS ( <query> )]...]
 <branch>
 [ {UNION [ALL] | INTERSECT | EXCEPT} <branch> ]...
 [ORDER BY expr [ASC|DESC], ...]
@@ -112,23 +113,26 @@ Parser: `compat/sqlselect.go` (`parseCatalogSelect`). A view definition is `CREA
 
 <branch> ::=
 SELECT [DISTINCT] projection, ... 
-FROM table[[ AS] alias]
-[ {LEFT [OUTER] | INNER | CROSS | } JOIN table[[ AS] alias] [ON expr] ]...
+FROM source[[ AS] alias]
+[ {LEFT [OUTER] | INNER | CROSS | } JOIN source[[ AS] alias] [ON expr] ]...
 [WHERE expr]
 [GROUP BY expr, ...]
 [HAVING expr]
+
+source ::= table | ( <query> )
 ```
 
 - **Projections**: comma-separated. Each is `expr` or `expr AS alias`; the alias is a simple identifier (no dot). `SELECT *` / a bare `*` projection is **rejected** (`unsupported catalog expression`).
-- **FROM**: a single table source `table`, `table alias`, or `table AS alias`. The table name must not be schema-qualified (no `.`). Compound sources (comma, parentheses) are rejected with `compound table source is outside the canonical grammar`.
+- **CTEs (`WITH`)**: an optional, **non-recursive** `WITH` prefix binds one or more named common table expressions (`SelectQuery.With []CommonTableExpr{Name, Query}` in `compat/schema.go`, JSON `with` with `omitempty`), each a full query in this same grammar, referenced from a `FROM`/`JOIN` by its name like an ordinary table. Materialized-result and name-shadowing semantics (a CTE shadows a real table of the same name for the query) are identical in both engines. **`WITH RECURSIVE` is rejected** (`WITH RECURSIVE is outside the canonical grammar`): recursive termination and observable row ordering are not guaranteed byte-identical between engines, so such a view becomes an unresolved object (`Exact = false`) rather than divergent SQL.
+- **FROM / JOIN source**: a named table (`table`, `table alias`, `table AS alias`; name not schema-qualified, no `.`) **or a derived table** `( <query> ) [AS] alias` — a parenthesized subquery in this same grammar (`TableSource.Subquery *SelectQuery`, JSON `subquery` with `omitempty`). A derived table **requires an alias** (PostgreSQL's rule; keeps the canonical form exact for both engines) and cannot be correlated with the enclosing query (standard SQL), so both engines materialize it identically. Any other compound source (top-level comma; a parenthesized group that is not a single subquery) is rejected with `compound table source is outside the canonical grammar`.
 - **JOINs**: `LEFT [OUTER]`, `INNER`, `CROSS`, and bare `JOIN` (treated as `INNER`). `LEFT`/`INNER` require `ON <expr>`; `CROSS` takes no `ON`. Multiple joins chain.
 - **WHERE / HAVING**: a catalog expression (Section 3).
 - **GROUP BY**: comma-separated expressions.
 - **ORDER BY**: comma-separated; each item is `expr [ASC|DESC]`.
 - **LIMIT / OFFSET**: non-negative integers. A **negative** value is rejected at parse time with `unsupported negative LIMIT %d` / `unsupported negative OFFSET %d`.
-- **Set operations (compounds)**: a left-associative chain of `UNION`, `UNION ALL`, `INTERSECT` and `EXCEPT` over branches (`q0 op1 q1 op2 q2 ...`). Each branch is a single SELECT with the grammar above (projections, FROM, JOINs, WHERE, GROUP BY, HAVING) but **no** ORDER BY/LIMIT/OFFSET of its own; a trailing ORDER BY/LIMIT/OFFSET applies to the whole compound and is hoisted onto the leading query (`SelectQuery.Compounds []CompoundSelect{Operator, Query}` in `compat/schema.go`, JSON `compounds` with `omitempty`). All four operators have identical set semantics in both engines. A chain that **mixes `INTERSECT` with `UNION`/`EXCEPT`** is rejected (`compound mixing INTERSECT with UNION/EXCEPT is outside the canonical grammar`): `INTERSECT` binds more tightly than `UNION`/`EXCEPT` in PostgreSQL but has equal (left-associative) precedence in SQLite, so a flat chain would group differently per engine; such a view becomes an unresolved object (`Exact = false`) rather than divergent SQL. A homogeneous chain of a single operator (including all-`INTERSECT`) and any chain of `{UNION, UNION ALL, EXCEPT}` are accepted. Parenthesized branches (the shape PostgreSQL deparses around a mixed-precedence compound) are rejected because a branch must begin with `SELECT`. Subqueries and CTEs inside a branch remain out of scope.
+- **Set operations (compounds)**: a left-associative chain of `UNION`, `UNION ALL`, `INTERSECT` and `EXCEPT` over branches (`q0 op1 q1 op2 q2 ...`). Each branch is a single SELECT with the grammar above (projections, FROM, JOINs, WHERE, GROUP BY, HAVING) but **no** ORDER BY/LIMIT/OFFSET of its own; a trailing ORDER BY/LIMIT/OFFSET applies to the whole compound and is hoisted onto the leading query (`SelectQuery.Compounds []CompoundSelect{Operator, Query}` in `compat/schema.go`, JSON `compounds` with `omitempty`). All four operators have identical set semantics in both engines. A chain that **mixes `INTERSECT` with `UNION`/`EXCEPT`** is rejected (`compound mixing INTERSECT with UNION/EXCEPT is outside the canonical grammar`): `INTERSECT` binds more tightly than `UNION`/`EXCEPT` in PostgreSQL but has equal (left-associative) precedence in SQLite, so a flat chain would group differently per engine; such a view becomes an unresolved object (`Exact = false`) rather than divergent SQL. A homogeneous chain of a single operator (including all-`INTERSECT`) and any chain of `{UNION, UNION ALL, EXCEPT}` are accepted. Parenthesized branches (the shape PostgreSQL deparses around a mixed-precedence compound) are rejected because a branch must begin with `SELECT`. A branch's `FROM` may use a derived table (`FROM (SELECT ...) alias`); a `WITH` prefix binds the **whole** compound (its leading query), not an individual branch.
 
-Always rejected in SELECT: subqueries, CTEs (`WITH`), window functions, `SELECT *`, compound table sources, schema-qualified table names, and any compound chain that mixes `INTERSECT` with `UNION`/`EXCEPT`.
+Derived tables (`FROM (SELECT ...) alias`) and non-recursive CTEs (`WITH`) are supported (see above). Still always rejected in SELECT: `WITH RECURSIVE`; a **subquery in an `IN` predicate** (`x IN (SELECT ...)`) and other subqueries in the expression grammar; correlated subqueries and `EXISTS`; window functions; `SELECT *`; a derived table without an alias; other compound table sources (top-level comma); schema-qualified table names; and any compound chain that mixes `INTERSECT` with `UNION`/`EXCEPT`.
 
 ## 5. Triggers (canonical forms)
 
@@ -184,7 +188,7 @@ The layer never silently degrades. These are rejected with explicit errors:
 - Non-`public` schema qualifier on a PostgreSQL trigger.
 - `SELECT *` or a bare `*` projection.
 - Compound or schema-qualified table sources in `FROM`.
-- Subqueries, CTEs, window functions. Set operations (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) are supported as compounds (Section 4), except a chain mixing `INTERSECT` with `UNION`/`EXCEPT`, which is rejected because its grouping diverges between engines.
+- Derived tables (`FROM (SELECT ...) alias`) and non-recursive CTEs (`WITH`) are supported (Section 4). `WITH RECURSIVE`, subqueries in the expression grammar (including `x IN (SELECT ...)`), correlated subqueries, `EXISTS`, and window functions are rejected. Set operations (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) are supported as compounds (Section 4), except a chain mixing `INTERSECT` with `UNION`/`EXCEPT`, which is rejected because its grouping diverges between engines.
 - Any function not in the allowlist (Section 3).
 - Any expression outside the grammar (Section 3).
 - Unsupported PostgreSQL `DEFAULT` casts (only a known set is accepted: `text`, `character varying`, `character`, `boolean`, `smallint`, `integer`, `bigint`, `numeric`, `real`, `double precision`, `date`, `timestamp without time zone`, `timestamp with time zone`, `uuid`, `json`, `jsonb`).

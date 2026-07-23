@@ -56,7 +56,7 @@ Los tres subcomandos comparten una taxonomía cerrada de códigos de error (`ERR
 
 ## Estado de validación
 
-La batería E2E (`e2e/system_test.go`, `e2e/suppress_test.go`, `e2e/cutover_test.go`) corre contra SQLite real y PostgreSQL 17.10 real: 41 pruebas de nivel superior, 40 superadas y 1 fallida de forma intencional (`TestSystemClaimsExactCoverageForRequiredFeatureFamilies`), que documenta que las familias genéricas no-canónicas (`foreign_keys`, `check_constraints`, `indexes`, `views`, `triggers`, `stored_routines`, `full_text`) permanecen `unknown` porque representan SQL arbitrario del dialecto, no cubierto todavía. Detalle completo en [docs/reports/VALIDATION_REPORT.md](docs/reports/VALIDATION_REPORT.md).
+La batería E2E (`e2e/system_test.go`, `e2e/suppress_test.go`, `e2e/cutover_test.go`) corre contra SQLite real y PostgreSQL 17.10 real: 42 pruebas de nivel superior, 41 superadas y 1 fallida de forma intencional (`TestSystemClaimsExactCoverageForRequiredFeatureFamilies`), que documenta que las familias genéricas no-canónicas (`foreign_keys`, `check_constraints`, `indexes`, `views`, `triggers`, `stored_routines`, `full_text`) permanecen `unknown` porque representan SQL arbitrario del dialecto, no cubierto todavía. Detalle completo en [docs/reports/VALIDATION_REPORT.md](docs/reports/VALIDATION_REPORT.md).
 
 La compatibilidad del tipo `vector` fue validada por separado contra libSQL/sqld y pgvector reales (snapshot, replicación incremental e inspección de dimensión hacia una columna `vector(N)` nativa). Detalle en [docs/reports/VECTOR-COMPAT-REPORT.md](docs/reports/VECTOR-COMPAT-REPORT.md).
 

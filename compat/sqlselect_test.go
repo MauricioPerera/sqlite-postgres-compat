@@ -431,3 +431,137 @@ func TestParseCatalogSelectCompoundBranchInternalWhitespace(t *testing.T) {
 		t.Fatalf("UNION inside a string literal must not split a compound: %+v", quoted.Compounds)
 	}
 }
+
+// TestParseCatalogSelectFromSubquery freezes the AST for a derived table
+// (FROM-subquery): the leading query keeps its projections while its From holds a
+// nested SelectQuery (the derived table) plus the required alias. The derived
+// table cannot be correlated with the enclosing query in standard SQL, so both
+// engines materialize it identically.
+func TestParseCatalogSelectFromSubquery(t *testing.T) {
+	got, err := parseCatalogSelect(`SELECT s.id, s.name FROM (SELECT id, name FROM products WHERE active = TRUE) AS s`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.From.Table != "" || got.From.Subquery == nil || got.From.Alias != "s" {
+		t.Fatalf("expected a derived table aliased s, got %+v", got.From)
+	}
+	sub := got.From.Subquery
+	if sub.From.Table != "products" || len(sub.Columns) != 2 || sub.Where == nil {
+		t.Fatalf("derived table inner query not parsed: %+v", sub)
+	}
+	if len(got.Columns) != 2 || got.Columns[0].Expression.Value != "s.id" {
+		t.Fatalf("outer projections not parsed: %+v", got.Columns)
+	}
+}
+
+// TestParseCatalogSelectFromSubqueryWithoutAlias rejects a derived table with no
+// alias: PostgreSQL requires one, so demanding it keeps the canonical form exact
+// for both engines rather than compiling something SQLite accepts but PG refuses.
+func TestParseCatalogSelectFromSubqueryWithoutAlias(t *testing.T) {
+	if _, err := parseCatalogSelect(`SELECT id FROM (SELECT id FROM products)`); err == nil {
+		t.Fatal("expected rejection for an unaliased derived table, got nil")
+	}
+}
+
+// TestParseCatalogSelectFromSubqueryAcceptsPostgresDeparse round-trips the exact
+// normalized definition PostgreSQL 17 emits for a FROM-subquery view (captured
+// from information_schema.views): qualified columns, extra parentheses and
+// newlines. It must parse (so the view stays resolved / Exact on inspection).
+func TestParseCatalogSelectFromSubqueryAcceptsPostgresDeparse(t *testing.T) {
+	deparse := " SELECT id,\n    name\n   FROM ( SELECT pt.id,\n            pt.name\n           FROM pt\n          WHERE (pt.active = true)) s;"
+	got, err := parseCatalogSelect(deparse)
+	if err != nil {
+		t.Fatalf("PostgreSQL FROM-subquery deparse did not round-trip: %v", err)
+	}
+	if got.From.Subquery == nil || got.From.Alias != "s" || got.From.Subquery.Where == nil {
+		t.Fatalf("unexpected round-tripped derived table: %+v", got.From)
+	}
+}
+
+// TestParseCatalogSelectSingleCTE freezes the AST for a single non-recursive CTE:
+// the WITH list carries the named subquery and the main query references it by
+// name in FROM like an ordinary table.
+func TestParseCatalogSelectSingleCTE(t *testing.T) {
+	got, err := parseCatalogSelect(`WITH a AS (SELECT id, name FROM products) SELECT id, name FROM a`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.With) != 1 || got.With[0].Name != "a" {
+		t.Fatalf("expected one CTE named a, got %+v", got.With)
+	}
+	if got.With[0].Query.From.Table != "products" || len(got.With[0].Query.Columns) != 2 {
+		t.Fatalf("CTE inner query not parsed: %+v", got.With[0].Query)
+	}
+	if got.From.Table != "a" || len(got.Columns) != 2 {
+		t.Fatalf("main query not parsed: %+v", got)
+	}
+}
+
+// TestParseCatalogSelectMultipleCTEs freezes a two-CTE chain feeding a joined
+// main query, and confirms both CTE bodies are parsed independently.
+func TestParseCatalogSelectMultipleCTEs(t *testing.T) {
+	got, err := parseCatalogSelect(`WITH a AS (SELECT id, name FROM products), b AS (SELECT id FROM sales) SELECT a.id, a.name FROM a INNER JOIN b ON b.id = a.id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.With) != 2 || got.With[0].Name != "a" || got.With[1].Name != "b" {
+		t.Fatalf("expected CTEs a and b, got %+v", got.With)
+	}
+	if got.From.Table != "a" || len(got.Joins) != 1 || got.Joins[0].Table.Table != "b" {
+		t.Fatalf("main query join not parsed: %+v", got)
+	}
+}
+
+// TestParseCatalogSelectCTEAcceptsPostgresDeparse round-trips the exact
+// normalized definition PostgreSQL 17 emits for a CTE view (WITH preserved,
+// reindented with newlines), so a native CTE view stays resolved on inspection.
+func TestParseCatalogSelectCTEAcceptsPostgresDeparse(t *testing.T) {
+	deparse := " WITH a AS (\n         SELECT pt.id,\n            pt.name\n           FROM pt\n        )\n SELECT id,\n    name\n   FROM a;"
+	got, err := parseCatalogSelect(deparse)
+	if err != nil {
+		t.Fatalf("PostgreSQL CTE deparse did not round-trip: %v", err)
+	}
+	if len(got.With) != 1 || got.With[0].Name != "a" || got.From.Table != "a" {
+		t.Fatalf("unexpected round-tripped CTE view: %+v", got)
+	}
+}
+
+// TestParseCatalogSelectRejectsRecursiveCTE freezes the honest rejection of WITH
+// RECURSIVE: recursive termination and observable ordering are not guaranteed
+// identical between the engines, so such a view becomes unresolved, never
+// divergent SQL.
+func TestParseCatalogSelectRejectsRecursiveCTE(t *testing.T) {
+	_, err := parseCatalogSelect(`WITH RECURSIVE a AS (SELECT id FROM products) SELECT id FROM a`)
+	if err == nil {
+		t.Fatal("expected rejection for WITH RECURSIVE, got nil")
+	}
+	if !strings.Contains(err.Error(), "RECURSIVE") {
+		t.Fatalf("expected a RECURSIVE rejection, got %q", err.Error())
+	}
+}
+
+// TestParseCatalogSelectCTEInCreateView confirms the CREATE VIEW header boundary
+// is found when the body begins with WITH (the view's AS is followed by WITH, not
+// SELECT), matching how SQLite stores a CTE view verbatim.
+func TestParseCatalogSelectCTEInCreateView(t *testing.T) {
+	got, err := parseCatalogSelect(`CREATE VIEW v AS WITH a AS (SELECT id FROM products) SELECT id FROM a`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.With) != 1 || got.From.Table != "a" {
+		t.Fatalf("CREATE VIEW with CTE not parsed: %+v", got)
+	}
+}
+
+// TestParseCatalogSelectCTEOverCompound confirms a CTE can precede a compound
+// main query: the WITH list attaches to the leading query and the set-operation
+// chain is parsed as usual.
+func TestParseCatalogSelectCTEOverCompound(t *testing.T) {
+	got, err := parseCatalogSelect(`WITH a AS (SELECT id FROM products) SELECT id FROM a UNION SELECT id FROM sales`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.With) != 1 || len(got.Compounds) != 1 || got.Compounds[0].Operator != "union" {
+		t.Fatalf("expected a CTE over a union compound, got %+v", got)
+	}
+}

@@ -494,6 +494,14 @@ func compileExpressionArgs(engine Engine, args []Expression, inTrigger bool) ([]
 // operation) chain. The whole-compound ORDER BY / LIMIT / OFFSET live on the
 // leading query and are emitted once, after every branch.
 func compileSelect(engine Engine, query SelectQuery) (string, error) {
+	prefix := ""
+	if len(query.With) > 0 {
+		with, err := compileWith(engine, query.With)
+		if err != nil {
+			return "", err
+		}
+		prefix = with + " "
+	}
 	statement, err := compileSelectCore(engine, query)
 	if err != nil {
 		return "", err
@@ -521,7 +529,26 @@ func compileSelect(engine Engine, query SelectQuery) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return statement + trailing, nil
+	return prefix + statement + trailing, nil
+}
+
+// compileWith emits a WITH clause: `WITH name AS (query), ...`. Each CTE name is
+// quoted like any identifier and each query is compiled recursively with the same
+// grammar, so nested CTEs and compounds inside a CTE work. The keyword and syntax
+// are identical in SQLite and PostgreSQL.
+func compileWith(engine Engine, ctes []CommonTableExpr) (string, error) {
+	parts := make([]string, len(ctes))
+	for i, cte := range ctes {
+		if cte.Name == "" {
+			return "", fmt.Errorf("common table expression requires a name")
+		}
+		query, err := compileSelect(engine, cte.Query)
+		if err != nil {
+			return "", err
+		}
+		parts[i] = quoteIdentifier(cte.Name) + " AS (" + query + ")"
+	}
+	return "WITH " + strings.Join(parts, ", "), nil
 }
 
 // validateCompoundChain applies the same INTERSECT-mixing rule the parser uses,
@@ -556,7 +583,7 @@ func compoundOperatorSQL(operator string) (string, error) {
 // [HAVING] portion of a query, without the trailing ORDER BY / LIMIT / OFFSET,
 // so it can be reused for every branch of a compound.
 func compileSelectCore(engine Engine, query SelectQuery) (string, error) {
-	if len(query.Columns) == 0 || query.From.Table == "" {
+	if len(query.Columns) == 0 || (query.From.Table == "" && query.From.Subquery == nil) {
 		return "", fmt.Errorf("select requires projections and a source table")
 	}
 	projections := make([]string, len(query.Columns))
@@ -574,7 +601,11 @@ func compileSelectCore(engine Engine, query SelectQuery) (string, error) {
 	if query.Distinct {
 		statement += "DISTINCT "
 	}
-	statement += strings.Join(projections, ", ") + " FROM " + compileTableSource(query.From)
+	from, err := compileTableSource(engine, query.From)
+	if err != nil {
+		return "", err
+	}
+	statement += strings.Join(projections, ", ") + " FROM " + from
 	for _, join := range query.Joins {
 		kind := strings.ToUpper(join.Kind)
 		switch kind {
@@ -582,7 +613,11 @@ func compileSelectCore(engine Engine, query SelectQuery) (string, error) {
 		default:
 			return "", fmt.Errorf("unsupported join kind %q", join.Kind)
 		}
-		statement += " " + kind + " JOIN " + compileTableSource(join.Table)
+		joinSource, err := compileTableSource(engine, join.Table)
+		if err != nil {
+			return "", err
+		}
+		statement += " " + kind + " JOIN " + joinSource
 		if kind != "CROSS" {
 			on, err := compileExpression(engine, join.On)
 			if err != nil {
@@ -655,12 +690,27 @@ func compileSelectTrailing(engine Engine, query SelectQuery) (string, error) {
 	return trailing, nil
 }
 
-func compileTableSource(source TableSource) string {
+// compileTableSource emits a FROM/JOIN source: a quoted table name, or a derived
+// table `(subquery) AS alias`. The subquery is compiled recursively with the same
+// grammar; a derived table always carries its alias. The syntax is identical in
+// SQLite and PostgreSQL.
+func compileTableSource(engine Engine, source TableSource) (string, error) {
+	if source.Subquery != nil {
+		subquery, err := compileSelect(engine, *source.Subquery)
+		if err != nil {
+			return "", err
+		}
+		compiled := "(" + subquery + ")"
+		if source.Alias != "" {
+			compiled += " AS " + quoteIdentifier(source.Alias)
+		}
+		return compiled, nil
+	}
 	compiled := quoteIdentifier(source.Table)
 	if source.Alias != "" {
 		compiled += " AS " + quoteIdentifier(source.Alias)
 	}
-	return compiled
+	return compiled, nil
 }
 
 func compileTrigger(engine Engine, trigger Trigger) ([]string, error) {
