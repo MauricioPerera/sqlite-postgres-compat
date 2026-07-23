@@ -15,7 +15,7 @@
 | Clave foránea | Compuesta; `NO ACTION`, `RESTRICT`, `CASCADE`, `SET NULL`, `SET DEFAULT` | Acciones comunes de ambos catálogos | `MATCH` no común, diferimiento y extensiones del motor |
 | `CHECK` | Expresiones del AST común | Operadores, literales y funciones comunes reconocidas | Expresiones arbitrarias del dialecto |
 | Índices | Únicos, parciales, varias columnas, `ASC`/`DESC`, y **claves de expresión** `(expr)` de la gramática canónica (función/operador; únicos y mezclados con columnas) | B-tree por columnas y por expresión (reconstruida desde `CREATE INDEX` en SQLite y `pg_get_indexdef` en PostgreSQL cuando el deparse cae dentro de la gramática) más predicados parciales comunes | Expresiones que el motor reescribe fuera de la gramática (p.ej. PostgreSQL añade `::text` a un literal: `coalesce(email, 'x')` → `COALESCE(email, 'x'::text)`) quedan `No resuelto`; también métodos, colaciones y clases de operador específicas |
-| Vistas | Proyección, filtro, joins, agregación, orden, límite, desplazamiento, operaciones de conjuntos (`UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`), tablas derivadas (`FROM (SELECT …) alias`) y CTE no recursivas (`WITH … AS (…)`) | `INNER`, `LEFT`, `CROSS`, `GROUP BY`, `HAVING`, agregados comunes, compounds de conjuntos con precedencia igual entre motores, subconsultas en `FROM` (tabla derivada, no correlacionable) y `WITH` no recursivo | `WITH RECURSIVE`; subconsultas en la gramática de expresiones (incluido `x IN (SELECT …)`); subconsultas correlacionadas y `EXISTS`; ventanas; tabla derivada sin alias; y cadenas de compound que mezclan `INTERSECT` con `UNION`/`EXCEPT` (precedencia divergente entre motores) |
+| Vistas | Proyección, filtro, joins, agregación, orden, límite, desplazamiento, operaciones de conjuntos (`UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`), tablas derivadas (`FROM (SELECT …) alias`) y CTE no recursivas (`WITH … AS (…)`) | `INNER`, `LEFT`, `CROSS`, `GROUP BY`, `HAVING`, agregados comunes, compounds de conjuntos con precedencia igual entre motores, subconsultas en `FROM` (tabla derivada, no correlacionable) y `WITH` no recursivo | `WITH RECURSIVE` (investigado contra motores reales; ver abajo); subconsultas en la gramática de expresiones (incluido `x IN (SELECT …)`); subconsultas correlacionadas y `EXISTS`; ventanas; tabla derivada sin alias; y cadenas de compound que mezclan `INTERSECT` con `UNION`/`EXCEPT` (precedencia divergente entre motores) |
 | Triggers | `BEFORE`/`AFTER`; eventos y acciones `INSERT`/`UPDATE`/`DELETE` | Auditoría basada en `NEW`/`OLD` | Control de flujo, SQL dinámico y código procedural arbitrario |
 | Rutinas | Acciones transaccionales del runtime común (`INSERT`/`UPDATE`/`DELETE`) | Procedimientos SQL/PLpgSQL parametrizados con acciones `INSERT`/`UPDATE`/`DELETE` y `WHERE` restringido a comparaciones columna↔parámetro/literal compuestas con `AND`/`OR`/`NOT` | Funciones con retorno, modos avanzados y lógica procedural arbitraria |
 | JSON | Texto canónico sin pérdida de representación | Columnas JSON/JSONB se reconocen | Operadores e índices JSON específicos |
@@ -23,6 +23,33 @@
 | Vector | `vector(N)` con dimensión canónica | `F32_BLOB(N)` de libSQL y `vector` de pgvector se reconocen | Tipos vectoriales no modelados, índices ANN y funciones de distancia nativas |
 | Timestamp | Texto canónico RFC3339Nano | Tipos timestamp se reconocen | Semántica arbitraria de zona, infinidades y funciones específicas |
 | Búsqueda textual | Tokenización Unicode determinista en Go | No se traduce FTS nativo | Ranking, stemming, diccionarios, FTS5, `tsvector`/`tsquery` arbitrarios |
+
+## `WITH RECURSIVE` (rechazado, con evidencia)
+
+`WITH RECURSIVE` se rechaza (`Exact = false`), no por falta de sintaxis sino por
+**riesgo semántico real** verificado contra SQLite real y PostgreSQL 17 real
+(evidencia completa en [reports/FEAT-RECURSIVECTE-REPORT.md](reports/FEAT-RECURSIVECTE-REPORT.md)):
+
+- **Terminación (bloqueante).** Sobre datos cíclicos (`A→B→A`) alimentando el
+  acumulador de profundidad/path que lleva casi toda query de árbol, el dedup de
+  filas completas de `UNION` nunca se dispara (cada fila es única por la
+  profundidad creciente) y **ambos** motores se desbocan de forma **divergente**:
+  SQLite no tiene guardia de iteración del lado servidor (3.178.564 filas en 6 s,
+  detenido sólo por cancelación de cliente); PostgreSQL tampoco tiene límite
+  nativo (se detuvo por `statement_timeout`, con 222.940 filas — un conteo
+  distinto). No hay un resultado común y acotado que comparar. La aciclicidad **no
+  es verificable en compilación** (una `FOREIGN KEY` no impide `A→B→A`).
+- **Sin guarda de ciclo nativa portable.** La cláusula `CYCLE` del estándar SQL
+  (PostgreSQL 14+) es un **error de sintaxis en SQLite**, y la guarda por arrays
+  (`= ANY(path)`) no tiene equivalente en SQLite (sin tipo array). La gramática
+  canónica no puede expresar una guarda de path portable, y la corrección de una
+  guarda ad-hoc no es verificable sintácticamente.
+- **Orden (arreglable, pero no es el bloqueante).** Sin `ORDER BY` el orden de
+  filas diverge sobre el mismo árbol acíclico (SQLite `1,2,3,4,5,6` vs PostgreSQL
+  `1,3,2,6,5,4`); con `ORDER BY depth,id` explícito ambos coinciden.
+
+Como ningún subconjunto puede garantizarse byte-idéntico ni con guardas
+sintácticas obligatorias, se conserva el rechazo.
 
 ## Columnas generadas
 
