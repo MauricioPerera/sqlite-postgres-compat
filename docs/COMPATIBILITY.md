@@ -10,7 +10,7 @@
 
 | Familia | AST canónico | Catálogo externo traducible | Fuera de cobertura actual |
 |---|---|---|---|
-| Tablas y columnas | Tipos escalares del modelo; columnas generadas `STORED` (`GENERATED ALWAYS AS (<expr>) STORED`) con expresión en la gramática canónica | Afinidades SQLite y tipos PostgreSQL conocidos; columnas generadas `STORED` reconstruidas desde el catálogo (`pragma_table_xinfo` hidden=3 en SQLite, `is_generated='ALWAYS'` en PostgreSQL) | Tipos de usuario, dominios, arrays y semántica específica no modelada; columnas generadas `VIRTUAL` (PostgreSQL no las soporta), de identidad, y expresiones de generación fuera de la gramática (quedan `No resuelto`) |
+| Tablas y columnas | Tipos escalares del modelo; columnas generadas `STORED` (`GENERATED ALWAYS AS (<expr>) STORED`) con expresión en la gramática canónica; **dominios** (`CREATE DOMAIN` nativo en PostgreSQL, inline base+CHECK en SQLite) con CHECK en la gramática canónica | Afinidades SQLite y tipos PostgreSQL conocidos; columnas generadas `STORED` reconstruidas desde el catálogo (`pragma_table_xinfo` hidden=3 en SQLite, `is_generated='ALWAYS'` en PostgreSQL) | Tipos de usuario, arrays y semántica específica no modelada; columnas generadas `VIRTUAL` (PostgreSQL no las soporta), de identidad, y expresiones de generación fuera de la gramática (quedan `No resuelto`); **inspección externa de un dominio** — nunca existió como tal en SQLite (aparece como columna+CHECK) y PostgreSQL deparsa el CHECK con `VALUE` fuera de la gramática, por lo que una columna de tipo dominio queda `No resuelto` (`domain_column`) |
 | Clave primaria y `UNIQUE` | Simples y compuestas | Pragmas SQLite y `pg_constraint` | Diferimiento y extensiones específicas |
 | Clave foránea | Compuesta; `NO ACTION`, `RESTRICT`, `CASCADE`, `SET NULL`, `SET DEFAULT` | Acciones comunes de ambos catálogos | `MATCH` no común, diferimiento y extensiones del motor |
 | `CHECK` | Expresiones del AST común | Operadores, literales y funciones comunes reconocidas | Expresiones arbitrarias del dialecto |
@@ -29,6 +29,20 @@
 Se soportan columnas generadas **`STORED`** (`col TIPO GENERATED ALWAYS AS (<expr>) STORED`), sintaxis idéntica en SQLite (≥ 3.31) y PostgreSQL (≥ 12). La expresión de generación usa la gramática canónica de expresiones (misma que `CHECK`/`DEFAULT`). Ambos motores recomputan el valor de forma determinista en el destino: esa recomputación idéntica **es** la prueba de equivalencia. La cadena de datos nunca escribe una columna generada — se excluye de la lista de columnas de todo `INSERT`/`UPDATE` (snapshot y replicación) y el motor destino la recalcula.
 
 Restricciones (validadas en `Schema.Validate`, ambos motores las imponen): una columna generada no puede tener `DEFAULT` a la vez, no puede formar parte de una clave primaria, y **`VIRTUAL` se rechaza explícitamente** (PostgreSQL no lo soporta) — nunca se emite; en inspección nativa una columna `VIRTUAL`, de identidad o con expresión fuera de la gramática queda `No resuelto` (`Exact = false`), no degradada en silencio.
+
+## Dominios
+
+Un **dominio** (`Domain{Name, Type base, Check, NotNull, Default}`) es un tipo con nombre = tipo base + `CHECK` opcional (+ `NOT NULL`/`DEFAULT` opcionales). Se soporta como objeto canónico, con una **asimetría explícita e inevitable** entre motores:
+
+- **PostgreSQL** tiene dominios nativos: se emite `CREATE DOMAIN "nombre" AS <tipo base> [DEFAULT …] [NOT NULL] [CHECK (…)]` antes de las tablas, y la columna usa el nombre del dominio como tipo. El `CHECK` referencia el valor con la palabra clave `VALUE`.
+- **SQLite no tiene dominios**: la única forma portable es **inline** — cada columna que usa el dominio recibe el tipo base + el `CHECK` (+ `NOT NULL`/`DEFAULT`) del dominio, con el placeholder del valor resuelto al nombre de la columna. El resultado es **semánticamente equivalente** (mismo tipo base, misma restricción) al dominio de PostgreSQL, y el dato almacenado es idéntico.
+
+Una columna referencia un dominio con `Column.DomainRef` (campo aditivo `omitempty`); debe conservar `Type` igual al tipo base del dominio (la cadena de datos canoniza por `Column.Type.Family`) y ser neutra (`Nullable=true`, sin `Default` ni `Generated` propios), de modo que el dominio sea la única fuente de la restricción. El `CHECK` del dominio usa la gramática canónica de expresiones (el valor bajo prueba es el nodo `domain_value`); una expresión fuera de la gramática se rechaza al compilar. `Schema.Validate` rechaza dominios sin nombre/duplicados/sin tipo base, y columnas que referencian un dominio inexistente, con tipo que no coincide, o no neutras.
+
+**Round-trip y asimetría.** La ruta canónica (esquema creado por esta capa, guardado en `__compat_schema`) preserva el dominio en metadata y **round-tripea exacto en ambos motores** — es la prueba principal. La **inspección externa** no reconstruye "un dominio":
+
+- En **SQLite** un dominio nunca existió; la columna inline aparece como columna + `CHECK` y se reconstruye exacta **como columna** (no como dominio). No es una divergencia de datos, sólo una diferencia de forma, y es aceptable.
+- En **PostgreSQL** el deparse del `CHECK` del dominio usa `VALUE` (y añade `::type`), fuera de la gramática canónica, así que una columna de tipo dominio queda en `Inspection.Unresolved` (`kind=domain_column`, `Exact=false`) en vez de degradarse en silencio a su tipo escalar subyacente.
 
 ## Gramática de expresiones y funciones
 

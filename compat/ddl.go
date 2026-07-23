@@ -16,9 +16,26 @@ func CompileDDL(target Target, schema Schema) ([]string, error) {
 		return nil, err
 	}
 
-	statements := make([]string, 0, len(schema.Tables)+len(schema.Indexes)+len(schema.Views)+len(schema.Triggers)*2)
+	domains := make(map[string]Domain, len(schema.Domains))
+	for _, domain := range schema.Domains {
+		domains[domain.Name] = domain
+	}
+
+	statements := make([]string, 0, len(schema.Domains)+len(schema.Tables)+len(schema.Indexes)+len(schema.Views)+len(schema.Triggers)*2)
+	// Native domains are emitted before the tables that reference them. On SQLite
+	// compileDomain returns no statement (the engine has no CREATE DOMAIN); the
+	// referencing columns are inlined in compileTable instead.
+	for _, domain := range schema.Domains {
+		statement, err := compileDomain(target.Engine, domain)
+		if err != nil {
+			return nil, fmt.Errorf("domain %s: %w", domain.Name, err)
+		}
+		if statement != "" {
+			statements = append(statements, statement)
+		}
+	}
 	for _, table := range schema.Tables {
-		statement, err := compileTable(target.Engine, table)
+		statement, err := compileTable(target.Engine, table, domains)
 		if err != nil {
 			return nil, err
 		}
@@ -84,9 +101,111 @@ func compileIndex(engine Engine, index Index) (string, error) {
 	return statement, nil
 }
 
-func compileTable(engine Engine, table Table) (string, error) {
+// compileDomain emits a native PostgreSQL domain
+// (`CREATE DOMAIN "name" AS <base type> [DEFAULT ...] [NOT NULL] [CHECK (...)]`).
+// The CHECK's domain_value placeholder compiles to the VALUE keyword. SQLite has
+// no CREATE DOMAIN, so it returns the empty string and the domain is inlined into
+// each referencing column by compileColumnWithDomain.
+func compileDomain(engine Engine, domain Domain) (string, error) {
+	if engine != Postgres {
+		return "", nil
+	}
+	typeSQL, err := compileType(engine, domain.Type)
+	if err != nil {
+		return "", err
+	}
+	statement := "CREATE DOMAIN " + quoteIdentifier(domain.Name) + " AS " + typeSQL
+	if domain.Default != nil {
+		defaultSQL, err := compileExpression(engine, *domain.Default)
+		if err != nil {
+			return "", err
+		}
+		statement += " DEFAULT " + defaultSQL
+	}
+	if domain.NotNull {
+		statement += " NOT NULL"
+	}
+	if domain.Check != nil {
+		check, err := compileExpression(engine, *domain.Check)
+		if err != nil {
+			return "", err
+		}
+		statement += " CHECK (" + check + ")"
+	}
+	return statement, nil
+}
+
+// compileColumnWithDomain compiles a column that references a domain. On
+// PostgreSQL the column's SQL type is simply the domain name (the domain carries
+// the CHECK/NOT NULL/DEFAULT). On SQLite, which has no domains, the domain is
+// inlined: the base type plus NOT NULL/DEFAULT/CHECK, with the CHECK's
+// domain_value placeholder resolved to this column's name. Schema.Validate
+// guarantees the referencing column is neutral (nullable, no own default, not
+// generated), so the domain is the single source of the constraint on both
+// engines and stored data is identical.
+func compileColumnWithDomain(engine Engine, column Column, domain Domain) (string, error) {
+	if engine == Postgres {
+		return quoteIdentifier(column.Name) + " " + quoteIdentifier(domain.Name), nil
+	}
+	typeSQL, err := compileType(engine, domain.Type)
+	if err != nil {
+		return "", err
+	}
+	definition := quoteIdentifier(column.Name) + " " + typeSQL
+	if domain.NotNull {
+		definition += " NOT NULL"
+	}
+	if domain.Default != nil {
+		defaultSQL, err := compileExpression(engine, *domain.Default)
+		if err != nil {
+			return "", err
+		}
+		definition += " DEFAULT " + defaultSQL
+	}
+	if domain.Check != nil {
+		check, err := compileExpression(engine, substituteDomainValue(*domain.Check, column.Name))
+		if err != nil {
+			return "", err
+		}
+		definition += " CHECK (" + check + ")"
+	}
+	return definition, nil
+}
+
+// substituteDomainValue returns a copy of expression with every domain_value
+// placeholder node replaced by a reference to the named column. It is used to
+// inline a domain CHECK into a SQLite column, where the value under test is the
+// column itself (PostgreSQL keeps the VALUE keyword instead).
+func substituteDomainValue(expression Expression, column string) Expression {
+	if expression.Kind == "domain_value" {
+		return Expression{Kind: "column", Value: column}
+	}
+	if len(expression.Args) == 0 {
+		return expression
+	}
+	args := make([]Expression, len(expression.Args))
+	for i, arg := range expression.Args {
+		args[i] = substituteDomainValue(arg, column)
+	}
+	expression.Args = args
+	return expression
+}
+
+func compileTable(engine Engine, table Table, domains map[string]Domain) (string, error) {
 	parts := make([]string, 0, len(table.Columns)+len(table.Constraints))
 	for _, column := range table.Columns {
+		if column.DomainRef != "" {
+			domain, ok := domains[column.DomainRef]
+			if !ok {
+				return "", fmt.Errorf("%s.%s references unknown domain %q", table.Name, column.Name, column.DomainRef)
+			}
+			definition, err := compileColumnWithDomain(engine, column, domain)
+			if err != nil {
+				return "", fmt.Errorf("%s.%s domain %s: %w", table.Name, column.Name, column.DomainRef, err)
+			}
+			parts = append(parts, definition)
+			continue
+		}
 		typeSQL, err := compileType(engine, column.Type)
 		if err != nil {
 			return "", fmt.Errorf("%s.%s: %w", table.Name, column.Name, err)
@@ -288,6 +407,16 @@ func compileExpressionIn(engine Engine, expression Expression, inTrigger bool) (
 		return "", fmt.Errorf("invalid boolean %q", expression.Value)
 	case "column":
 		return compileColumnExpression(expression.Value, inTrigger)
+	case "domain_value":
+		// The value under test inside a domain CHECK. PostgreSQL uses the VALUE
+		// keyword. On SQLite the placeholder is resolved to the referencing column
+		// name by substituteDomainValue before compilation, so reaching this branch
+		// for SQLite means an unresolved placeholder — reject it rather than emit
+		// invalid SQL.
+		if engine == Postgres {
+			return "VALUE", nil
+		}
+		return "", fmt.Errorf("domain value placeholder must be resolved to a column for %s", engine)
 	case "star":
 		return "*", nil
 	case "and", "or", "eq", "ne", "lt", "lte", "gt", "gte", "add", "sub", "mul", "div", "like", "concat":

@@ -81,6 +81,96 @@ func TestCompileGeneratedStoredColumnForBothEngines(t *testing.T) {
 	}
 }
 
+// domainTestSchema builds a table whose columns reference three domains that
+// exercise a CHECK over the value (integer > 0), a CHECK over a function of the
+// value (length(text) > 0), and a NOT NULL + DEFAULT domain with no CHECK.
+func domainTestSchema() Schema {
+	gtZero := Expression{Kind: "gt", Args: []Expression{{Kind: "domain_value"}, {Kind: "integer", Value: "0"}}}
+	lenGtZero := Expression{Kind: "gt", Args: []Expression{{Kind: "length", Args: []Expression{{Kind: "domain_value"}}}, {Kind: "integer", Value: "0"}}}
+	defNew := Expression{Kind: "string", Value: "new"}
+	return Schema{
+		Domains: []Domain{
+			{Name: "positive_qty", Type: Type{Family: IntegerType}, Check: &gtZero, NotNull: true},
+			{Name: "email_addr", Type: Type{Family: TextType}, Check: &lenGtZero},
+			{Name: "status", Type: Type{Family: TextType}, Default: &defNew, NotNull: true},
+		},
+		Tables: []Table{{
+			Name: "items",
+			Columns: []Column{
+				{Name: "id", Type: Type{Family: IntegerType}},
+				{Name: "qty", Type: Type{Family: IntegerType}, Nullable: true, DomainRef: "positive_qty"},
+				{Name: "label", Type: Type{Family: TextType}, Nullable: true, DomainRef: "email_addr"},
+				{Name: "st", Type: Type{Family: TextType}, Nullable: true, DomainRef: "status"},
+			},
+			Constraints: []Constraint{{Kind: PrimaryKey, Columns: []string{"id"}}},
+		}},
+	}
+}
+
+// TestCompileDomainForBothEngines freezes the asymmetric-but-equivalent DDL for
+// SQL domains. PostgreSQL emits native CREATE DOMAIN statements before the table
+// and the columns reference the domain by name. SQLite, which has no domains,
+// emits no CREATE DOMAIN and inlines each domain's base type + CHECK/NOT
+// NULL/DEFAULT into the referencing column, with the CHECK's domain_value
+// placeholder resolved to the column name (VALUE on PostgreSQL). The base type
+// differs per engine (INTEGER vs BIGINT) but the enforced constraint is the same.
+func TestCompileDomainForBothEngines(t *testing.T) {
+	schema := domainTestSchema()
+	sqlite, err := CompileDDL(Target{Engine: SQLite, Version: Version{Major: 3}}, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postgres, err := CompileDDL(Target{Engine: Postgres, Version: Version{Major: 17}}, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantPostgres := []string{
+		`CREATE DOMAIN "positive_qty" AS BIGINT NOT NULL CHECK ((VALUE > 0))`,
+		`CREATE DOMAIN "email_addr" AS TEXT CHECK ((LENGTH(VALUE) > 0))`,
+		`CREATE DOMAIN "status" AS TEXT DEFAULT 'new' NOT NULL`,
+		`CREATE TABLE "items" ("id" BIGINT NOT NULL, "qty" "positive_qty", "label" "email_addr", "st" "status", PRIMARY KEY ("id"))`,
+	}
+	if len(postgres) != len(wantPostgres) {
+		t.Fatalf("postgres statement count = %d, want %d: %#v", len(postgres), len(wantPostgres), postgres)
+	}
+	for i, want := range wantPostgres {
+		if postgres[i] != want {
+			t.Fatalf("postgres[%d]\n  got %s\n want %s", i, postgres[i], want)
+		}
+	}
+
+	// SQLite emits no CREATE DOMAIN; the single statement is the table with the
+	// domains inlined per referencing column.
+	wantSQLite := `CREATE TABLE "items" ("id" INTEGER NOT NULL, "qty" INTEGER NOT NULL CHECK (("qty" > 0)), "label" TEXT CHECK ((LENGTH("label") > 0)), "st" TEXT NOT NULL DEFAULT 'new', PRIMARY KEY ("id"))`
+	if len(sqlite) != 1 {
+		t.Fatalf("sqlite statement count = %d, want 1: %#v", len(sqlite), sqlite)
+	}
+	if sqlite[0] != wantSQLite {
+		t.Fatalf("sqlite\n  got %s\n want %s", sqlite[0], wantSQLite)
+	}
+}
+
+// TestCompileDomainRejectsOutOfGrammarCheck confirms a domain CHECK outside the
+// canonical expression grammar (an unsupported function) is rejected by CompileDDL
+// on both engines, exactly like any other expression — the domain does not open a
+// hole in the grammar.
+func TestCompileDomainRejectsOutOfGrammarCheck(t *testing.T) {
+	badCheck := Expression{Kind: "substr", Args: []Expression{{Kind: "domain_value"}, {Kind: "integer", Value: "1"}}}
+	schema := Schema{
+		Domains: []Domain{{Name: "bad", Type: Type{Family: TextType}, Check: &badCheck}},
+		Tables: []Table{{
+			Name:    "t",
+			Columns: []Column{{Name: "c", Type: Type{Family: TextType}, Nullable: true, DomainRef: "bad"}},
+		}},
+	}
+	for _, engine := range []Engine{SQLite, Postgres} {
+		if _, err := CompileDDL(Target{Engine: engine, Version: Version{Major: 17}}, schema); err == nil {
+			t.Fatalf("%s: expected out-of-grammar domain CHECK to be rejected", engine)
+		}
+	}
+}
+
 func TestPostgresTimestampUsesLosslessTextStorage(t *testing.T) {
 	typ, err := compileType(Postgres, Type{Family: TimestampType})
 	if err != nil {

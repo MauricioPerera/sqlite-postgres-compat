@@ -248,6 +248,47 @@ func TestInspectCanonicalMetadataExpressionIndexRoundTrip(t *testing.T) {
 	}
 }
 
+// TestInspectCanonicalMetadataDomainRoundTrip is the primary proof for domains:
+// a schema with a domain used by a column, applied to SQLite (where the domain is
+// inlined) and read back through the canonical metadata (__compat_schema), must
+// reconstruct byte-for-byte — domain definition and DomainRef included. This is
+// the exact round-trip both engines share; external SQLite inspection does NOT
+// rebuild a domain (the column appears as a plain column + CHECK), which is
+// documented as the accepted asymmetry.
+func TestInspectCanonicalMetadataDomainRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	check := Expression{Kind: "gt", Args: []Expression{{Kind: "domain_value"}, {Kind: "integer", Value: "0"}}}
+	schema := Schema{
+		Domains: []Domain{{Name: "positive_qty", Type: Type{Family: IntegerType}, Check: &check, NotNull: true}},
+		Tables: []Table{{
+			Name: "items",
+			Columns: []Column{
+				{Name: "id", Type: Type{Family: IntegerType}},
+				{Name: "qty", Type: Type{Family: IntegerType}, Nullable: true, DomainRef: "positive_qty"},
+			},
+			Constraints: []Constraint{{Kind: PrimaryKey, Columns: []string{"id"}}},
+		}},
+	}
+	store, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := store.InspectSchema(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inspection.Exact || inspection.Source != "canonical_metadata" {
+		t.Fatalf("unexpected inspection: %+v", inspection)
+	}
+	if !reflect.DeepEqual(schema, inspection.Schema) {
+		t.Fatalf("schema mismatch:\n want %+v\n  got %+v", schema, inspection.Schema)
+	}
+}
+
 func TestReservedMetadataTableIsRejected(t *testing.T) {
 	for _, name := range []string{schemaMetadataTable, appliedChangesTable, captureStateTable, changeJournalTable} {
 		schema := Schema{Tables: []Table{{Name: name, Columns: []Column{{Name: "x", Type: Type{Family: TextType}}}}}}

@@ -451,7 +451,7 @@ func (store *Store) inspectPostgresColumns(ctx context.Context, inspection *Insp
 					JOIN pg_namespace n ON n.oid = cl.relnamespace
 					WHERE n.nspname = c.table_schema AND cl.relname = c.table_name AND a.attname = c.column_name AND NOT a.attisdropped), -1)
 				ELSE -1 END AS atttypmod,
-			c.is_nullable, c.column_default, c.is_identity, c.is_generated, c.generation_expression
+			c.is_nullable, c.column_default, c.is_identity, c.is_generated, c.generation_expression, c.domain_name
 			FROM information_schema.columns c
 			WHERE c.table_schema = current_schema() AND c.table_name NOT IN ($1, $2, $3, $4)
 			AND c.table_name IN (SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE')
@@ -463,9 +463,9 @@ func (store *Store) inspectPostgresColumns(ctx context.Context, inspection *Insp
 	var order []string
 	for rows.Next() {
 		var tableName, columnName, dataType, udtName, nullable, identity, generated string
-		var defaultSQL, generationExpr sql.NullString
+		var defaultSQL, generationExpr, domainName sql.NullString
 		var atttypmod int
-		if err := rows.Scan(&tableName, &columnName, &dataType, &udtName, &atttypmod, &nullable, &defaultSQL, &identity, &generated, &generationExpr); err != nil {
+		if err := rows.Scan(&tableName, &columnName, &dataType, &udtName, &atttypmod, &nullable, &defaultSQL, &identity, &generated, &generationExpr, &domainName); err != nil {
 			return nil, nil, err
 		}
 		table := tables[tableName]
@@ -473,6 +473,17 @@ func (store *Store) inspectPostgresColumns(ctx context.Context, inspection *Insp
 			table = &Table{Name: tableName}
 			tables[tableName] = table
 			order = append(order, tableName)
+		}
+		if domainName.Valid && domainName.String != "" {
+			// A domain-typed column. External inspection cannot rebuild the domain as
+			// a canonical Domain: the base type is recoverable, but PostgreSQL deparses
+			// the domain's CHECK with the VALUE keyword (and adds ::type casts) into a
+			// form outside the canonical grammar, so reconstructing it exactly is not
+			// possible here. Surface it as unresolved rather than silently degrading to
+			// the underlying scalar type. The canonical metadata path (__compat_schema)
+			// round-trips the domain exactly; this branch only affects inspection of an
+			// external database created outside this layer.
+			inspection.Unresolved = append(inspection.Unresolved, CatalogObject{Kind: "domain_column", Name: tableName + "." + columnName, Definition: domainName.String, Reason: "domain-typed column is only reconstructed via canonical metadata; external inspection does not rebuild the domain"})
 		}
 		columnType := postgresType(dataType, udtName, atttypmod)
 		if columnType.Family == VectorType && len(columnType.Arguments) == 0 {

@@ -2071,3 +2071,115 @@ func TestSystemExpressionIndexNativeInspectionRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// TestSystemDomainCopyEquivalentAndExternalInspection exercises SQL domains end
+// to end against real engines. It proves two things:
+//
+//  1. Data equivalence across the asymmetric compile paths. A schema with two
+//     domains (a CHECK over the value, and a CHECK over a function of the value)
+//     used by columns is applied to real SQLite (domains inlined as base type +
+//     CHECK) and, via a snapshot copy, to real PostgreSQL (native CREATE DOMAIN +
+//     columns referencing it). Valid rows are inserted, the source snapshot is
+//     imported into PostgreSQL, and the re-exported destination snapshot must be
+//     equivalent — the constraint is enforced on both engines and the stored data
+//     coincides byte-for-byte. A green ImportSnapshot also proves real PostgreSQL
+//     accepts the emitted CREATE DOMAIN + domain-typed columns.
+//
+//  2. Honest external inspection. A domain-typed column created by raw DDL (no
+//     __compat_schema metadata) is surfaced as an unresolved domain_column rather
+//     than silently degraded to its underlying scalar type — PostgreSQL deparses
+//     the domain CHECK with the VALUE keyword, outside the canonical grammar, so
+//     the domain cannot be rebuilt exactly from the external catalog.
+func TestSystemDomainCopyEquivalentAndExternalInspection(t *testing.T) {
+	ctx := context.Background()
+
+	posCheck := compat.Expression{Kind: "gt", Args: []compat.Expression{{Kind: "domain_value"}, {Kind: "integer", Value: "0"}}}
+	nonEmpty := compat.Expression{Kind: "gt", Args: []compat.Expression{
+		{Kind: "length", Args: []compat.Expression{{Kind: "domain_value"}}},
+		{Kind: "integer", Value: "0"},
+	}}
+	schema := compat.Schema{
+		Domains: []compat.Domain{
+			{Name: "cuboa5_positive_qty", Type: compat.Type{Family: compat.IntegerType}, Check: &posCheck, NotNull: true},
+			{Name: "cuboa5_nonempty_label", Type: compat.Type{Family: compat.TextType}, Check: &nonEmpty},
+		},
+		Tables: []compat.Table{{
+			Name: "cuboa5_items",
+			Columns: []compat.Column{
+				{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+				{Name: "qty", Type: compat.Type{Family: compat.IntegerType}, Nullable: true, DomainRef: "cuboa5_positive_qty"},
+				{Name: "label", Type: compat.Type{Family: compat.TextType}, Nullable: true, DomainRef: "cuboa5_nonempty_label"},
+			},
+			Constraints: []compat.Constraint{{Kind: compat.PrimaryKey, Columns: []string{"id"}}},
+		}},
+	}
+
+	// Phase 1: SQLite (inlined domains) -> PostgreSQL (native domains), equivalent.
+	source := openSQLite(t, filepath.Join(t.TempDir(), "domain-source.db"))
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO cuboa5_items (id, qty, label) VALUES (?, ?, ?), (?, ?, ?)`,
+		1, 5, "alpha", 2, 10, "beta"); err != nil {
+		t.Fatal(err)
+	}
+	sourceSnapshot, err := source.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postgres := openPostgres(t)
+	if _, err := postgres.DB.ExecContext(ctx, `DROP SCHEMA public CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := postgres.DB.ExecContext(ctx, `CREATE SCHEMA public`); err != nil {
+		t.Fatal(err)
+	}
+	if err := postgres.ImportSnapshot(ctx, sourceSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	postgresSnapshot, err := postgres.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEquivalent(t, sourceSnapshot, postgresSnapshot)
+
+	// The native PostgreSQL domain must actually enforce the CHECK: an invalid row
+	// (qty = 0) is rejected by the engine, proving the constraint is live, not
+	// cosmetic.
+	if _, err := postgres.DB.ExecContext(ctx, `INSERT INTO cuboa5_items (id, qty, label) VALUES (3, 0, 'gamma')`); err == nil {
+		t.Fatal("postgres domain CHECK (VALUE > 0) must reject qty = 0")
+	}
+
+	// Phase 2: external inspection of a raw domain column is honestly unresolved.
+	external := openPostgres(t)
+	if _, err := external.DB.ExecContext(ctx, `DROP SCHEMA public CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := external.DB.ExecContext(ctx, `CREATE SCHEMA public`); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`CREATE DOMAIN cuboa5_ext_pos AS integer CHECK (VALUE > 0)`,
+		`CREATE TABLE cuboa5_ext (id integer PRIMARY KEY, qty cuboa5_ext_pos NOT NULL)`,
+	} {
+		if _, err := external.DB.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("external DDL %q: %v", statement, err)
+		}
+	}
+	inspection, err := external.InspectSchema(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Exact {
+		t.Fatalf("external inspection must not be exact while a domain column is unresolved: %+v", inspection)
+	}
+	var found bool
+	for _, object := range inspection.Unresolved {
+		if object.Kind == "domain_column" && strings.Contains(object.Name, "cuboa5_ext.qty") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("external domain column must be reported as unresolved domain_column: %+v", inspection.Unresolved)
+	}
+}

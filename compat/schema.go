@@ -1,16 +1,57 @@
 package compat
 
-import "fmt"
+import (
+	"fmt"
+	"reflect"
+)
 
 // Schema is the engine-neutral representation used before emitting SQLite or
 // PostgreSQL DDL. Every engine-specific construct must be represented as an
 // explicit capability rather than hidden in a raw SQL string.
 type Schema struct {
-	Tables   []Table   `json:"tables"`
-	Indexes  []Index   `json:"indexes,omitempty"`
+	Tables  []Table `json:"tables"`
+	Indexes []Index `json:"indexes,omitempty"`
+	// Domains is the list of named SQL domains (a base type plus an optional
+	// CHECK, NOT NULL and DEFAULT). It is additive and omitempty, so a schema
+	// without domains stays byte-identical in the canonical JSON and in every
+	// emitted statement. PostgreSQL has native domains (CREATE DOMAIN emitted
+	// before the tables); SQLite has none, so a column that references a domain is
+	// inlined with the domain's base type + CHECK (+ NOT NULL/DEFAULT). See Domain.
+	Domains  []Domain  `json:"domains,omitempty"`
 	Views    []View    `json:"views,omitempty"`
 	Triggers []Trigger `json:"triggers,omitempty"`
 	Routines []Routine `json:"routines,omitempty"`
+}
+
+// Domain is a named SQL domain: a base Type plus an optional CHECK constraint,
+// NOT NULL flag and DEFAULT expression. It is asymmetric across the two engines
+// by nature:
+//
+//   - PostgreSQL emits a native CREATE DOMAIN and columns reference it by name.
+//   - SQLite has no domains, so every column that references the domain is
+//     compiled INLINE with the domain's base type and the same CHECK/NOT
+//     NULL/DEFAULT — semantically equivalent (same base type, same constraint),
+//     the only portable rendering.
+//
+// The CHECK expression refers to the value under test with the placeholder node
+// Expression{Kind:"domain_value"}: it compiles to the SQL keyword VALUE on
+// PostgreSQL (the domain's own value) and to the referencing column's name when
+// inlined on SQLite. Grammar validity of the CHECK is enforced at compile time
+// by the same compileExpression path as any other expression, so an
+// out-of-grammar CHECK fails with an explicit error.
+//
+// A domain is a schema-level constraint, not data: the stored value is identical
+// whether the constraint is enforced by a native PG domain or by an inline SQLite
+// CHECK, so data fidelity is preserved. Only the canonical path (schema created by
+// this layer, kept in __compat_schema) round-trips the domain exactly; external
+// inspection cannot rebuild a domain that never physically existed as such (see
+// docs/COMPATIBILITY.md).
+type Domain struct {
+	Name    string      `json:"name"`
+	Type    Type        `json:"type"`
+	Check   *Expression `json:"check,omitempty"`
+	NotNull bool        `json:"not_null,omitempty"`
+	Default *Expression `json:"default,omitempty"`
 }
 
 type Table struct {
@@ -24,6 +65,19 @@ type Column struct {
 	Type     Type        `json:"type"`
 	Nullable bool        `json:"nullable"`
 	Default  *Expression `json:"default,omitempty"`
+	// DomainRef, when set, names a Schema.Domains entry this column takes its
+	// CHECK/NOT NULL/DEFAULT from. It is additive and omitempty, so a column
+	// without it stays byte-identical. The column MUST still carry Type equal to
+	// the domain's base type: the data chain (export/import canonicalization) keys
+	// off Column.Type.Family, and both engines physically store the domain value
+	// as its base type, so the redundant Type keeps that path unchanged and keeps
+	// PG(native domain) and SQLite(inlined) storing identical values. A
+	// domain-referencing column must be otherwise neutral — Nullable true, no own
+	// Default, no Generated — so the domain is the single source of the constraint
+	// (validated in Schema.Validate). On PostgreSQL the column's SQL type is the
+	// domain name; on SQLite it is the base type with the domain's CHECK/NOT
+	// NULL/DEFAULT inlined.
+	DomainRef string `json:"domain,omitempty"`
 	// Generated, when set, makes this a STORED generated column whose value is
 	// computed from Expression rather than supplied on INSERT/UPDATE. It is an
 	// additive, omitempty field: a column without it stays byte-identical in the
@@ -287,10 +341,14 @@ type RoutineAction struct {
 }
 
 func (s Schema) Validate() error {
+	domains, err := validateDomains(s.Domains)
+	if err != nil {
+		return err
+	}
 	tables := make(map[string]struct{}, len(s.Tables))
 	tableColumns := make(map[string]map[string]struct{}, len(s.Tables))
 	for _, table := range s.Tables {
-		if err := validateTable(table, tables, tableColumns); err != nil {
+		if err := validateTable(table, domains, tables, tableColumns); err != nil {
 			return err
 		}
 	}
@@ -309,9 +367,40 @@ func (s Schema) Validate() error {
 	return nil
 }
 
+// validateDomains checks that every domain has a name, is unique, and carries a
+// supported base type family (the same base-type rules as a column). The CHECK
+// expression's grammar is enforced at compile time by compileExpression — the
+// same deferral used for generated columns and expression indexes — so an
+// out-of-grammar CHECK is rejected by CompileDDL with a clear error. It returns
+// the domain map so table/column validation can resolve DomainRef references.
+func validateDomains(domains []Domain) (map[string]Domain, error) {
+	resolved := make(map[string]Domain, len(domains))
+	for _, domain := range domains {
+		if domain.Name == "" {
+			return nil, fmt.Errorf("domain name is required")
+		}
+		if _, exists := resolved[domain.Name]; exists {
+			return nil, fmt.Errorf("duplicate domain %q", domain.Name)
+		}
+		if domain.Type.Family == "" {
+			return nil, fmt.Errorf("domain %q has no base type", domain.Name)
+		}
+		if !knownTypeFamily(domain.Type.Family) {
+			return nil, fmt.Errorf("domain %q has unsupported base type family %q", domain.Name, domain.Type.Family)
+		}
+		if domain.Type.Family == VectorType {
+			if len(domain.Type.Arguments) != 1 || domain.Type.Arguments[0] <= 0 {
+				return nil, fmt.Errorf("domain %q vector base type requires a single positive dimension", domain.Name)
+			}
+		}
+		resolved[domain.Name] = domain
+	}
+	return resolved, nil
+}
+
 // validateTable checks one table and registers it (and its column set) in the
 // provided maps so that later index validation can resolve references.
-func validateTable(table Table, tables map[string]struct{}, tableColumns map[string]map[string]struct{}) error {
+func validateTable(table Table, domains map[string]Domain, tables map[string]struct{}, tableColumns map[string]map[string]struct{}) error {
 	if table.Name == "" {
 		return fmt.Errorf("table name is required")
 	}
@@ -324,7 +413,7 @@ func validateTable(table Table, tables map[string]struct{}, tableColumns map[str
 	tables[table.Name] = struct{}{}
 	columns := make(map[string]struct{}, len(table.Columns))
 	for _, column := range table.Columns {
-		if err := validateTableColumn(table.Name, column, columns); err != nil {
+		if err := validateTableColumn(table.Name, column, domains, columns); err != nil {
 			return err
 		}
 	}
@@ -359,7 +448,7 @@ func validateTable(table Table, tables map[string]struct{}, tableColumns map[str
 
 // validateTableColumn checks a single column and, when valid, registers it in
 // the column set for duplicate detection.
-func validateTableColumn(tableName string, column Column, columns map[string]struct{}) error {
+func validateTableColumn(tableName string, column Column, domains map[string]Domain, columns map[string]struct{}) error {
 	if column.Name == "" {
 		return fmt.Errorf("table %q has a column without a name", tableName)
 	}
@@ -368,6 +457,30 @@ func validateTableColumn(tableName string, column Column, columns map[string]str
 	}
 	if !knownTypeFamily(column.Type.Family) {
 		return fmt.Errorf("column %q.%q has unsupported type family %q", tableName, column.Name, column.Type.Family)
+	}
+	if column.DomainRef != "" {
+		// A domain-referencing column must resolve to a declared domain and be
+		// otherwise neutral: its Type must equal the domain's base type (the data
+		// chain keys off Column.Type, and both engines store the value as that base
+		// type), it must not add its own NOT NULL/DEFAULT/GENERATED (the domain is
+		// the single source of the constraint), so PG(native) and SQLite(inlined)
+		// enforce exactly the same thing on identical data.
+		domain, ok := domains[column.DomainRef]
+		if !ok {
+			return fmt.Errorf("column %q.%q references unknown domain %q", tableName, column.Name, column.DomainRef)
+		}
+		if !reflect.DeepEqual(column.Type, domain.Type) {
+			return fmt.Errorf("column %q.%q type must match domain %q base type", tableName, column.Name, column.DomainRef)
+		}
+		if !column.Nullable {
+			return fmt.Errorf("column %q.%q must be nullable; NOT NULL is defined by domain %q", tableName, column.Name, column.DomainRef)
+		}
+		if column.Default != nil {
+			return fmt.Errorf("column %q.%q cannot have its own default; DEFAULT is defined by domain %q", tableName, column.Name, column.DomainRef)
+		}
+		if column.Generated != nil {
+			return fmt.Errorf("column %q.%q cannot be generated and reference domain %q", tableName, column.Name, column.DomainRef)
+		}
 	}
 	if column.Type.Family == VectorType {
 		// A vector is declared as vector(N); the single argument is the

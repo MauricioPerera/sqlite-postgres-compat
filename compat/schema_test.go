@@ -176,6 +176,119 @@ func TestSchemaValidateExpressionIndex(t *testing.T) {
 	}
 }
 
+// TestSchemaValidateAcceptsDomain confirms a well-formed schema with a domain
+// used by a neutral column validates.
+func TestSchemaValidateAcceptsDomain(t *testing.T) {
+	check := Expression{Kind: "gt", Args: []Expression{{Kind: "domain_value"}, {Kind: "integer", Value: "0"}}}
+	schema := Schema{
+		Domains: []Domain{{Name: "pos", Type: Type{Family: IntegerType}, Check: &check, NotNull: true}},
+		Tables: []Table{{
+			Name:    "t",
+			Columns: []Column{{Name: "n", Type: Type{Family: IntegerType}, Nullable: true, DomainRef: "pos"}},
+		}},
+	}
+	if err := schema.Validate(); err != nil {
+		t.Fatalf("valid domain schema must pass validation: %v", err)
+	}
+}
+
+// TestSchemaValidateRejectsInvalidDomains freezes the canonical domain
+// rejections: a duplicate/unnamed/untyped domain, a column referencing an unknown
+// domain, a column whose type does not match the domain base type, and a
+// domain-referencing column that is not neutral (NOT NULL, own default, or
+// generated).
+func TestSchemaValidateRejectsInvalidDomains(t *testing.T) {
+	posCheck := Expression{Kind: "gt", Args: []Expression{{Kind: "domain_value"}, {Kind: "integer", Value: "0"}}}
+	def := Expression{Kind: "integer", Value: "1"}
+	gen := &GeneratedColumn{Stored: true, Expression: Expression{Kind: "integer", Value: "1"}}
+	cases := []struct {
+		name   string
+		schema Schema
+		want   string
+	}{
+		{
+			name:   "unnamed domain",
+			schema: Schema{Domains: []Domain{{Type: Type{Family: IntegerType}}}},
+			want:   "domain name is required",
+		},
+		{
+			name:   "duplicate domain",
+			schema: Schema{Domains: []Domain{{Name: "d", Type: Type{Family: IntegerType}}, {Name: "d", Type: Type{Family: TextType}}}},
+			want:   "duplicate domain",
+		},
+		{
+			name:   "domain without base type",
+			schema: Schema{Domains: []Domain{{Name: "d"}}},
+			want:   "has no base type",
+		},
+		{
+			name:   "domain unknown base type",
+			schema: Schema{Domains: []Domain{{Name: "d", Type: Type{Family: "nope"}}}},
+			want:   "unsupported base type",
+		},
+		{
+			name: "unknown domain reference",
+			schema: Schema{Tables: []Table{{
+				Name:    "t",
+				Columns: []Column{{Name: "c", Type: Type{Family: IntegerType}, Nullable: true, DomainRef: "missing"}},
+			}}},
+			want: "references unknown domain",
+		},
+		{
+			name: "type mismatch",
+			schema: Schema{
+				Domains: []Domain{{Name: "pos", Type: Type{Family: IntegerType}, Check: &posCheck}},
+				Tables: []Table{{
+					Name:    "t",
+					Columns: []Column{{Name: "c", Type: Type{Family: TextType}, Nullable: true, DomainRef: "pos"}},
+				}},
+			},
+			want: "must match domain",
+		},
+		{
+			name: "not neutral not null",
+			schema: Schema{
+				Domains: []Domain{{Name: "pos", Type: Type{Family: IntegerType}}},
+				Tables: []Table{{
+					Name:    "t",
+					Columns: []Column{{Name: "c", Type: Type{Family: IntegerType}, DomainRef: "pos"}},
+				}},
+			},
+			want: "must be nullable",
+		},
+		{
+			name: "not neutral own default",
+			schema: Schema{
+				Domains: []Domain{{Name: "pos", Type: Type{Family: IntegerType}}},
+				Tables: []Table{{
+					Name:    "t",
+					Columns: []Column{{Name: "c", Type: Type{Family: IntegerType}, Nullable: true, Default: &def, DomainRef: "pos"}},
+				}},
+			},
+			want: "cannot have its own default",
+		},
+		{
+			name: "not neutral generated",
+			schema: Schema{
+				Domains: []Domain{{Name: "pos", Type: Type{Family: IntegerType}}},
+				Tables: []Table{{
+					Name:    "t",
+					Columns: []Column{{Name: "c", Type: Type{Family: IntegerType}, Nullable: true, Generated: gen, DomainRef: "pos"}},
+				}},
+			},
+			want: "cannot be generated",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.schema.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected error containing %q, got: %v", tc.want, err)
+			}
+		})
+	}
+}
+
 func TestValidReferentialActionAcceptsCanonicalActions(t *testing.T) {
 	for _, action := range []ReferentialAction{"", NoAction, Restrict, Cascade, SetNull, SetDefault} {
 		if !validReferentialAction(action) {

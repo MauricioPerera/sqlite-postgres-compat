@@ -42,6 +42,21 @@ Rules (from `Schema.Validate`; both engines enforce them):
 
 Native inspection reconstructs a STORED generated column as `exact` (SQLite `pragma_table_xinfo` hidden=3, expression recovered from the `CREATE TABLE` text; PostgreSQL `is_generated='ALWAYS'`, expression from `generation_expression`). A `VIRTUAL` (SQLite hidden=2), identity, or out-of-grammar generation expression column is placed in `Inspection.Unresolved` and blocks `Inspection.Exact`.
 
+### Domains (asymmetric)
+
+A `Schema` may carry an additive `omitempty` `Domains []Domain` (`compat/schema.go`). A `Domain{Name, Type /* base family */, Check *Expression, NotNull bool, Default *Expression}` is a named base type plus an optional CHECK, NOT NULL and DEFAULT. A column references a domain through an additive `omitempty` `Column.DomainRef string` (JSON `domain`); a column without it stays byte-identical. The CHECK refers to the value under test with the placeholder node `Expression{Kind:"domain_value"}` (Section 3 grammar otherwise).
+
+A domain-referencing column **must still carry `Type` equal to the domain's base type** and be otherwise neutral — `Nullable=true`, no own `Default`, no `Generated` — so the domain is the single source of the constraint (enforced by `Schema.Validate`). The redundant `Type` keeps the data chain (export/import canonicalization keys off `Column.Type.Family`) unchanged and keeps PostgreSQL (native) and SQLite (inlined) storing identical values; the mechanism is the least invasive one that does not alter the byte-identical behavior of columns without domains.
+
+Compilation (`compat/ddl.go`) is **asymmetric but semantically equivalent**:
+
+- **PostgreSQL** emits a native `CREATE DOMAIN "name" AS <base type> [DEFAULT ...] [NOT NULL] [CHECK (...)]` before the tables; the referencing column's SQL type is the domain name. The CHECK's `domain_value` compiles to the `VALUE` keyword.
+- **SQLite has no domains**, so it emits no `CREATE DOMAIN`; each referencing column is inlined as `<base type> [NOT NULL] [DEFAULT ...] [CHECK (...)]`, with the CHECK's `domain_value` resolved to the column name. The base type differs per engine (e.g. `INTEGER`/`BIGINT`) but the enforced constraint and the stored data are identical.
+
+Grammar validity of the domain CHECK is enforced at compile time by the same `compileExpression` path as generated columns and CHECK constraints, so an out-of-grammar CHECK is rejected by `CompileDDL`. `Schema.Validate` rejects a duplicate/unnamed/untyped domain and a column referencing an unknown domain, whose type does not match the domain base type, or that is not neutral.
+
+**Asymmetry (honest).** The canonical path (schema created by this layer, kept in `__compat_schema`) round-trips the domain **exactly on both engines** — this is the primary proof. External inspection is different: a domain never physically existed in SQLite, so an inlined column is reconstructed as an ordinary column + CHECK (exact **as a column**, not as a domain — this is not a data divergence, only a shape difference, and is accepted). External **PostgreSQL** inspection **does not rebuild the domain** either: PostgreSQL deparses the domain CHECK with the `VALUE` keyword (and adds `::type` casts) into a form outside the canonical grammar, so a domain-typed column is placed in `Inspection.Unresolved` (`kind=domain_column`, `Exact=false`) rather than silently degraded to its underlying scalar type.
+
 ## 2. Constraint forms
 
 `Constraint{Kind, Columns, References, Expression}` (`compat/schema.go`, compiled in `compat/ddl.go`):
@@ -218,6 +233,7 @@ The layer never silently degrades. These are rejected with explicit errors:
 - Routines with a non-void return, languages other than `plpgsql`/`sql`, or parameters with `DEFAULT`/`=`.
 - `vector` without exactly one positive dimension argument.
 - A `VIRTUAL` generated column (`Generated.Stored = false`), a generated column that also has a `Default`, or a generated column that is part of a `primary_key`.
+- A domain that is unnamed, duplicated, or has an unsupported base type family; a domain CHECK outside the expression grammar; a column that references an unknown domain, whose `Type` does not equal the domain base type, or that is not neutral (`Nullable=false`, an own `Default`, or `Generated`).
 - `Version{0,0,0}` as a source/destination version (invalid dedup key).
 - Trigger/routine actions outside the three canonical forms.
 
