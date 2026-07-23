@@ -9,6 +9,12 @@ go vet ./...
 
 Estas pruebas deben terminar correctamente. Cubren AST, compilación DDL, parsers de catálogo, snapshots, journals, conflictos y runtime común.
 
+Antes de commitear, corré el gate de calidad local, que exige `gofmt -l .` vacío, `go vet ./...` y `go test ./... -count=1`:
+
+```powershell
+.\scripts\check.ps1
+```
+
 ## Pruebas E2E
 
 La suite E2E necesita una conexión PostgreSQL administrativa capaz de crear y eliminar bases temporales:
@@ -45,7 +51,7 @@ La segunda prueba falla intencionalmente mientras haya capacidades `unknown`. El
 
 ## Conteo vigente
 
-La batería E2E tiene 28 pruebas de nivel superior distribuidas en tres archivos: `e2e/system_test.go`, `e2e/suppress_test.go` y `e2e/cutover_test.go`. Hoy son 27 superadas y 1 fallida de forma intencional (`TestSystemClaimsExactCoverageForRequiredFeatureFamilies`). Esa proporción no es un porcentaje de compatibilidad total: el fallo significa que el objetivo del 100 % no se cumple.
+La batería E2E tiene 33 pruebas de nivel superior distribuidas en tres archivos: `e2e/system_test.go`, `e2e/suppress_test.go` y `e2e/cutover_test.go`. Hoy son 32 superadas y 1 fallida de forma intencional (`TestSystemClaimsExactCoverageForRequiredFeatureFamilies`). Esa proporción no es un porcentaje de compatibilidad total: el fallo significa que el objetivo del 100 % no se cumple.
 
 El conteo vigente y las familias restantes se registran en [VALIDATION_REPORT.md](reports/VALIDATION_REPORT.md).
 

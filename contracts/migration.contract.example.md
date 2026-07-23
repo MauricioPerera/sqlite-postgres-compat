@@ -80,7 +80,7 @@ go run ./cmd/compat-cutover ./cutover.json
   {"status":"ready","source_digest":"<sha256>","destination_digest":"<sha256>","changes_applied":<N>}
   ```
   with `source_digest` equal to `destination_digest`.
-- **Expected stderr**: progress lines `audit: ...`, `capture: ...`, `snapshot: ...`, `catch-up: ...`.
+- **Expected stderr**: progress lines, each prefixed with `compat-cutover: `: `compat-cutover: audit: ...`, `compat-cutover: capture: ...`, `compat-cutover: snapshot: ...`, `compat-cutover: catch-up: ...`.
 - **Expected exit code**: `0`.
 - **Failure**: `{"status":"diverged",...}` with exit `1` (digests differ), exit `1` with findings on stderr (a required feature not exact), or exit `2` (wrong argument count). Do not cut the DSN over.
 
