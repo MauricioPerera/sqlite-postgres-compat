@@ -743,6 +743,7 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 			`CREATE TABLE native_parents (id INTEGER PRIMARY KEY, tenant INTEGER NOT NULL, code TEXT NOT NULL, UNIQUE (tenant, code))`,
 			`CREATE TABLE native_children (id INTEGER PRIMARY KEY, parent_tenant INTEGER NOT NULL, parent_code TEXT NOT NULL, FOREIGN KEY (parent_tenant, parent_code) REFERENCES native_parents (tenant, code) ON UPDATE CASCADE ON DELETE CASCADE)`,
 			`CREATE VIEW native_parent_counts AS SELECT p.tenant AS tenant, count(c.id) AS child_count FROM native_parents AS p LEFT JOIN native_children AS c ON ((c.parent_tenant = p.tenant) AND (c.parent_code = p.code)) GROUP BY p.tenant`,
+			`CREATE VIEW native_all_codes AS SELECT code FROM native_products UNION SELECT product_code FROM native_audit`,
 		},
 		compat.Postgres: {
 			`CREATE TABLE native_products (code TEXT NOT NULL, price BIGINT NOT NULL DEFAULT 3, active BOOLEAN NOT NULL DEFAULT TRUE, status TEXT NOT NULL DEFAULT 'new', CHECK (price >= 0))`,
@@ -759,6 +760,7 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 			`CREATE TABLE native_parents (id BIGINT PRIMARY KEY, tenant BIGINT NOT NULL, code TEXT NOT NULL, UNIQUE (tenant, code))`,
 			`CREATE TABLE native_children (id BIGINT PRIMARY KEY, parent_tenant BIGINT NOT NULL, parent_code TEXT NOT NULL, FOREIGN KEY (parent_tenant, parent_code) REFERENCES native_parents (tenant, code) ON UPDATE CASCADE ON DELETE CASCADE)`,
 			`CREATE VIEW native_parent_counts AS SELECT p.tenant AS tenant, count(c.id) AS child_count FROM native_parents AS p LEFT JOIN native_children AS c ON ((c.parent_tenant = p.tenant) AND (c.parent_code = p.code)) GROUP BY p.tenant`,
+			`CREATE VIEW native_all_codes AS SELECT code FROM native_products UNION SELECT product_code FROM native_audit`,
 		},
 	}
 	for _, store := range []*compat.Store{sqlite, postgres} {
@@ -812,7 +814,7 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 		if !foundUnique || !foundPartial {
 			t.Fatalf("%s native index semantics lost: %+v", store.Target.Engine, inspection.Schema.Indexes)
 		}
-		activeView, aggregateView := false, false
+		activeView, aggregateView, compoundView := false, false, false
 		for _, view := range inspection.Schema.Views {
 			if view.Name == "native_active_products" && len(view.Query.Columns) == 2 && view.Query.Where != nil {
 				activeView = true
@@ -820,8 +822,15 @@ func TestSystemInspectsNativeSchemaObjectsWithoutMetadata(t *testing.T) {
 			if view.Name == "native_parent_counts" && len(view.Query.Columns) == 2 && len(view.Query.Joins) == 1 && len(view.Query.GroupBy) == 1 && view.Query.Columns[1].Expression.Kind == "count" {
 				aggregateView = true
 			}
+			// The compound (UNION) view must round-trip through each engine's
+			// native catalog with its set operation intact — proving canonical_views
+			// stays exact for compounds (the whole inspection is asserted Exact with
+			// no Unresolved objects above).
+			if view.Name == "native_all_codes" && len(view.Query.Compounds) == 1 && view.Query.Compounds[0].Operator == "union" {
+				compoundView = true
+			}
 		}
-		if !activeView || !aggregateView {
+		if !activeView || !aggregateView || !compoundView {
 			t.Fatalf("%s native view was not reconstructed: %+v", store.Target.Engine, inspection.Schema.Views)
 		}
 		triggerKinds := map[string]bool{}
@@ -1292,6 +1301,104 @@ func queryProjectedRows(t *testing.T, db *sql.DB) []string {
 			t.Fatal(err)
 		}
 		result = append(result, fmt.Sprintf("%d|%s|%v", id, grade, statusOrNull))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+// TestSystemCompoundViewsProduceEquivalentResults drives the FEAT-CUBOA-2A set
+// operations (UNION, UNION ALL, INTERSECT, EXCEPT) through the real engines. It
+// applies a canonical schema whose views use each set operation over two tables,
+// imports it into real PostgreSQL, and compares the rows each view returns on
+// SQLite versus PostgreSQL. A green ImportSnapshot proves real PostgreSQL accepts
+// every compiled compound view DDL; the row comparison proves the set semantics
+// coincide. The data includes a duplicate row so UNION deduplication and UNION
+// ALL retention are exercised, and rows present in only one table so INTERSECT
+// and EXCEPT are non-trivial.
+func TestSystemCompoundViewsProduceEquivalentResults(t *testing.T) {
+	ctx := context.Background()
+	col := func(name string) compat.Expression { return compat.Expression{Kind: "column", Value: name} }
+	branch := func(table string) compat.SelectQuery {
+		return compat.SelectQuery{
+			Columns: []compat.Projection{{Expression: col("id")}, {Expression: col("name")}},
+			From:    compat.TableSource{Table: table},
+		}
+	}
+	compoundView := func(name, operator string) compat.View {
+		return compat.View{Name: name, Query: compat.SelectQuery{
+			Columns:   []compat.Projection{{Expression: col("id")}, {Expression: col("name")}},
+			From:      compat.TableSource{Table: "comp_a"},
+			Compounds: []compat.CompoundSelect{{Operator: operator, Query: branch("comp_b")}},
+		}}
+	}
+	table := func(name string) compat.Table {
+		return compat.Table{
+			Name: name,
+			Columns: []compat.Column{
+				{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+				{Name: "name", Type: compat.Type{Family: compat.TextType}},
+			},
+		}
+	}
+	schema := compat.Schema{
+		Tables: []compat.Table{table("comp_a"), table("comp_b")},
+		Views: []compat.View{
+			compoundView("comp_union", "union"),
+			compoundView("comp_union_all", "union_all"),
+			compoundView("comp_intersect", "intersect"),
+			compoundView("comp_except", "except"),
+		},
+	}
+
+	source := openSQLite(t, filepath.Join(t.TempDir(), "compound.db"))
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	// comp_a carries a duplicate (2,'b'); comp_b shares (2,'b') and (3,'c') but
+	// differs on the rest, so every set operation returns a distinct result.
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO comp_a (id, name) VALUES (1,'a'),(2,'b'),(3,'c'),(2,'b')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO comp_b (id, name) VALUES (2,'b'),(3,'x'),(4,'d')`); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := source.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postgres := openPostgres(t)
+	if err := postgres.ImportSnapshot(ctx, snapshot); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, view := range []string{"comp_union", "comp_union_all", "comp_intersect", "comp_except"} {
+		query := `SELECT id, name FROM ` + view + ` ORDER BY id, name`
+		sqliteRows := queryIDNameRows(t, source.DB, query)
+		postgresRows := queryIDNameRows(t, postgres.DB, query)
+		if fmt.Sprint(sqliteRows) != fmt.Sprint(postgresRows) {
+			t.Fatalf("%s diverged: sqlite=%v postgres=%v", view, sqliteRows, postgresRows)
+		}
+	}
+}
+
+func queryIDNameRows(t *testing.T, db *sql.DB, query string) []string {
+	t.Helper()
+	rows, err := db.Query(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var result []string
+	for rows.Next() {
+		var id int64
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			t.Fatal(err)
+		}
+		result = append(result, fmt.Sprintf("%d|%s", id, name))
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)

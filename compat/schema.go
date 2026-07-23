@@ -145,9 +145,29 @@ type SelectQuery struct {
 	Where    *Expression  `json:"where,omitempty"`
 	GroupBy  []Expression `json:"group_by,omitempty"`
 	Having   *Expression  `json:"having,omitempty"`
-	OrderBy  []Ordering   `json:"order_by,omitempty"`
-	Limit    *int         `json:"limit,omitempty"`
-	Offset   *int         `json:"offset,omitempty"`
+	// Compounds is the left-associative chain of set operations applied after
+	// this (the leading) SELECT: q0 op1 q1 op2 q2 ... The trailing OrderBy,
+	// Limit and Offset below apply to the whole compound, not to the last
+	// branch, so each CompoundSelect.Query carries none of them. Absent
+	// compounds leave the single-SELECT behavior byte-identical, and the field
+	// is omitted from JSON so existing view snapshots do not change.
+	Compounds []CompoundSelect `json:"compounds,omitempty"`
+	OrderBy   []Ordering       `json:"order_by,omitempty"`
+	Limit     *int             `json:"limit,omitempty"`
+	Offset    *int             `json:"offset,omitempty"`
+}
+
+// CompoundSelect is one branch of a compound (set-operation) SELECT: the set
+// operator that joins it to everything to its left, plus the branch query. The
+// operator is one of "union", "union_all", "intersect", "except"; all four have
+// identical set semantics in SQLite and PostgreSQL. A chain that mixes
+// "intersect" with any other operator is rejected, because INTERSECT binds
+// more tightly than UNION/EXCEPT in PostgreSQL but has equal (left-associative)
+// precedence in SQLite, so a flat left-associative chain would group
+// differently between the two engines.
+type CompoundSelect struct {
+	Operator string      `json:"operator"`
+	Query    SelectQuery `json:"query"`
 }
 
 type Projection struct {

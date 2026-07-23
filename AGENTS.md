@@ -104,15 +104,19 @@ SQLite's `LIKE` is case-insensitive (ASCII) by default; PostgreSQL's `LIKE` is c
 Parser: `compat/sqlselect.go` (`parseCatalogSelect`). A view definition is `CREATE VIEW name AS <select>`; the parser strips the `CREATE ... AS SELECT ` prefix and requires a `SELECT`.
 
 ```
+<branch>
+[ {UNION [ALL] | INTERSECT | EXCEPT} <branch> ]...
+[ORDER BY expr [ASC|DESC], ...]
+[LIMIT n]
+[OFFSET n]
+
+<branch> ::=
 SELECT [DISTINCT] projection, ... 
 FROM table[[ AS] alias]
 [ {LEFT [OUTER] | INNER | CROSS | } JOIN table[[ AS] alias] [ON expr] ]...
 [WHERE expr]
 [GROUP BY expr, ...]
 [HAVING expr]
-[ORDER BY expr [ASC|DESC], ...]
-[LIMIT n]
-[OFFSET n]
 ```
 
 - **Projections**: comma-separated. Each is `expr` or `expr AS alias`; the alias is a simple identifier (no dot). `SELECT *` / a bare `*` projection is **rejected** (`unsupported catalog expression`).
@@ -122,8 +126,9 @@ FROM table[[ AS] alias]
 - **GROUP BY**: comma-separated expressions.
 - **ORDER BY**: comma-separated; each item is `expr [ASC|DESC]`.
 - **LIMIT / OFFSET**: non-negative integers. A **negative** value is rejected at parse time with `unsupported negative LIMIT %d` / `unsupported negative OFFSET %d`.
+- **Set operations (compounds)**: a left-associative chain of `UNION`, `UNION ALL`, `INTERSECT` and `EXCEPT` over branches (`q0 op1 q1 op2 q2 ...`). Each branch is a single SELECT with the grammar above (projections, FROM, JOINs, WHERE, GROUP BY, HAVING) but **no** ORDER BY/LIMIT/OFFSET of its own; a trailing ORDER BY/LIMIT/OFFSET applies to the whole compound and is hoisted onto the leading query (`SelectQuery.Compounds []CompoundSelect{Operator, Query}` in `compat/schema.go`, JSON `compounds` with `omitempty`). All four operators have identical set semantics in both engines. A chain that **mixes `INTERSECT` with `UNION`/`EXCEPT`** is rejected (`compound mixing INTERSECT with UNION/EXCEPT is outside the canonical grammar`): `INTERSECT` binds more tightly than `UNION`/`EXCEPT` in PostgreSQL but has equal (left-associative) precedence in SQLite, so a flat chain would group differently per engine; such a view becomes an unresolved object (`Exact = false`) rather than divergent SQL. A homogeneous chain of a single operator (including all-`INTERSECT`) and any chain of `{UNION, UNION ALL, EXCEPT}` are accepted. Parenthesized branches (the shape PostgreSQL deparses around a mixed-precedence compound) are rejected because a branch must begin with `SELECT`. Subqueries and CTEs inside a branch remain out of scope.
 
-Always rejected in SELECT: subqueries, set operations (`UNION`/`INTERSECT`/`EXCEPT`), CTEs (`WITH`), window functions, `SELECT *`, compound table sources, and schema-qualified table names.
+Always rejected in SELECT: subqueries, CTEs (`WITH`), window functions, `SELECT *`, compound table sources, schema-qualified table names, and any compound chain that mixes `INTERSECT` with `UNION`/`EXCEPT`.
 
 ## 5. Triggers (canonical forms)
 
@@ -179,7 +184,7 @@ The layer never silently degrades. These are rejected with explicit errors:
 - Non-`public` schema qualifier on a PostgreSQL trigger.
 - `SELECT *` or a bare `*` projection.
 - Compound or schema-qualified table sources in `FROM`.
-- Subqueries, set operations, CTEs, window functions.
+- Subqueries, CTEs, window functions. Set operations (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) are supported as compounds (Section 4), except a chain mixing `INTERSECT` with `UNION`/`EXCEPT`, which is rejected because its grouping diverges between engines.
 - Any function not in the allowlist (Section 3).
 - Any expression outside the grammar (Section 3).
 - Unsupported PostgreSQL `DEFAULT` casts (only a known set is accepted: `text`, `character varying`, `character`, `boolean`, `smallint`, `integer`, `bigint`, `numeric`, `real`, `double precision`, `date`, `timestamp without time zone`, `timestamp with time zone`, `uuid`, `json`, `jsonb`).

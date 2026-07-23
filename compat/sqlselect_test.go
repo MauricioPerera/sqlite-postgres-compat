@@ -297,3 +297,137 @@ func TestParseCatalogSelectJoinInternalWhitespace(t *testing.T) {
 		})
 	}
 }
+
+// TestParseCatalogSelectCompoundOperators freezes the AST produced for each of
+// the four set operations and for a homogeneous chain. UNION, UNION ALL,
+// INTERSECT and EXCEPT have identical set semantics in SQLite and PostgreSQL, so
+// each parses into a leading query plus a Compounds chain carrying the operator.
+func TestParseCatalogSelectCompoundOperators(t *testing.T) {
+	tests := []struct {
+		name          string
+		input         string
+		wantOperators []string
+	}{
+		{"union", "SELECT a FROM t UNION SELECT a FROM s", []string{"union"}},
+		{"union all", "SELECT a FROM t UNION ALL SELECT a FROM s", []string{"union_all"}},
+		{"intersect", "SELECT a FROM t INTERSECT SELECT a FROM s", []string{"intersect"}},
+		{"except", "SELECT a FROM t EXCEPT SELECT a FROM s", []string{"except"}},
+		{"union chain", "SELECT a FROM t UNION SELECT a FROM s UNION SELECT a FROM u", []string{"union", "union"}},
+		{"mixed union all and except", "SELECT a FROM t UNION ALL SELECT a FROM s EXCEPT SELECT a FROM u", []string{"union_all", "except"}},
+		{"all intersect chain", "SELECT a FROM t INTERSECT SELECT a FROM s INTERSECT SELECT a FROM u", []string{"intersect", "intersect"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseCatalogSelect(test.input)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			// The leading query keeps its own projections and FROM.
+			if got.From.Table != "t" || len(got.Columns) != 1 {
+				t.Fatalf("unexpected leading query: %+v", got)
+			}
+			if len(got.Compounds) != len(test.wantOperators) {
+				t.Fatalf("expected %d compounds, got %d: %+v", len(test.wantOperators), len(got.Compounds), got.Compounds)
+			}
+			for i, wantOp := range test.wantOperators {
+				branch := got.Compounds[i]
+				if branch.Operator != wantOp {
+					t.Fatalf("compound %d operator: got %q want %q", i, branch.Operator, wantOp)
+				}
+				if len(branch.Query.Columns) != 1 || branch.Query.From.Table == "" {
+					t.Fatalf("compound %d branch is not a full SELECT: %+v", i, branch.Query)
+				}
+				// A branch never carries the whole-compound trailing clauses or a
+				// nested compound.
+				if branchHasTrailingClauses(branch.Query) || len(branch.Query.Compounds) != 0 {
+					t.Fatalf("compound %d branch carries trailing/nested state: %+v", i, branch.Query)
+				}
+			}
+		})
+	}
+}
+
+// TestParseCatalogSelectCompoundTrailingClauseAppliesToWholeCompound freezes the
+// semantics that a trailing ORDER BY / LIMIT / OFFSET after the last branch
+// applies to the whole compound: it is hoisted onto the leading query and no
+// branch retains it.
+func TestParseCatalogSelectCompoundTrailingClauseAppliesToWholeCompound(t *testing.T) {
+	got, err := parseCatalogSelect("SELECT a FROM t UNION SELECT a FROM s ORDER BY a DESC LIMIT 10 OFFSET 5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Compounds) != 1 || got.Compounds[0].Operator != "union" {
+		t.Fatalf("expected one union compound, got %+v", got.Compounds)
+	}
+	if len(got.OrderBy) != 1 || !got.OrderBy[0].Descending || got.Limit == nil || *got.Limit != 10 || got.Offset == nil || *got.Offset != 5 {
+		t.Fatalf("trailing clauses were not hoisted onto the leading query: %+v", got)
+	}
+	if branchHasTrailingClauses(got.Compounds[0].Query) {
+		t.Fatalf("branch must not keep the trailing clauses: %+v", got.Compounds[0].Query)
+	}
+}
+
+// TestParseCatalogSelectRejectsMixedIntersect freezes the honest rejection: a
+// chain mixing INTERSECT with UNION or EXCEPT is refused, because INTERSECT
+// binds more tightly than UNION/EXCEPT in PostgreSQL but has equal precedence in
+// SQLite, so a flat left-associative chain would group differently per engine.
+func TestParseCatalogSelectRejectsMixedIntersect(t *testing.T) {
+	cases := []string{
+		"SELECT a FROM t UNION SELECT a FROM s INTERSECT SELECT a FROM u",
+		"SELECT a FROM t INTERSECT SELECT a FROM s UNION SELECT a FROM u",
+		"SELECT a FROM t INTERSECT SELECT a FROM s EXCEPT SELECT a FROM u",
+		"SELECT a FROM t EXCEPT SELECT a FROM s INTERSECT SELECT a FROM u",
+	}
+	for _, input := range cases {
+		t.Run(input, func(t *testing.T) {
+			_, err := parseCatalogSelect(input)
+			if err == nil {
+				t.Fatalf("expected rejection for mixed INTERSECT, got nil")
+			}
+			if !strings.Contains(err.Error(), "INTERSECT") {
+				t.Fatalf("expected an INTERSECT precedence error, got %q", err.Error())
+			}
+		})
+	}
+}
+
+// TestParseCatalogSelectRejectsParenthesizedCompoundBranch confirms a
+// parenthesized branch (the shape PostgreSQL emits around a mixed-precedence
+// compound) is rejected rather than silently mis-parsed: the set operator it
+// contains stays inside the parentheses, so the branch does not begin with
+// SELECT and the single-select parser refuses it.
+func TestParseCatalogSelectRejectsParenthesizedCompoundBranch(t *testing.T) {
+	cases := []string{
+		"SELECT a FROM t UNION (SELECT a FROM s INTERSECT SELECT a FROM u)",
+		"(SELECT a FROM t UNION SELECT a FROM s) EXCEPT SELECT a FROM u",
+	}
+	for _, input := range cases {
+		t.Run(input, func(t *testing.T) {
+			if _, err := parseCatalogSelect(input); err == nil {
+				t.Fatalf("expected rejection for parenthesized compound branch, got nil")
+			}
+		})
+	}
+}
+
+// TestParseCatalogSelectCompoundBranchInternalWhitespace confirms the compound
+// split tolerates any run of whitespace inside a multi-word operator, exactly as
+// the clause and JOIN keywords do, and that a string literal containing the
+// word UNION is not mistaken for a set operator.
+func TestParseCatalogSelectCompoundBranchInternalWhitespace(t *testing.T) {
+	got, err := parseCatalogSelect("SELECT a FROM t UNION  ALL SELECT a FROM s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Compounds) != 1 || got.Compounds[0].Operator != "union_all" {
+		t.Fatalf("expected a union_all compound, got %+v", got.Compounds)
+	}
+
+	quoted, err := parseCatalogSelect("SELECT a FROM t WHERE a = 'x UNION y'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(quoted.Compounds) != 0 {
+		t.Fatalf("UNION inside a string literal must not split a compound: %+v", quoted.Compounds)
+	}
+}

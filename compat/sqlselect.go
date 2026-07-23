@@ -23,12 +23,158 @@ type locatedClause struct {
 }
 
 // parseCatalogSelect parses the shared, deliberately bounded SELECT grammar
-// used for external views. Unsupported clauses are rejected explicitly.
+// used for external views. Unsupported clauses are rejected explicitly. A view
+// body may be a single SELECT or a left-associative chain of set operations
+// (UNION [ALL] / INTERSECT / EXCEPT); the trailing ORDER BY / LIMIT / OFFSET, if
+// present, apply to the whole compound and are hoisted onto the leading query.
 func parseCatalogSelect(definition string) (SelectQuery, error) {
-	body, distinct, err := stripCatalogSelectHeader(definition)
+	selectText, err := stripCatalogViewPrefix(definition)
 	if err != nil {
 		return SelectQuery{}, err
 	}
+	segments, operators := splitCompoundSelect(selectText)
+	if len(operators) == 0 {
+		return parseSingleCatalogSelect(selectText)
+	}
+	if err := rejectMixedIntersectChain(operators); err != nil {
+		return SelectQuery{}, err
+	}
+	head, err := parseSingleCatalogSelect(strings.TrimSpace(segments[0]))
+	if err != nil {
+		return SelectQuery{}, err
+	}
+	// Only the final branch may carry ORDER BY / LIMIT / OFFSET; both engines
+	// reject those clauses on a non-final branch of an unparenthesized compound.
+	if branchHasTrailingClauses(head) {
+		return SelectQuery{}, fmt.Errorf("ORDER BY/LIMIT/OFFSET must follow the last SELECT of a compound")
+	}
+	compounds := make([]CompoundSelect, 0, len(operators))
+	for i, operator := range operators {
+		branch, err := parseSingleCatalogSelect(strings.TrimSpace(segments[i+1]))
+		if err != nil {
+			return SelectQuery{}, err
+		}
+		if i < len(operators)-1 && branchHasTrailingClauses(branch) {
+			return SelectQuery{}, fmt.Errorf("ORDER BY/LIMIT/OFFSET must follow the last SELECT of a compound")
+		}
+		compounds = append(compounds, CompoundSelect{Operator: operator, Query: branch})
+	}
+	// Hoist the whole-compound trailing clauses from the last branch onto the
+	// leading query, where the model keeps them.
+	last := &compounds[len(compounds)-1].Query
+	head.OrderBy, last.OrderBy = last.OrderBy, nil
+	head.Limit, last.Limit = last.Limit, nil
+	head.Offset, last.Offset = last.Offset, nil
+	head.Compounds = compounds
+	return head, nil
+}
+
+// branchHasTrailingClauses reports whether a parsed branch carries any
+// whole-compound trailing clause (ORDER BY / LIMIT / OFFSET).
+func branchHasTrailingClauses(query SelectQuery) bool {
+	return len(query.OrderBy) > 0 || query.Limit != nil || query.Offset != nil
+}
+
+// rejectMixedIntersectChain rejects a compound chain that mixes INTERSECT with
+// any other set operator. UNION, UNION ALL and EXCEPT share precedence and are
+// left-associative in both SQLite and PostgreSQL, so a flat left-associative
+// chain of those compiles identically for either engine. INTERSECT, however,
+// binds more tightly than UNION/EXCEPT in PostgreSQL while SQLite gives it equal
+// (left-associative) precedence, so `a UNION b INTERSECT c` groups as
+// `a UNION (b INTERSECT c)` in PostgreSQL but `(a UNION b) INTERSECT c` in
+// SQLite. Rather than emit SQL that would diverge, such a chain is rejected and
+// surfaces as an unresolved object (Exact = false). A homogeneous all-INTERSECT
+// chain is accepted: it groups left-associatively and identically in both.
+func rejectMixedIntersectChain(operators []string) error {
+	hasIntersect, hasOther := false, false
+	for _, operator := range operators {
+		if operator == "intersect" {
+			hasIntersect = true
+		} else {
+			hasOther = true
+		}
+	}
+	if hasIntersect && hasOther {
+		return fmt.Errorf("compound mixing INTERSECT with UNION/EXCEPT is outside the canonical grammar: INTERSECT precedence differs between SQLite and PostgreSQL")
+	}
+	return nil
+}
+
+// compoundOperators lists the recognized set operators in match-priority order;
+// "UNION ALL" must be tested before "UNION" so the longer keyword wins.
+var compoundOperators = []struct {
+	keyword  string
+	operator string
+}{
+	{"UNION ALL", "union_all"},
+	{"UNION", "union"},
+	{"INTERSECT", "intersect"},
+	{"EXCEPT", "except"},
+}
+
+// splitCompoundSelect scans a view's SELECT text and splits it at every
+// top-level set operator (outside parentheses and string/identifier quotes),
+// returning the branch texts and the operator joining each branch to the one
+// before it (len(operators) == len(segments)-1). Text with no top-level set
+// operator yields a single segment and no operators, so the caller treats it as
+// a plain SELECT with byte-identical behavior. A parenthesized branch (e.g. the
+// `(...)` PostgreSQL emits around a mixed-precedence compound) leaves any set
+// operator it contains at depth > 0, so it is not split here and the branch,
+// which does not begin with SELECT, is rejected by the single-select parser.
+func splitCompoundSelect(text string) (segments []string, operators []string) {
+	depth := 0
+	inSingle, inDouble := false, false
+	start := 0
+	for i := 0; i < len(text); i++ {
+		switch text[i] {
+		case '\'':
+			if !inDouble {
+				if inSingle && i+1 < len(text) && text[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+		case '(':
+			if !inSingle && !inDouble {
+				depth++
+			}
+		case ')':
+			if !inSingle && !inDouble {
+				depth--
+			}
+		}
+		if depth != 0 || inSingle || inDouble || !wordBoundary(text, i-1) {
+			continue
+		}
+		for _, candidate := range compoundOperators {
+			if end, ok := keywordMatchSpan(text, i, candidate.keyword); ok && wordBoundary(text, end) {
+				segments = append(segments, text[start:i])
+				operators = append(operators, candidate.operator)
+				i = end - 1 // the loop's i++ resumes scanning just past the keyword
+				start = end
+				break
+			}
+		}
+	}
+	segments = append(segments, text[start:])
+	return segments, operators
+}
+
+// parseSingleCatalogSelect parses one branch of the grammar: a single SELECT
+// with its projections, FROM, JOINs and optional WHERE / GROUP BY / HAVING /
+// ORDER BY / LIMIT / OFFSET. It expects text that begins with the SELECT
+// keyword (compound splitting and the CREATE VIEW prefix are handled by the
+// caller).
+func parseSingleCatalogSelect(selectText string) (SelectQuery, error) {
+	if !strings.HasPrefix(strings.ToUpper(selectText), "SELECT ") {
+		return SelectQuery{}, fmt.Errorf("view definition is not SELECT")
+	}
+	body, distinct := stripCatalogSelectKeyword(selectText)
 	fromPosition := topLevelKeyword(body, "FROM")
 	if fromPosition < 0 {
 		return SelectQuery{}, fmt.Errorf("SELECT has no FROM")
@@ -63,34 +209,41 @@ func parseCatalogSelect(definition string) (SelectQuery, error) {
 	return query, nil
 }
 
-// stripCatalogSelectHeader trims the definition, strips an optional
-// "CREATE VIEW ... AS" prefix, and removes the leading SELECT/DISTINCT
-// keywords, returning the body to be parsed for FROM and projections and the
-// DISTINCT flag.
-func stripCatalogSelectHeader(definition string) (body string, distinct bool, err error) {
+// stripCatalogViewPrefix trims the definition, drops a trailing ";", and strips
+// an optional "CREATE VIEW ... AS" prefix, returning the remaining text, which
+// must begin with SELECT. The SELECT keyword itself is left in place so the
+// result can be split into compound branches, each of which begins with its own
+// SELECT.
+func stripCatalogViewPrefix(definition string) (string, error) {
 	text := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(definition), ";"))
-	upper := strings.ToUpper(text)
-	if strings.HasPrefix(upper, "CREATE ") {
+	if strings.HasPrefix(strings.ToUpper(text), "CREATE ") {
 		// Find the "AS SELECT" boundary with the same whitespace tolerance the
 		// rest of the parser uses for multi-word keywords (keywordMatchSpan), so
 		// "AS  SELECT" or "AS\tSELECT" is accepted just like "AS SELECT". Both
 		// SQLite and Postgres treat any run of whitespace as a separator here.
 		position := topLevelKeyword(text, "AS SELECT")
 		if position < 0 {
-			return "", false, fmt.Errorf("view definition has no AS SELECT")
+			return "", fmt.Errorf("view definition has no AS SELECT")
 		}
 		end, _ := keywordMatchSpan(text, position, "AS SELECT")
 		text = strings.TrimSpace(text[end-len("SELECT"):])
 	}
 	if !strings.HasPrefix(strings.ToUpper(text), "SELECT ") {
-		return "", false, fmt.Errorf("view definition is not SELECT")
+		return "", fmt.Errorf("view definition is not SELECT")
 	}
+	return text, nil
+}
+
+// stripCatalogSelectKeyword removes the leading SELECT keyword and an optional
+// DISTINCT from a single branch's text, returning the remaining body and the
+// DISTINCT flag. The caller must have verified the text begins with "SELECT ".
+func stripCatalogSelectKeyword(text string) (body string, distinct bool) {
 	body = strings.TrimSpace(text[len("SELECT "):])
 	if strings.HasPrefix(strings.ToUpper(body), "DISTINCT ") {
 		distinct = true
 		body = strings.TrimSpace(body[len("DISTINCT "):])
 	}
-	return body, distinct, nil
+	return body, distinct
 }
 
 // catalogSelectClauses returns the ordered set of trailing clauses the grammar

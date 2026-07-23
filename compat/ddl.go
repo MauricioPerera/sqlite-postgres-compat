@@ -490,7 +490,72 @@ func compileExpressionArgs(engine Engine, args []Expression, inTrigger bool) ([]
 	return compiled, nil
 }
 
+// compileSelect emits a single SELECT or a left-associative compound (set
+// operation) chain. The whole-compound ORDER BY / LIMIT / OFFSET live on the
+// leading query and are emitted once, after every branch.
 func compileSelect(engine Engine, query SelectQuery) (string, error) {
+	statement, err := compileSelectCore(engine, query)
+	if err != nil {
+		return "", err
+	}
+	if len(query.Compounds) > 0 {
+		if err := validateCompoundChain(query.Compounds); err != nil {
+			return "", err
+		}
+		for _, compound := range query.Compounds {
+			operator, err := compoundOperatorSQL(compound.Operator)
+			if err != nil {
+				return "", err
+			}
+			if branchHasTrailingClauses(compound.Query) || len(compound.Query.Compounds) > 0 {
+				return "", fmt.Errorf("compound branch must not carry ORDER BY/LIMIT/OFFSET or nested compounds")
+			}
+			branch, err := compileSelectCore(engine, compound.Query)
+			if err != nil {
+				return "", err
+			}
+			statement += " " + operator + " " + branch
+		}
+	}
+	trailing, err := compileSelectTrailing(engine, query)
+	if err != nil {
+		return "", err
+	}
+	return statement + trailing, nil
+}
+
+// validateCompoundChain applies the same INTERSECT-mixing rule the parser uses,
+// so a hand-built AST cannot smuggle a chain whose grouping would diverge
+// between SQLite and PostgreSQL past compilation.
+func validateCompoundChain(compounds []CompoundSelect) error {
+	operators := make([]string, len(compounds))
+	for i, compound := range compounds {
+		operators[i] = compound.Operator
+	}
+	return rejectMixedIntersectChain(operators)
+}
+
+// compoundOperatorSQL maps a canonical set-operator name to the SQL keyword,
+// which is identical for SQLite and PostgreSQL.
+func compoundOperatorSQL(operator string) (string, error) {
+	switch operator {
+	case "union":
+		return "UNION", nil
+	case "union_all":
+		return "UNION ALL", nil
+	case "intersect":
+		return "INTERSECT", nil
+	case "except":
+		return "EXCEPT", nil
+	default:
+		return "", fmt.Errorf("unsupported compound operator %q", operator)
+	}
+}
+
+// compileSelectCore emits the SELECT ... FROM ... [JOIN ...] [WHERE] [GROUP BY]
+// [HAVING] portion of a query, without the trailing ORDER BY / LIMIT / OFFSET,
+// so it can be reused for every branch of a compound.
+func compileSelectCore(engine Engine, query SelectQuery) (string, error) {
 	if len(query.Columns) == 0 || query.From.Table == "" {
 		return "", fmt.Errorf("select requires projections and a source table")
 	}
@@ -551,6 +616,14 @@ func compileSelect(engine Engine, query SelectQuery) (string, error) {
 		}
 		statement += " HAVING " + having
 	}
+	return statement, nil
+}
+
+// compileSelectTrailing emits the ORDER BY / LIMIT / OFFSET clauses that apply
+// to a whole query (or whole compound). It returns a leading-space-prefixed
+// string so callers append it directly to the core statement.
+func compileSelectTrailing(engine Engine, query SelectQuery) (string, error) {
+	trailing := ""
 	if len(query.OrderBy) > 0 {
 		order := make([]string, len(query.OrderBy))
 		for i, ordering := range query.OrderBy {
@@ -565,21 +638,21 @@ func compileSelect(engine Engine, query SelectQuery) (string, error) {
 			}
 			order[i] = compiled
 		}
-		statement += " ORDER BY " + strings.Join(order, ", ")
+		trailing += " ORDER BY " + strings.Join(order, ", ")
 	}
 	if query.Limit != nil {
 		if *query.Limit < 0 {
 			return "", fmt.Errorf("limit must be non-negative")
 		}
-		statement += " LIMIT " + fmt.Sprint(*query.Limit)
+		trailing += " LIMIT " + fmt.Sprint(*query.Limit)
 	}
 	if query.Offset != nil {
 		if *query.Offset < 0 {
 			return "", fmt.Errorf("offset must be non-negative")
 		}
-		statement += " OFFSET " + fmt.Sprint(*query.Offset)
+		trailing += " OFFSET " + fmt.Sprint(*query.Offset)
 	}
-	return statement, nil
+	return trailing, nil
 }
 
 func compileTableSource(source TableSource) string {

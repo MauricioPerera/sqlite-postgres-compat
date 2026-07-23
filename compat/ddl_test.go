@@ -451,6 +451,186 @@ func TestCompileInLikeInsideCaseKeepsIlikeMapping(t *testing.T) {
 	}
 }
 
+// TestCompileCompoundSelectForBothEngines freezes the exact SQL emitted for the
+// four set operations plus a homogeneous chain. The set-operation keywords are
+// identical in SQLite and PostgreSQL, so every case must compile byte-identical
+// for both engines.
+func TestCompileCompoundSelectForBothEngines(t *testing.T) {
+	branch := func(table, column string) SelectQuery {
+		return SelectQuery{
+			Columns: []Projection{{Expression: Expression{Kind: "column", Value: column}}},
+			From:    TableSource{Table: table},
+		}
+	}
+	tests := []struct {
+		name  string
+		query SelectQuery
+		want  string
+	}{
+		{
+			name: "union",
+			query: SelectQuery{
+				Columns:   []Projection{{Expression: Expression{Kind: "column", Value: "a"}}},
+				From:      TableSource{Table: "t"},
+				Compounds: []CompoundSelect{{Operator: "union", Query: branch("s", "b")}},
+			},
+			want: `SELECT "a" FROM "t" UNION SELECT "b" FROM "s"`,
+		},
+		{
+			name: "union all",
+			query: SelectQuery{
+				Columns:   []Projection{{Expression: Expression{Kind: "column", Value: "a"}}},
+				From:      TableSource{Table: "t"},
+				Compounds: []CompoundSelect{{Operator: "union_all", Query: branch("s", "b")}},
+			},
+			want: `SELECT "a" FROM "t" UNION ALL SELECT "b" FROM "s"`,
+		},
+		{
+			name: "intersect",
+			query: SelectQuery{
+				Columns:   []Projection{{Expression: Expression{Kind: "column", Value: "a"}}},
+				From:      TableSource{Table: "t"},
+				Compounds: []CompoundSelect{{Operator: "intersect", Query: branch("s", "b")}},
+			},
+			want: `SELECT "a" FROM "t" INTERSECT SELECT "b" FROM "s"`,
+		},
+		{
+			name: "except",
+			query: SelectQuery{
+				Columns:   []Projection{{Expression: Expression{Kind: "column", Value: "a"}}},
+				From:      TableSource{Table: "t"},
+				Compounds: []CompoundSelect{{Operator: "except", Query: branch("s", "b")}},
+			},
+			want: `SELECT "a" FROM "t" EXCEPT SELECT "b" FROM "s"`,
+		},
+		{
+			name: "homogeneous chain",
+			query: SelectQuery{
+				Columns: []Projection{{Expression: Expression{Kind: "column", Value: "a"}}},
+				From:    TableSource{Table: "t"},
+				Compounds: []CompoundSelect{
+					{Operator: "union", Query: branch("s", "b")},
+					{Operator: "union", Query: branch("u", "c")},
+				},
+			},
+			want: `SELECT "a" FROM "t" UNION SELECT "b" FROM "s" UNION SELECT "c" FROM "u"`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, engine := range []Engine{SQLite, Postgres} {
+				got, err := compileSelect(engine, test.query)
+				if err != nil {
+					t.Fatalf("%s: %v", engine, err)
+				}
+				if got != test.want {
+					t.Fatalf("%s compound SQL:\n got %q\nwant %q", engine, got, test.want)
+				}
+			}
+		})
+	}
+}
+
+// TestCompileCompoundTrailingClausesApplyOnceAfterAllBranches freezes that the
+// whole-compound ORDER BY / LIMIT / OFFSET carried by the leading query are
+// emitted a single time, after every branch, not after the first SELECT.
+func TestCompileCompoundTrailingClausesApplyOnceAfterAllBranches(t *testing.T) {
+	limit, offset := 10, 5
+	query := SelectQuery{
+		Columns: []Projection{{Expression: Expression{Kind: "column", Value: "a"}}},
+		From:    TableSource{Table: "t"},
+		Compounds: []CompoundSelect{{Operator: "union", Query: SelectQuery{
+			Columns: []Projection{{Expression: Expression{Kind: "column", Value: "b"}}},
+			From:    TableSource{Table: "s"},
+		}}},
+		OrderBy: []Ordering{{Expression: Expression{Kind: "column", Value: "a"}, Descending: true}},
+		Limit:   &limit,
+		Offset:  &offset,
+	}
+	want := `SELECT "a" FROM "t" UNION SELECT "b" FROM "s" ORDER BY "a" DESC LIMIT 10 OFFSET 5`
+	for _, engine := range []Engine{SQLite, Postgres} {
+		got, err := compileSelect(engine, query)
+		if err != nil {
+			t.Fatalf("%s: %v", engine, err)
+		}
+		if got != want {
+			t.Fatalf("%s compound trailing SQL:\n got %q\nwant %q", engine, got, want)
+		}
+	}
+}
+
+// TestCompileCompoundBranchKeepsPerEngineExpressionMapping confirms each branch
+// is compiled per engine, so a LIKE in a branch still maps to ILIKE on
+// PostgreSQL while staying LIKE on SQLite.
+func TestCompileCompoundBranchKeepsPerEngineExpressionMapping(t *testing.T) {
+	like := Expression{Kind: "like", Args: []Expression{{Kind: "column", Value: "code"}, {Kind: "string", Value: "x%"}}}
+	query := SelectQuery{
+		Columns: []Projection{{Expression: Expression{Kind: "column", Value: "code"}}},
+		From:    TableSource{Table: "t"},
+		Compounds: []CompoundSelect{{Operator: "union", Query: SelectQuery{
+			Columns: []Projection{{Expression: Expression{Kind: "column", Value: "code"}}},
+			From:    TableSource{Table: "s"},
+			Where:   &like,
+		}}},
+	}
+	sqlite, err := compileSelect(SQLite, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(sqlite, `("code" LIKE 'x%')`) {
+		t.Fatalf("sqlite branch must keep LIKE: %s", sqlite)
+	}
+	postgres, err := compileSelect(Postgres, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(postgres, `("code" ILIKE 'x%')`) {
+		t.Fatalf("postgres branch must use ILIKE: %s", postgres)
+	}
+}
+
+// TestCompileCompoundRejectsInvalidChains freezes the compile-time guards that
+// keep a hand-built AST from producing engine-divergent or malformed SQL.
+func TestCompileCompoundRejectsInvalidChains(t *testing.T) {
+	leading := SelectQuery{
+		Columns: []Projection{{Expression: Expression{Kind: "column", Value: "a"}}},
+		From:    TableSource{Table: "t"},
+	}
+	simpleBranch := func(operator, table string) CompoundSelect {
+		return CompoundSelect{Operator: operator, Query: SelectQuery{
+			Columns: []Projection{{Expression: Expression{Kind: "column", Value: "a"}}},
+			From:    TableSource{Table: table},
+		}}
+	}
+	limit := 3
+
+	t.Run("mixed intersect", func(t *testing.T) {
+		query := leading
+		query.Compounds = []CompoundSelect{simpleBranch("union", "s"), simpleBranch("intersect", "u")}
+		if _, err := compileSelect(SQLite, query); err == nil || !strings.Contains(err.Error(), "INTERSECT") {
+			t.Fatalf("expected INTERSECT precedence rejection, got %v", err)
+		}
+	})
+
+	t.Run("unknown operator", func(t *testing.T) {
+		query := leading
+		query.Compounds = []CompoundSelect{simpleBranch("minus", "s")}
+		if _, err := compileSelect(SQLite, query); err == nil || !strings.Contains(err.Error(), "unsupported compound operator") {
+			t.Fatalf("expected unsupported operator rejection, got %v", err)
+		}
+	})
+
+	t.Run("branch carries trailing clause", func(t *testing.T) {
+		branch := simpleBranch("union", "s")
+		branch.Query.Limit = &limit
+		query := leading
+		query.Compounds = []CompoundSelect{branch}
+		if _, err := compileSelect(SQLite, query); err == nil || !strings.Contains(err.Error(), "must not carry") {
+			t.Fatalf("expected branch-trailing rejection, got %v", err)
+		}
+	})
+}
+
 func TestSchemaRejectsIndexOnUnknownColumn(t *testing.T) {
 	schema := Schema{
 		Tables:  []Table{{Name: "products", Columns: []Column{{Name: "id", Type: Type{Family: IntegerType}}}}},
