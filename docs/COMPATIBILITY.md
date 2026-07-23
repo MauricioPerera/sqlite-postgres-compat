@@ -64,6 +64,19 @@ construido a mano). Una CTE que referencia a **otra CTE anterior** de la misma
 cláusula `WITH` es legítima y se sigue aceptando. Evidencia en
 [reports/FIX-AUDIT10-REPORT.md](reports/FIX-AUDIT10-REPORT.md).
 
+La comparación de nombres es **case-insensitive para ASCII**, equiparando el
+plegado que ambos motores aplican a identificadores no citados (SQLite compara
+letras ASCII sin distinguir mayúsculas; PostgreSQL pliega a minúscula), así que
+`WITH T AS (SELECT id FROM t) …` también se rechaza: `T` y `t` nombran la misma
+relación en ambos motores. El AST no conserva si un identificador vino citado
+(`parseCatalogIdentifier` quita las comillas), de modo que la comparación no puede
+distinguir un `"T"` citado deliberadamente de un `T` sin citar; plegar el case es
+la elección conservadora (a lo sumo rechaza la vista rara que cita `"T"` para
+diferenciarlo de una tabla `t`, ya de por sí un riesgo de divergencia entre
+motores) y cierra el flanco de AUDIT11 A11-1 para todo el camino no citado, que es
+el común y peligroso. Evidencia en
+[reports/FIX-AUDIT11-REPORT.md](reports/FIX-AUDIT11-REPORT.md).
+
 ## Columnas generadas
 
 Se soportan columnas generadas **`STORED`** (`col TIPO GENERATED ALWAYS AS (<expr>) STORED`), sintaxis idéntica en SQLite (≥ 3.31) y PostgreSQL (≥ 12). La expresión de generación usa la gramática canónica de expresiones (misma que `CHECK`/`DEFAULT`). Ambos motores recomputan el valor de forma determinista en el destino: esa recomputación idéntica **es** la prueba de equivalencia. La cadena de datos nunca escribe una columna generada — se excluye de la lista de columnas de todo `INSERT`/`UPDATE` (snapshot y replicación) y el motor destino la recalcula.

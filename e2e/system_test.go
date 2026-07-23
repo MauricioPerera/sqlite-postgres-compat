@@ -1141,6 +1141,62 @@ func TestSystemRejectsAudit10DivergentDDLBeforeEngines(t *testing.T) {
 	}
 }
 
+// TestSystemRejectsAudit11CaseFoldSelfReferentialCTE reproduces AUDIT11 A11-1
+// against both real engines: a non-recursive CTE named "T" whose body reads from
+// "t" (unquoted identifiers differing only in ASCII case), over a real base table
+// "t" holding rows. Before the fix, compat emitted byte-identical DDL for both
+// engines that diverged at query time — SQLite raised "circular reference" while
+// PostgreSQL bound the inner "t" to the base table and returned rows. Compat now
+// folds identifier case in the self-reference check and refuses the view during
+// compilation, before any statement reaches SQLite or PostgreSQL. After the
+// rejection the view is confirmed absent in PostgreSQL, proving no DDL escaped.
+func TestSystemRejectsAudit11CaseFoldSelfReferentialCTE(t *testing.T) {
+	ctx := context.Background()
+
+	caseFoldSelfRefView := compat.Schema{
+		Tables: []compat.Table{{
+			Name:    "t",
+			Columns: []compat.Column{{Name: "id", Type: compat.Type{Family: compat.IntegerType}}},
+		}},
+		Views: []compat.View{{
+			Name: "audit11_casefold_selfref",
+			Query: compat.SelectQuery{
+				With: []compat.CommonTableExpr{{
+					Name: "T",
+					Query: compat.SelectQuery{
+						Columns: []compat.Projection{{Expression: compat.Expression{Kind: "column", Value: "id"}}},
+						From:    compat.TableSource{Table: "t"},
+					},
+				}},
+				Columns: []compat.Projection{{Expression: compat.Expression{Kind: "column", Value: "id"}}},
+				From:    compat.TableSource{Table: "T"},
+			},
+		}},
+	}
+
+	sqlite := openSQLite(t, filepath.Join(t.TempDir(), "audit11.db"))
+	postgres := openPostgres(t)
+	for _, store := range []*compat.Store{sqlite, postgres} {
+		err := store.ApplySchema(ctx, caseFoldSelfRefView)
+		if err == nil {
+			t.Fatalf("%s: expected ApplySchema to reject case-fold self-referential CTE", store.Target.Engine)
+		}
+		if !strings.Contains(err.Error(), "self-referential") {
+			t.Fatalf("%s: error %q does not mention self-referential", store.Target.Engine, err.Error())
+		}
+	}
+	// The view must not exist in PostgreSQL: no DDL reached the engine.
+	var count int
+	if err := postgres.DB.QueryRowContext(ctx,
+		`SELECT count(*) FROM information_schema.views WHERE table_name = $1`,
+		"audit11_casefold_selfref").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("view leaked into PostgreSQL despite rejection")
+	}
+}
+
 func openSQLite(t *testing.T, path string) *compat.Store {
 	t.Helper()
 	store, err := compat.OpenSQLite(compat.Version{Major: 3}, "file:"+filepath.ToSlash(path))

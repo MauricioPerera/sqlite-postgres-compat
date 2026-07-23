@@ -909,6 +909,32 @@ func TestCompileRejectsSelfReferentialCTE(t *testing.T) {
 	}
 }
 
+// TestCompileRejectsCaseFoldSelfReferentialCTE freezes the compile-time (hand-built
+// AST) half of the AUDIT11 A11-1 guard: a CommonTableExpr named "T" whose body reads
+// from "t" (identifiers differing only in ASCII case) self-references under the fold
+// both engines apply to unquoted names, so it must be rejected before any DDL is
+// emitted, on both engines, mirroring the parser guard.
+func TestCompileRejectsCaseFoldSelfReferentialCTE(t *testing.T) {
+	query := SelectQuery{
+		With: []CommonTableExpr{{
+			Name: "T",
+			Query: SelectQuery{
+				Columns: []Projection{{Expression: Expression{Kind: "column", Value: "id"}}},
+				From:    TableSource{Table: "t"},
+			},
+		}},
+		Columns: []Projection{{Expression: Expression{Kind: "column", Value: "id"}}},
+		From:    TableSource{Table: "T"},
+	}
+	for _, engine := range []Engine{SQLite, Postgres} {
+		if _, err := compileSelect(engine, query); err == nil {
+			t.Fatalf("%s: expected case-fold self-referential CTE to be rejected", engine)
+		} else if !strings.Contains(err.Error(), "self-referential") {
+			t.Fatalf("%s: unexpected error %q", engine, err.Error())
+		}
+	}
+}
+
 // TestCompileMultipleCTEsForBothEngines freezes a two-CTE clause feeding a joined
 // main query, confirming the comma-separated WITH list and the join both compile.
 func TestCompileMultipleCTEsForBothEngines(t *testing.T) {

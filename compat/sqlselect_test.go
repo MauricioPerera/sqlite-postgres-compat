@@ -609,3 +609,37 @@ func TestParseCatalogSelectAcceptsSiblingCTEReference(t *testing.T) {
 		t.Fatalf("second CTE should read from the first: %+v", got.With[1].Query)
 	}
 }
+
+// TestParseCatalogSelectRejectsCaseFoldSelfReferentialCTE freezes AUDIT11 A11-1:
+// a non-recursive CTE named `T` whose body reads from `t` (unquoted identifiers
+// differing only in ASCII case). Both engines fold unquoted identifiers, so `T`
+// and `t` denote the same name and the CTE self-references — SQLite errors
+// "circular reference" while PostgreSQL binds the inner `t` to a real base table
+// of the same folded name and returns rows, from byte-identical DDL. The exact-
+// case form was closed by M2; this closes the case-fold flank.
+func TestParseCatalogSelectRejectsCaseFoldSelfReferentialCTE(t *testing.T) {
+	_, err := parseCatalogSelect(`WITH T AS (SELECT id FROM t) SELECT id FROM T`)
+	if err == nil {
+		t.Fatal("expected rejection for case-fold self-referential CTE, got nil")
+	}
+	if !strings.Contains(err.Error(), "self-referential") || !strings.Contains(err.Error(), "RECURSIVE") {
+		t.Fatalf("expected a self-referential CTE rejection, got %q", err.Error())
+	}
+}
+
+// TestParseCatalogSelectAcceptsDistinctNamedCTE is the A11-1 non-regression guard:
+// a WITH whose CTE and base table have genuinely different names (not merely a
+// case difference) must still parse — the case-insensitive self-reference check
+// must not turn into a false positive against unrelated names.
+func TestParseCatalogSelectAcceptsDistinctNamedCTE(t *testing.T) {
+	got, err := parseCatalogSelect(`WITH summary AS (SELECT id FROM orders) SELECT id FROM summary`)
+	if err != nil {
+		t.Fatalf("distinct-named CTE must still parse: %v", err)
+	}
+	if len(got.With) != 1 || got.With[0].Name != "summary" {
+		t.Fatalf("expected CTE summary, got %+v", got.With)
+	}
+	if got.With[0].Query.From.Table != "orders" {
+		t.Fatalf("CTE should read from the base table orders: %+v", got.With[0].Query)
+	}
+}

@@ -744,7 +744,7 @@ func cteQueryReferencesName(query SelectQuery, name string) bool {
 	// below this query resolves to that inner binding, not to the CTE we are
 	// checking, so this scope is not a self-reference.
 	for _, cte := range query.With {
-		if cte.Name == name {
+		if identifiersFoldEqual(cte.Name, name) {
 			return false
 		}
 	}
@@ -775,7 +775,42 @@ func tableSourceReferencesName(source TableSource, name string) bool {
 	if source.Subquery != nil {
 		return cteQueryReferencesName(*source.Subquery, name)
 	}
-	return source.Table == name
+	return identifiersFoldEqual(source.Table, name)
+}
+
+// identifiersFoldEqual reports whether two catalog identifiers name the same
+// relation under the identifier folding both engines apply to unquoted names:
+// SQLite compares ASCII letters case-insensitively, and PostgreSQL folds unquoted
+// identifiers to lower case, so `T` and `t` denote the same name on either engine.
+// The comparison is intentionally ASCII-only, matching SQLite's ASCII case fold
+// rather than Go's broader Unicode folding, so non-ASCII bytes must match exactly.
+//
+// The AST does not preserve whether an identifier arrived quoted (parseCatalogIdentifier
+// strips the quotes), so this comparison cannot tell a deliberately quoted `"T"`
+// (case-sensitive in both engines, and thus distinct from `t`) from an unquoted `T`.
+// Folding case here is the conservative choice: at worst it rejects the rare view
+// that quotes `"T"` specifically to make it distinct from a base table `t` — itself
+// an engine-divergence hazard we prefer to reject — while it closes the self-reference
+// gap (AUDIT11 A11-1) for every unquoted case, which is the common and dangerous path.
+func identifiersFoldEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if asciiLower(a[i]) != asciiLower(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// asciiLower lower-cases a single ASCII byte and leaves every other byte
+// (including all non-ASCII bytes of a multi-byte UTF-8 rune) unchanged.
+func asciiLower(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
 }
 
 func nextCatalogJoin(text string) (position int, kind string, keyword string, found bool) {

@@ -51,7 +51,7 @@ La segunda prueba falla intencionalmente mientras haya capacidades `unknown`. El
 
 ## Conteo vigente
 
-La batería E2E tiene 49 pruebas de nivel superior distribuidas en tres archivos: `e2e/system_test.go`, `e2e/suppress_test.go` y `e2e/cutover_test.go`. Hoy son 48 superadas y 1 fallida de forma intencional (`TestSystemClaimsExactCoverageForRequiredFeatureFamilies`). Esa proporción no es un porcentaje de compatibilidad total: el fallo significa que el objetivo del 100 % no se cumple.
+La batería E2E tiene 50 pruebas de nivel superior distribuidas en tres archivos: `e2e/system_test.go`, `e2e/suppress_test.go` y `e2e/cutover_test.go`. Hoy son 49 superadas y 1 fallida de forma intencional (`TestSystemClaimsExactCoverageForRequiredFeatureFamilies`). Esa proporción no es un porcentaje de compatibilidad total: el fallo significa que el objetivo del 100 % no se cumple.
 
 El conteo vigente y las familias restantes se registran en [VALIDATION_REPORT.md](reports/VALIDATION_REPORT.md).
 
