@@ -383,14 +383,61 @@ func wordBoundary(text string, index int) bool {
 	return index < 0 || index >= len(text) || !(unicode.IsLetter(rune(text[index])) || unicode.IsDigit(rune(text[index])) || text[index] == '_')
 }
 
+// isCatalogNumber reports whether text is a valid SQLite numeric literal
+// (decimal or integer), matching the grammar:
+//
+//	[+-]? ( digits [. [digits]] | .digits ) [ ([eE] [+-]? digits) ]
+//
+// The mantissa must contribute at least one digit before any exponent, so a
+// bare exponent such as "E5" or "e10" — which has no mantissa digits before
+// the e/E — is NOT a number: SQLite treats it as an identifier (column). The
+// previous "at least one digit over [0-9.+-eE]" check accepted such forms
+// wrongly and emitted them unquoted, which folded to the wrong column. Hex
+// literals (0x...) are handled separately by catalogHexLiteral and never reach
+// here.
 func isCatalogNumber(text string) bool {
-	for _, character := range text {
-		if unicode.IsDigit(character) || strings.ContainsRune(".+-eE", character) {
-			continue
-		}
+	if text == "" {
 		return false
 	}
-	return text != "" && strings.ContainsAny(text, "0123456789")
+	i := 0
+	if text[0] == '+' || text[0] == '-' {
+		i++
+	}
+	// Mantissa: digits, an optional dot, then optional digits. ".5" (no
+	// leading digits) is valid; "1." and "1.5" are valid too.
+	integerStart := i
+	for i < len(text) && text[i] >= '0' && text[i] <= '9' {
+		i++
+	}
+	hasDigits := i > integerStart
+	if i < len(text) && text[i] == '.' {
+		i++
+		fractionStart := i
+		for i < len(text) && text[i] >= '0' && text[i] <= '9' {
+			i++
+		}
+		hasDigits = hasDigits || i > fractionStart
+	}
+	if !hasDigits {
+		// "e5" / "E10" / "." / "+" reach here: no mantissa digit -> not a number.
+		return false
+	}
+	// Optional exponent, only after a valid mantissa. The exponent itself
+	// must carry at least one digit ("1e" is not a number).
+	if i < len(text) && (text[i] == 'e' || text[i] == 'E') {
+		i++
+		if i < len(text) && (text[i] == '+' || text[i] == '-') {
+			i++
+		}
+		exponentStart := i
+		for i < len(text) && text[i] >= '0' && text[i] <= '9' {
+			i++
+		}
+		if i == exponentStart {
+			return false
+		}
+	}
+	return i == len(text)
 }
 
 func parseCatalogIdentifier(text string) (string, bool) {

@@ -290,6 +290,123 @@ func TestParseCatalogExpressionNotPrecedence(t *testing.T) {
 	}
 }
 
+// TestParseCatalogExpressionNumericVersusIdentifier covers the MEDIA-1 fix:
+// a bare exponent such as "E5" or "e10" has no mantissa digit before the e/E,
+// so SQLite treats it as an identifier (column), not a number. The previous
+// "at least one digit over [0-9.+-eE]" check classified these as decimal
+// literals and emitted them unquoted, which folded to the wrong column. The
+// table checks both the parsed classification and the compiled DDL output:
+// columns are quoted, real numeric literals are emitted verbatim.
+func TestParseCatalogExpressionNumericVersusIdentifier(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		kind     string
+		value    string
+		compiled string
+	}{
+		// Bare exponents: identifiers (columns), quoted in DDL.
+		{`e5 column lowercase`, "e5", "column", "e5", `"e5"`},
+		{`E5 column uppercase`, "E5", "column", "E5", `"E5"`},
+		{`e10 column lowercase`, "e10", "column", "e10", `"e10"`},
+		{`E10 column uppercase`, "E10", "column", "E10", `"E10"`},
+		{`E3 column uppercase`, "E3", "column", "E3", `"E3"`},
+		// Real numeric literals: mantissa present, emitted verbatim.
+		{`1e5 decimal`, "1e5", "decimal", "1e5", "1e5"},
+		{`1E5 decimal uppercase exponent`, "1E5", "decimal", "1E5", "1E5"},
+		{`.5e3 decimal leading dot`, ".5e3", "decimal", ".5e3", ".5e3"},
+		{`0.5 decimal`, "0.5", "decimal", "0.5", "0.5"},
+		{`0 integer`, "0", "integer", "0", "0"},
+		{`16 integer`, "16", "integer", "16", "16"},
+		// Hex literal is handled separately and reinterpreted as int64.
+		{`0x1F hex`, "0x1F", "integer", "31", "31"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseCatalogExpression(test.input)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Kind != test.kind || got.Value != test.value {
+				t.Fatalf("classification got {Kind:%q Value:%q}, want {Kind:%q Value:%q}", got.Kind, got.Value, test.kind, test.value)
+			}
+			compiled, err := compileExpression(Postgres, got)
+			if err != nil {
+				t.Fatalf("compile error: %v", err)
+			}
+			if compiled != test.compiled {
+				t.Fatalf("compiled got %q, want %q", compiled, test.compiled)
+			}
+		})
+	}
+}
+
+// TestParseCatalogExpressionExponentColumnInComparison checks that an "E5"
+// reference in a CHECK-like predicate classifies as a column and is emitted
+// quoted, so a column created as "E5" resolves instead of folding to "e5".
+func TestParseCatalogExpressionExponentColumnInComparison(t *testing.T) {
+	got, err := parseCatalogExpression("E5 > 0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Expression{Kind: "gt", Args: []Expression{
+		{Kind: "column", Value: "E5"},
+		{Kind: "integer", Value: "0"},
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+	compiled, err := compileExpression(Postgres, got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `("E5" > 0)`; compiled != want {
+		t.Fatalf("compiled got %q, want %q", compiled, want)
+	}
+}
+
+// TestParseCatalogExpressionExponentPrefixedMixedForms documents the SQLite
+// grammar's verdict on exponent-prefixed forms with a dot. "e5.5" has no
+// mantissa digit before the e/E, so it is not a number; it falls through to
+// the identifier rule, which treats the dot as a qualifier separator and
+// yields the column reference e5.5. (A bare ".5" without an exponent stays a
+// number, so ".5e3" above is decimal.)
+func TestParseCatalogExpressionExponentPrefixedMixedForms(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		kind  string
+		value string
+	}{
+		{`e5.5 is a qualified column, not a number`, "e5.5", "column", "e5.5"},
+		{`E5.5 is a qualified column, not a number`, "E5.5", "column", "E5.5"},
+		{`.5e3 with mantissa is a decimal`, ".5e3", "decimal", ".5e3"},
+		{`1. is a decimal`, "1.", "decimal", "1."},
+		// "1e" has a mantissa but an exponent with no digits, so it is not a
+		// number; it falls through to the identifier rule as column "1e" (a
+		// digit-led identifier, same edge as the existing BAJA-class behavior).
+		{`1e exponent with no digits is not a number`, "1e", "column", "1e"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseCatalogExpression(test.input)
+			if test.kind == "unsupported" {
+				if err == nil {
+					t.Fatalf("expected %q to be rejected, got %#v", test.input, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Kind != test.kind || got.Value != test.value {
+				t.Fatalf("got {Kind:%q Value:%q}, want {Kind:%q Value:%q}", got.Kind, got.Value, test.kind, test.value)
+			}
+		})
+	}
+}
+
 func TestParseCatalogExpressionHexLiteral(t *testing.T) {
 	column := func(name string) Expression { return Expression{Kind: "column", Value: name} }
 

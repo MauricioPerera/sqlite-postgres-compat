@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // catalogClause pairs a trailing SELECT keyword with the routine that applies
@@ -141,7 +142,10 @@ func locateCatalogClauses(remainder string, clauses []catalogClause) []locatedCl
 // the located keywords, in source order) and applies each clause's handler.
 func applyCatalogClauses(query *SelectQuery, remainder string, clauses []catalogClause, located []locatedClause) error {
 	for i, current := range located {
-		start := current.position + len(clauses[current.index].keyword)
+		// Compute the actual end of the keyword span rather than start+len,
+		// because a multi-word keyword may have matched extra internal
+		// whitespace (e.g. "GROUP  BY") that len(keyword) does not count.
+		start, _ := keywordMatchSpan(remainder, current.position, clauses[current.index].keyword)
 		end := len(remainder)
 		if i+1 < len(located) {
 			end = located[i+1].position
@@ -219,11 +223,38 @@ func applyOffsetClause(query *SelectQuery, value string) error {
 	return nil
 }
 
+// keywordMatchSpan reports whether text matches keyword at position start,
+// allowing any run of whitespace (spaces, tabs, newlines) wherever keyword
+// has a single separating space, and returns the index just past the last
+// matched character. Matching is case-insensitive. The single spaces inside
+// keyword are treated as "any whitespace separator", so "GROUP  BY" or
+// "ORDER\tBY" match "GROUP BY" / "ORDER BY"; single-word keywords (FROM, ON,
+// AS, HAVING) match verbatim. It does not enforce word boundaries — callers
+// do that around the [start, end) span.
+func keywordMatchSpan(text string, start int, keyword string) (int, bool) {
+	words := strings.Split(keyword, " ")
+	i := start
+	for w, word := range words {
+		if w > 0 {
+			if i >= len(text) || !unicode.IsSpace(rune(text[i])) {
+				return 0, false
+			}
+			for i < len(text) && unicode.IsSpace(rune(text[i])) {
+				i++
+			}
+		}
+		if i+len(word) > len(text) || !strings.EqualFold(text[i:i+len(word)], word) {
+			return 0, false
+		}
+		i += len(word)
+	}
+	return i, true
+}
+
 func topLevelKeyword(text, keyword string) int {
 	depth := 0
 	inSingle, inDouble := false, false
-	upper := strings.ToUpper(text)
-	for i := 0; i+len(keyword) <= len(text); i++ {
+	for i := 0; i < len(text); i++ {
 		switch text[i] {
 		case '\'':
 			if !inDouble {
@@ -246,8 +277,10 @@ func topLevelKeyword(text, keyword string) int {
 				depth--
 			}
 		}
-		if depth == 0 && !inSingle && !inDouble && strings.HasPrefix(upper[i:], keyword) && wordBoundary(text, i-1) && wordBoundary(text, i+len(keyword)) {
-			return i
+		if depth == 0 && !inSingle && !inDouble && wordBoundary(text, i-1) {
+			if end, ok := keywordMatchSpan(text, i, keyword); ok && wordBoundary(text, end) {
+				return i
+			}
 		}
 	}
 	return -1
@@ -334,7 +367,7 @@ func parseCatalogFrom(text string) (TableSource, []Join, error) {
 	for hasOuterParentheses(text) {
 		text = strings.TrimSpace(text[1 : len(text)-1])
 	}
-	position, _, found := nextCatalogJoin(text)
+	position, _, _, found := nextCatalogJoin(text)
 	if !found {
 		source, err := parseCatalogTableSource(text)
 		return source, nil, err
@@ -346,27 +379,15 @@ func parseCatalogFrom(text string) (TableSource, []Join, error) {
 	remainder := strings.TrimSpace(text[position:])
 	var joins []Join
 	for remainder != "" {
-		start, kind, found := nextCatalogJoin(remainder)
+		start, kind, joinKeyword, found := nextCatalogJoin(remainder)
 		if !found || start != 0 {
 			return TableSource{}, nil, fmt.Errorf("invalid JOIN sequence %q", remainder)
 		}
-		keywordLength := len("JOIN")
-		switch kind {
-		case "left":
-			if strings.HasPrefix(strings.ToUpper(remainder), "LEFT OUTER JOIN") {
-				keywordLength = len("LEFT OUTER JOIN")
-			} else {
-				keywordLength = len("LEFT JOIN")
-			}
-		case "inner":
-			if strings.HasPrefix(strings.ToUpper(remainder), "INNER JOIN") {
-				keywordLength = len("INNER JOIN")
-			}
-		case "cross":
-			keywordLength = len("CROSS JOIN")
-		}
-		tail := strings.TrimSpace(remainder[keywordLength:])
-		next, _, hasNext := nextCatalogJoin(tail)
+		// Span the actual matched keyword so internal whitespace such as
+		// "LEFT  OUTER  JOIN" consumes the right number of characters.
+		end, _ := keywordMatchSpan(remainder, start, joinKeyword)
+		tail := strings.TrimSpace(remainder[end:])
+		next, _, _, hasNext := nextCatalogJoin(tail)
 		segment := tail
 		if hasNext {
 			segment = strings.TrimSpace(tail[:next])
@@ -395,7 +416,7 @@ func parseCatalogFrom(text string) (TableSource, []Join, error) {
 	return base, joins, nil
 }
 
-func nextCatalogJoin(text string) (int, string, bool) {
+func nextCatalogJoin(text string) (position int, kind string, keyword string, found bool) {
 	candidates := []struct {
 		keyword, kind string
 	}{
@@ -405,14 +426,16 @@ func nextCatalogJoin(text string) (int, string, bool) {
 		{"CROSS JOIN", "cross"},
 		{"JOIN", "inner"},
 	}
-	position := -1
-	kind := ""
+	position = -1
+	kind = ""
+	keyword = ""
 	for _, candidate := range candidates {
-		found := topLevelKeyword(text, candidate.keyword)
-		if found >= 0 && (position < 0 || found < position) {
-			position = found
+		candidateAt := topLevelKeyword(text, candidate.keyword)
+		if candidateAt >= 0 && (position < 0 || candidateAt < position) {
+			position = candidateAt
 			kind = candidate.kind
+			keyword = candidate.keyword
 		}
 	}
-	return position, kind, position >= 0
+	return position, kind, keyword, position >= 0
 }
