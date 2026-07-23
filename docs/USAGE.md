@@ -158,6 +158,14 @@ if err := postgres.ApplyChangesTolerant(ctx, schema, changes); err != nil {
 
 `ApplyChanges` queda intacto; usá `ApplyChangesTolerant` sólo durante el catch-up de un cutover.
 
+### Compatibilidad al actualizar la herramienta (reinstall de la captura)
+
+`InstallChangeCapture` instala triggers cuya rama `DECIMAL`/`typeof='real'` emite un marcador versionado (`realDecimalMarker`) antes del texto `printf('%!.17g')`, para que el applier distinga un decimal REAL-stored de TEXT arbitrario. Los triggers instalados por una versión **anterior** de la herramienta emiten esa rama **sin** el marcador. Esto es una **frontera de versión de la herramienta**, no un formato de journal autodescriptivo; respetala al actualizar la herramienta a través de ese límite:
+
+- **Reinstalar la captura tras actualizar (reinstall).** Los triggers instalados por una versión anterior deben **reinstalarse** (`InstallChangeCapture`) en cada store antes de capturar cambios nuevos con el código nuevo: los triggers viejos no emiten el marcador que el applier nuevo espera.
+- **Drenar o descartar journals in-flight pre-actualización.** Un journal capturado por triggers pre-actualización (sin marcador) **no** debe aplicarse con el código nuevo: drenaló al destino antes de actualizar, o descartálo y re-snapshoteá desde un origen limpio. El contrato de migración documentado (instalar captura → snapshot → catch-up que drena el journal) ya te mantiene del lado seguro; un journal in-flight mixto entre versiones está fuera de ese contrato.
+- **La divergencia la detecta verify, nunca es silenciosa.** Si aun así se aplica un journal pre-actualización con el código nuevo, `ApplyChanges` no errora, pero `VerifySnapshots` reporta `Equivalent == false` para los decimales REAL-stored de alta magnitud afectados (el código nuevo lee el texto sin marcador verbatim mientras el origen canoniza el `float64` REAL). No hay corrupción silenciosa: un paso de `verify` expone la divergencia.
+
 ## Cutover sin ventana con la CLI
 
 `compat-cutover` orquesta un cutover SQLite → PostgreSQL sin ventana de corte: audita el contrato, instala captura en el origen, importa el snapshot en el destino, drena el journal con `ApplyChangesTolerant` (resolviendo el solapamiento inherente) y verifica equivalencia. Configura `examples/cutover.example.json`:

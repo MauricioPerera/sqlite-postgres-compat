@@ -64,6 +64,40 @@ func TestParseCatalogSelectAllowsZeroLimitAndOffset(t *testing.T) {
 	}
 }
 
+// TestParseCatalogSelectRejectsEmptyClauseOperand covers the BAJA-N1 fix: a
+// clause keyword with no operand (e.g. "GROUP BY" at the end of the string) is a
+// syntax error in SQLite and Postgres. Every clause that takes an operand must
+// reject the empty form with a clear parse error rather than accepting it and
+// silently dropping the clause at emit time.
+func TestParseCatalogSelectRejectsEmptyClauseOperand(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{"GROUP BY empty", "SELECT a FROM t GROUP BY"},
+		{"GROUP BY empty extra whitespace", "SELECT a FROM t GROUP  BY "},
+		{"ORDER BY empty", "SELECT a FROM t ORDER BY"},
+		{"ORDER BY empty extra whitespace", "SELECT a FROM t ORDER\tBY\t"},
+		{"HAVING empty", "SELECT a FROM t HAVING"},
+		{"WHERE empty", "SELECT a FROM t WHERE"},
+		{"LIMIT empty", "SELECT a FROM t LIMIT"},
+		{"OFFSET empty", "SELECT a FROM t OFFSET"},
+		{"LIMIT empty with OFFSET", "SELECT a FROM t LIMIT 10 OFFSET"},
+		{"GROUP BY empty with ORDER BY operand", "SELECT a FROM t GROUP BY ORDER BY b"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := parseCatalogSelect(test.input)
+			if err == nil {
+				t.Fatalf("expected error for empty operand, got nil")
+			}
+			if !strings.Contains(err.Error(), "no operand") {
+				t.Fatalf("expected \"no operand\" error, got %q", err.Error())
+			}
+		})
+	}
+}
+
 // TestParseCatalogSelectToleratesKeywordInternalWhitespace covers the MEDIA-2
 // fix: SQLite and Postgres treat any run of whitespace as a separator, so a
 // multi-word keyword such as "GROUP BY" must still match when its words are

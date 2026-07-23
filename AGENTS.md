@@ -160,6 +160,7 @@ The body is `BEGIN ... END` (optional wrapper) parsed as the same action list as
 The layer never silently degrades. These are rejected with explicit errors:
 
 - Negative `LIMIT` / `OFFSET`.
+- A clause keyword (`WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`) with no operand — e.g. `GROUP BY` at the end of the string — is rejected with `SELECT <keyword> clause has no operand`; SQLite and Postgres treat this as a syntax error, and the layer rejects it rather than accepting an empty clause that the emitter would silently discard.
 - Non-`public` schema qualifier on a PostgreSQL trigger.
 - `SELECT *` or a bare `*` projection.
 - Compound or schema-qualified table sources in `FROM`.
@@ -285,6 +286,17 @@ A migration is a sequence of auditable verdicts. Each phase produces a machine-c
 A canonical schema that contains a `vector` column infers `canonical_vectors`; one with views/triggers/routines/indexes infers the corresponding `canonical_*` features. Generic families (`foreign_keys`, `check_constraints`, `indexes`, `views`, `triggers`, `stored_routines`, `full_text`) remain `unknown` because they represent arbitrary native SQL and are not audited as exact.
 
 See [`contracts/migration.contract.example.md`](contracts/migration.contract.example.md) for a full executable example.
+
+## 10. Upgrade compatibility — capture trigger versioning
+
+`InstallChangeCapture` installs change-capture triggers whose `DECIMAL`/`typeof='real'` branch emits a versioned `realDecimalMarker` prefix before the `printf('%!.17g')` text, so the applier can tell a REAL-stored decimal from arbitrary TEXT. Triggers installed by an **older** tool version emit that branch **without** the marker.
+
+This is a **tooling version boundary**, not a data format the journal is self-describing about. Observe it when upgrading the tool across that boundary:
+
+- **Reinstall capture after upgrading.** Triggers installed by a previous tool version must be **reinstalled** (`InstallChangeCapture`) on every store before capturing new changes with the new code. The old triggers do not emit the marker the new applier expects.
+- **Drain or discard in-flight pre-upgrade journals.** A journal captured by pre-upgrade triggers (no marker) must **not** be applied with the new code: drain it to the destination before upgrading, or discard it and re-snapshot from a clean source. The documented migration contract (install capture → snapshot → catch-up drains the journal) already keeps you on the safe side; a mixed-version in-flight journal is outside that contract.
+- **Divergence is detected, never silent.** If a pre-upgrade journal is nonetheless applied with the new code, `ApplyChanges` does not error, but `VerifySnapshots` reports `Equivalent == false` for affected high-magnitude REAL-stored decimals (the new code reads the unmarked text verbatim while the source canonizes the REAL `float64`). There is no silent corruption: a `verify` step surfaces the divergence.
+
 ## Interface note
 
 The CLIs are the canonical interface for agents: every operation is available as a command with a machine-readable JSON result, a typed error envelope and a stable exit code. An MCP server wrapping the same library functions is a possible optional layer (useful for shell-less agents or long-running cutover monitoring) and is intentionally not part of this repository today.

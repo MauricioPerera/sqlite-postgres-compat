@@ -150,7 +150,14 @@ func applyCatalogClauses(query *SelectQuery, remainder string, clauses []catalog
 		if i+1 < len(located) {
 			end = located[i+1].position
 		}
-		if err := clauses[current.index].apply(strings.TrimSpace(remainder[start:end])); err != nil {
+		value := strings.TrimSpace(remainder[start:end])
+		// A clause keyword with no operand (e.g. "GROUP BY" at end of string) is a
+		// syntax error in SQLite and Postgres; reject it explicitly rather than
+		// accepting an empty clause that the emitter would silently discard.
+		if value == "" {
+			return fmt.Errorf("SELECT %s clause has no operand", clauses[current.index].keyword)
+		}
+		if err := clauses[current.index].apply(value); err != nil {
 			return err
 		}
 	}
