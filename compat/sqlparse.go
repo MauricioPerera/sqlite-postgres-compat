@@ -166,6 +166,18 @@ func parseCatalogExpression(input string) (Expression, error) {
 				return Expression{}, fmt.Errorf("nullif requires two arguments")
 			}
 			return Expression{Kind: "nullif", Args: args}, nil
+		case "gen_random_uuid":
+			// gen_random_uuid() is a nullary, NON-DETERMINISTIC generator: it
+			// produces a fresh random RFC 4122 v4 UUID on every call. It takes
+			// zero arguments (empty parentheses); any argument is an arity error.
+			// Unlike every other node in this grammar it is NOT byte-identical
+			// between engines by value (that is impossible for a random source);
+			// the equivalence proof is that both engines emit a valid v4 UUID and
+			// successive calls differ. See docs/reports/FEAT-RANDOMUUID-REPORT.md.
+			if strings.TrimSpace(argument) != "" {
+				return Expression{}, fmt.Errorf("gen_random_uuid takes no arguments")
+			}
+			return Expression{Kind: "gen_random_uuid"}, nil
 		default:
 			return Expression{}, fmt.Errorf("unsupported catalog function %q", function)
 		}

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -2181,5 +2182,152 @@ func TestSystemDomainCopyEquivalentAndExternalInspection(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("external domain column must be reported as unresolved domain_column: %+v", inspection.Unresolved)
+	}
+}
+
+// uuidV4E2EPattern is a strict RFC 4122 version-4 UUID matcher (lowercase
+// 8-4-4-4-12 hex, version nibble '4', variant nibble in {8,9,a,b}), used to
+// validate the values gen_random_uuid() generates on each real engine.
+var uuidV4E2EPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// assertGeneratedV4UUIDs scans a single TEXT column and asserts every value is a
+// distinct, valid v4 UUID, returning the count so the caller can check the row
+// total. gen_random_uuid() is NON-DETERMINISTIC by design: unlike the rest of the
+// grammar the two engines never produce the same bytes, so equivalence here is
+// (a) both compile and run without error, (b) every value is a valid v4 UUID,
+// (c) successive values differ. See docs/reports/FEAT-RANDOMUUID-REPORT.md.
+func assertGeneratedV4UUIDs(t *testing.T, db *sql.DB, query string, engine string) int {
+	t.Helper()
+	rows, err := db.Query(query)
+	if err != nil {
+		t.Fatalf("%s: %v", engine, err)
+	}
+	defer rows.Close()
+	seen := make(map[string]bool)
+	count := 0
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("%s: %v", engine, err)
+		}
+		if !uuidV4E2EPattern.MatchString(id) {
+			t.Fatalf("%s generated non-v4 uuid %q", engine, id)
+		}
+		if seen[id] {
+			t.Fatalf("%s generated duplicate uuid %q across rows", engine, id)
+		}
+		seen[id] = true
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("%s: %v", engine, err)
+	}
+	return count
+}
+
+// TestSystemGenRandomUUIDGeneratesValidV4OnBothEngines drives the FEAT-RANDOMUUID
+// gen_random_uuid() canonical function through the real engines along both usage
+// paths, against real PostgreSQL 17 and real SQLite (modernc):
+//
+//  1. Column DEFAULT: a table with an `id` column of family=uuid and
+//     DEFAULT gen_random_uuid(). Rows are inserted WITHOUT supplying id, so each
+//     engine's default fires; every generated id must be a valid, unique v4 UUID.
+//  2. Trigger action: an AFTER INSERT trigger whose INSERT action uses
+//     gen_random_uuid() as a VALUES element; every trigger-written id must
+//     likewise be a valid, unique v4 UUID.
+//
+// This function is non-deterministic on purpose, so the check is NOT byte-equal
+// values across engines (impossible for a random source) but: both engines
+// compile and execute the construct without error, produce valid v4 UUIDs, and
+// never repeat a value. A green ApplySchema on real PostgreSQL also proves PG
+// accepts the compiled DDL (its native gen_random_uuid()); a green ApplySchema on
+// SQLite proves the assembled randomblob/hex expression is valid SQL there.
+func TestSystemGenRandomUUIDGeneratesValidV4OnBothEngines(t *testing.T) {
+	ctx := context.Background()
+
+	genUUID := compat.Expression{Kind: "gen_random_uuid"}
+	schema := compat.Schema{
+		Tables: []compat.Table{
+			{
+				// Path 1: id defaulted by gen_random_uuid().
+				Name: "randomuuid_defaulted",
+				Columns: []compat.Column{
+					{Name: "id", Type: compat.Type{Family: compat.UUIDType}, Default: &genUUID},
+					{Name: "n", Type: compat.Type{Family: compat.IntegerType}},
+				},
+				Constraints: []compat.Constraint{{Kind: compat.PrimaryKey, Columns: []string{"id"}}},
+			},
+			{
+				// Path 2 source: an insert here fires the trigger below.
+				Name: "randomuuid_events",
+				Columns: []compat.Column{
+					{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+					{Name: "label", Type: compat.Type{Family: compat.TextType}},
+				},
+				Constraints: []compat.Constraint{{Kind: compat.PrimaryKey, Columns: []string{"id"}}},
+			},
+			{
+				// Path 2 sink: the trigger inserts a fresh gen_random_uuid() token.
+				Name: "randomuuid_tokens",
+				Columns: []compat.Column{
+					{Name: "token", Type: compat.Type{Family: compat.UUIDType}},
+					{Name: "event_id", Type: compat.Type{Family: compat.IntegerType}},
+				},
+			},
+		},
+		Triggers: []compat.Trigger{{
+			Name:   "randomuuid_emit_token",
+			Table:  "randomuuid_events",
+			Timing: "after",
+			Event:  "insert",
+			Actions: []compat.TriggerAction{{
+				Kind:  "insert",
+				Table: "randomuuid_tokens",
+				Assignments: []compat.Assignment{
+					{Column: "token", Value: genUUID},
+					{Column: "event_id", Value: compat.Expression{Kind: "column", Value: "new.id"}},
+				},
+			}},
+		}},
+	}
+
+	sqlite := openSQLite(t, filepath.Join(t.TempDir(), "randomuuid.db"))
+	if err := sqlite.ApplySchema(ctx, schema); err != nil {
+		t.Fatalf("sqlite ApplySchema: %v", err)
+	}
+	postgres := openPostgres(t)
+	if err := postgres.ApplySchema(ctx, schema); err != nil {
+		t.Fatalf("postgres ApplySchema: %v", err)
+	}
+
+	const rowCount = 8
+	for _, store := range []*compat.Store{sqlite, postgres} {
+		for i := 1; i <= rowCount; i++ {
+			// Path 1: no id supplied -> DEFAULT gen_random_uuid() generates it.
+			if _, err := store.DB.ExecContext(ctx, `INSERT INTO randomuuid_defaulted (n) VALUES (`+fmt.Sprint(i)+`)`); err != nil {
+				t.Fatalf("insert defaulted row: %v", err)
+			}
+			// Path 2: insert an event -> trigger inserts a gen_random_uuid() token.
+			if _, err := store.DB.ExecContext(ctx, `INSERT INTO randomuuid_events (id, label) VALUES (`+fmt.Sprint(i)+`, 'e')`); err != nil {
+				t.Fatalf("insert event row: %v", err)
+			}
+		}
+	}
+
+	for _, tc := range []struct {
+		engine string
+		db     *sql.DB
+	}{
+		{"sqlite", sqlite.DB},
+		{"postgres", postgres.DB},
+	} {
+		defaulted := assertGeneratedV4UUIDs(t, tc.db, `SELECT id FROM randomuuid_defaulted`, tc.engine+" default")
+		if defaulted != rowCount {
+			t.Fatalf("%s default path: got %d generated uuids, want %d", tc.engine, defaulted, rowCount)
+		}
+		tokens := assertGeneratedV4UUIDs(t, tc.db, `SELECT token FROM randomuuid_tokens`, tc.engine+" trigger")
+		if tokens != rowCount {
+			t.Fatalf("%s trigger path: got %d generated uuids, want %d", tc.engine, tokens, rowCount)
+		}
 	}
 }

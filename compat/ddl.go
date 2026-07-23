@@ -431,6 +431,8 @@ func compileExpressionIn(engine Engine, expression Expression, inTrigger bool) (
 		return compileIn(engine, expression, inTrigger)
 	case "case":
 		return compileCase(engine, expression, inTrigger)
+	case "gen_random_uuid":
+		return compileGenRandomUUID(engine)
 	case "nullif":
 		if len(expression.Args) != 2 {
 			return "", fmt.Errorf("function %q requires two arguments", expression.Kind)
@@ -621,6 +623,44 @@ func compileCase(engine Engine, expression Expression, inTrigger bool) (string, 
 	}
 	builder.WriteString(" END")
 	return builder.String(), nil
+}
+
+// sqliteUUIDv4Expression assembles an RFC 4122 version-4 UUID from SQLite core
+// functions. The canonical 8-4-4-4-12 layout is built as:
+//
+//	hex(randomblob(4))                      -> 8 random hex digits
+//	hex(randomblob(2))                      -> 4 random hex digits
+//	'4' + substr(hex(randomblob(2)), 2)     -> version nibble '4' + 3 random digits
+//	substr('89ab', 1 + abs(random()%4), 1)  -> variant nibble in {8,9,a,b}
+//	  + substr(hex(randomblob(2)), 2)       -> + 3 random digits
+//	hex(randomblob(6))                      -> 12 random hex digits
+//
+// wrapped in lower() because hex() yields uppercase. random()%4 stays in
+// [-3,3] so abs() never touches the most-negative int64 (which would overflow),
+// keeping the variant index in the valid 1-based range [1,4]. The whole thing is
+// parenthesized because SQLite requires a non-literal column DEFAULT to be
+// wrapped in parentheses (DEFAULT (expr)); the outer parens are also harmless in
+// every other context (trigger VALUES, CHECK). The result is a genuine v4 UUID
+// (verified with a strict parser in the tests), semantically equivalent to
+// PostgreSQL's native generator even though the two never produce the same bytes.
+const sqliteUUIDv4Expression = "(lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || substr(hex(randomblob(2)), 2) || '-' || substr('89ab', 1 + abs(random() % 4), 1) || substr(hex(randomblob(2)), 2) || '-' || hex(randomblob(6))))"
+
+// compileGenRandomUUID compiles the non-deterministic gen_random_uuid()
+// generator. PostgreSQL has a core built-in of the same name (available since
+// PG13; the project requires PG17, so no extension or version gating is
+// needed). SQLite has no core random-UUID function, so a literal
+// hex(randomblob(16)) idiom would not translate; instead the equivalent
+// canonical function emits an inline expression that assembles a valid v4 UUID
+// from randomblob/hex. Both paths return a fresh valid v4 UUID per evaluation.
+func compileGenRandomUUID(engine Engine) (string, error) {
+	switch engine {
+	case Postgres:
+		return "gen_random_uuid()", nil
+	case SQLite:
+		return sqliteUUIDv4Expression, nil
+	default:
+		return "", fmt.Errorf("gen_random_uuid is not supported by %s", engine)
+	}
 }
 
 // compileExpressionArgs compiles each argument expression, returning the

@@ -130,8 +130,11 @@ Recognized by `parseCatalogExpression` and compiled by `compileExpression`:
 | `coalesce` | at least one argument | variadic |
 | `nullif` | exactly two arguments | returns `NULL` when the arguments are equal |
 | `replace` | exactly three arguments | |
+| `gen_random_uuid` | exactly zero arguments (empty parentheses) | **non-deterministic**; see note below |
 
 Every other function name is rejected with `unsupported catalog function %q`. In particular `round`, `substr`/`substring` and `cast` are **deliberately excluded**: they are not byte-identical between SQLite and PostgreSQL (round: half-to-even vs half-away-from-zero on doubles; substr: negative index/length; cast to integer: round vs truncate). `IS DISTINCT FROM` is deferred (needs SQLite ≥ 3.39 version gating). See `docs/reports/FEAT-CUBOA-1-REPORT.md`.
+
+**`gen_random_uuid()` — the one non-deterministic node.** It generates a fresh random RFC 4122 v4 UUID on every evaluation. It compiles to PostgreSQL's native core built-in `gen_random_uuid()` (available since PG13; the project requires PG17, so no extension and no version gating) and, on SQLite (which has no core random-UUID function), to an inline expression over `randomblob`/`hex` that assembles a valid v4 UUID (8-4-4-4-12 layout, version nibble `4`, variant nibble in `{8,9,a,b}`), parenthesized so it is valid as a column `DEFAULT (expr)`. It is **not** a literal translation of the SQLite idiom `hex(randomblob(16))` (rejected — `hex` is not in the allowlist and PostgreSQL core has no equivalent random-bytes generator); it is a new canonical function of equivalent purpose. Because a random source cannot produce the same value on both engines, this node is the sole exception to the byte-identical rule: its equivalence proof is that (a) both engines compile and execute it without error, (b) every generated value is a valid v4 UUID, and (c) successive calls differ — not value equality. It may be used in a column `DEFAULT` (typically on a `family=uuid` column) and as a value inside a trigger action (`INSERT ... VALUES (gen_random_uuid(), ...)`). See `docs/reports/FEAT-RANDOMUUID-REPORT.md`.
 
 ### LIKE → ILIKE
 

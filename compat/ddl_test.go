@@ -1,6 +1,8 @@
 package compat
 
 import (
+	"database/sql"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -1183,5 +1185,60 @@ func TestCompileColumnExpressionGatesTriggerNewOld(t *testing.T) {
 	}
 	if _, err := compileColumnExpression(".x", false); err == nil {
 		t.Fatal("expected error for empty leading segment, got nil")
+	}
+}
+
+// uuidV4Pattern is a strict RFC 4122 version-4 UUID matcher: lowercase 8-4-4-4-12
+// hex with the version nibble pinned to '4' and the variant nibble to {8,9,a,b}.
+var uuidV4Pattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// TestCompileGenRandomUUIDForBothEngines freezes the compiled output of the
+// non-deterministic gen_random_uuid() generator (FEAT-RANDOMUUID). PostgreSQL
+// emits its native core built-in verbatim; SQLite emits the exact inline
+// expression that assembles a valid v4 UUID from randomblob/hex. Unlike the rest
+// of the grammar these are not byte-identical between engines (a random source
+// cannot be), so the equivalence proof is structural: both emit a construct that
+// yields a valid v4 UUID. The SQLite branch is additionally executed to confirm
+// the expression really parses and produces valid, distinct v4 UUIDs.
+func TestCompileGenRandomUUIDForBothEngines(t *testing.T) {
+	expr := Expression{Kind: "gen_random_uuid"}
+
+	postgres, err := compileExpression(Postgres, expr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if postgres != "gen_random_uuid()" {
+		t.Fatalf("postgres compiled %q, want %q", postgres, "gen_random_uuid()")
+	}
+
+	sqlite, err := compileExpression(SQLite, expr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantSQLite = "(lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || substr(hex(randomblob(2)), 2) || '-' || substr('89ab', 1 + abs(random() % 4), 1) || substr(hex(randomblob(2)), 2) || '-' || hex(randomblob(6))))"
+	if sqlite != wantSQLite {
+		t.Fatalf("sqlite compiled:\n  %q\nwant:\n  %q", sqlite, wantSQLite)
+	}
+
+	// Execute the SQLite expression through the modernc driver (registered by the
+	// package) to prove it is valid SQL and emits genuine, distinct v4 UUIDs.
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	seen := make(map[string]bool, 512)
+	for i := 0; i < 512; i++ {
+		var value string
+		if err := db.QueryRow("SELECT " + sqlite).Scan(&value); err != nil {
+			t.Fatalf("executing compiled sqlite uuid expression: %v", err)
+		}
+		if !uuidV4Pattern.MatchString(value) {
+			t.Fatalf("compiled sqlite expression produced non-v4 uuid %q", value)
+		}
+		if seen[value] {
+			t.Fatalf("compiled sqlite expression repeated uuid %q", value)
+		}
+		seen[value] = true
 	}
 }

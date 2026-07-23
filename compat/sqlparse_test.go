@@ -427,6 +427,30 @@ func TestParseCatalogExpressionNullif(t *testing.T) {
 	}
 }
 
+// TestParseCatalogExpressionGenRandomUUID freezes the parse of the nullary
+// gen_random_uuid() generator (FEAT-RANDOMUUID). Empty parentheses yield a
+// zero-argument Expression{Kind:"gen_random_uuid"}; any argument is rejected so
+// gen_random_uuid(1) never becomes a valid node.
+func TestParseCatalogExpressionGenRandomUUID(t *testing.T) {
+	got, err := parseCatalogExpression("gen_random_uuid()")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Expression{Kind: "gen_random_uuid"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+	for _, in := range []string{
+		"gen_random_uuid(1)",
+		"gen_random_uuid(a)",
+		"gen_random_uuid('x')",
+	} {
+		if _, err := parseCatalogExpression(in); err == nil {
+			t.Fatalf("expected %q (arguments) to be rejected", in)
+		}
+	}
+}
+
 // TestParseCatalogExpressionDiscardedFunctionsStayRejected locks in the
 // FEAT-CUBOA-1 honesty decision: round, substr and cast are NOT byte-identical
 // across SQLite and real PostgreSQL, so they must stay outside the grammar
