@@ -274,11 +274,21 @@ func (store *Store) inspectSQLiteIndexes(ctx context.Context, tableName string) 
 			continue
 		}
 		index := Index{Name: item.name, Table: tableName, Unique: item.unique != 0}
+		var definition string
+		if err := store.DB.QueryRowContext(ctx, `SELECT COALESCE(sql, '') FROM sqlite_master WHERE type = 'index' AND name = ?`, item.name).Scan(&definition); err != nil {
+			return nil, nil, nil, err
+		}
+		// An expression key is reported by pragma_index_xinfo with a NULL column
+		// name (cid < 0); its text lives only in the CREATE INDEX SQL. Split that
+		// key list so each key position can recover its expression, aligned with
+		// the xinfo key rows in declaration order.
+		keyTerms := extractIndexKeyList(definition)
 		columns, err := store.DB.QueryContext(ctx, `SELECT cid, name, "desc", key FROM pragma_index_xinfo(?) ORDER BY seqno`, item.name)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		valid := true
+		keyPosition := 0
 		for columns.Next() {
 			var cid, descending, key int
 			var name sql.NullString
@@ -289,17 +299,21 @@ func (store *Store) inspectSQLiteIndexes(ctx context.Context, tableName string) 
 			if key == 0 {
 				continue
 			}
-			if cid < 0 || !name.Valid {
+			if name.Valid && cid >= 0 {
+				index.Columns = append(index.Columns, IndexColumn{Column: name.String, Descending: descending != 0})
+			} else if keyPosition < len(keyTerms) {
+				expression, err := parseCatalogExpression(stripIndexKeyOrdering(keyTerms[keyPosition]))
+				if err != nil {
+					valid = false
+				} else {
+					index.Columns = append(index.Columns, IndexColumn{Expression: &expression, Descending: descending != 0})
+				}
+			} else {
 				valid = false
-				continue
 			}
-			index.Columns = append(index.Columns, IndexColumn{Column: name.String, Descending: descending != 0})
+			keyPosition++
 		}
 		if err := columns.Close(); err != nil {
-			return nil, nil, nil, err
-		}
-		var definition string
-		if err := store.DB.QueryRowContext(ctx, `SELECT COALESCE(sql, '') FROM sqlite_master WHERE type = 'index' AND name = ?`, item.name).Scan(&definition); err != nil {
 			return nil, nil, nil, err
 		}
 		if item.partial != 0 {
@@ -761,11 +775,24 @@ func (store *Store) inspectPostgresIndexes(ctx context.Context) (postgresIndexIn
 				definition = strings.TrimSpace(definition[:len(definition)-len(" ASC")])
 			}
 			column, ok := parseCatalogIdentifier(definition)
-			if !ok || strings.Contains(column, ".") {
+			switch {
+			case ok && !strings.Contains(column, "."):
+				index.Columns = append(index.Columns, IndexColumn{Column: column, Descending: descending})
+			case ok:
+				// A schema-qualified column is outside the canonical index grammar.
 				valid = false
-				continue
+			default:
+				// Not a bare column: reconstruct an expression key. If PostgreSQL
+				// deparsed it into a form outside the canonical grammar (e.g. it
+				// appended a ::type cast to a literal), parsing fails and the index
+				// falls to Unresolved rather than fabricating a wrong AST.
+				expression, err := parseCatalogExpression(definition)
+				if err != nil {
+					valid = false
+				} else {
+					index.Columns = append(index.Columns, IndexColumn{Expression: &expression, Descending: descending})
+				}
 			}
-			index.Columns = append(index.Columns, IndexColumn{Column: column, Descending: descending})
 		}
 		if item.predicate != "" {
 			expression, err := parseCatalogExpression(item.predicate)
@@ -945,6 +972,65 @@ func indexWord(text, keyword string) int {
 		}
 		offset = position + len(keyword)
 	}
+}
+
+// extractIndexKeyList returns the top-level comma-separated key terms of a
+// CREATE INDEX statement — the parenthesized list that follows `ON table`. Each
+// term keeps its optional trailing ASC/DESC/COLLATE decoration. It is used to
+// recover the text of an expression key, which pragma_index_xinfo reports with a
+// NULL column name.
+func extractIndexKeyList(definition string) []string {
+	open := indexKeyListStart(definition)
+	if open < 0 {
+		return nil
+	}
+	closing := matchingParenthesis(definition, open)
+	if closing < 0 {
+		return nil
+	}
+	return splitTopLevelCommas(definition[open+1 : closing])
+}
+
+// indexKeyListStart returns the byte offset of the first parenthesis that is not
+// inside a quoted identifier or string literal: the opening of the index key
+// list (the index and table names before it are bare or quoted identifiers with
+// no parentheses).
+func indexKeyListStart(text string) int {
+	inSingle, inDouble := false, false
+	for i := 0; i < len(text); i++ {
+		switch text[i] {
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+		case '(':
+			if !inSingle && !inDouble {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// stripIndexKeyOrdering removes a trailing ASC/DESC direction keyword from an
+// index key term. The direction is taken from pragma_index_xinfo, so only the
+// bare key expression must remain for parsing. A COLLATE clause is intentionally
+// left in place: parseCatalogExpression then rejects it and the index falls to
+// Unresolved rather than silently dropping a non-default collation.
+func stripIndexKeyOrdering(term string) string {
+	term = strings.TrimSpace(term)
+	upper := strings.ToUpper(term)
+	if strings.HasSuffix(upper, " DESC") {
+		return strings.TrimSpace(term[:len(term)-len(" DESC")])
+	}
+	if strings.HasSuffix(upper, " ASC") {
+		return strings.TrimSpace(term[:len(term)-len(" ASC")])
+	}
+	return term
 }
 
 func extractIndexPredicate(definition string) string {

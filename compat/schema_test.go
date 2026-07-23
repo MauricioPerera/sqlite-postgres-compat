@@ -152,6 +152,30 @@ func TestSchemaValidateRejectsUnknownTypeFamilyOnRoutineParameter(t *testing.T) 
 	}
 }
 
+// TestSchemaValidateExpressionIndex freezes the validation rules for expression
+// index keys: a valid expression key passes (grammar validity is enforced later
+// at compile time), and a key that carries both a column name and an expression
+// is rejected.
+func TestSchemaValidateExpressionIndex(t *testing.T) {
+	lowerEmail := Expression{Kind: "lower", Args: []Expression{{Kind: "column", Value: "email"}}}
+	base := func(cols []IndexColumn) Schema {
+		return Schema{
+			Tables: []Table{{
+				Name:    "users",
+				Columns: []Column{{Name: "email", Type: Type{Family: TextType}}},
+			}},
+			Indexes: []Index{{Name: "users_idx", Table: "users", Columns: cols}},
+		}
+	}
+	if err := base([]IndexColumn{{Expression: &lowerEmail}}).Validate(); err != nil {
+		t.Fatalf("valid expression index must pass validation: %v", err)
+	}
+	err := base([]IndexColumn{{Column: "email", Expression: &lowerEmail}}).Validate()
+	if err == nil || !strings.Contains(err.Error(), "both a column and an expression") {
+		t.Fatalf("index key with both a column and an expression must be rejected, got: %v", err)
+	}
+}
+
 func TestValidReferentialActionAcceptsCanonicalActions(t *testing.T) {
 	for _, action := range []ReferentialAction{"", NoAction, Restrict, Cascade, SetNull, SetDefault} {
 		if !validReferentialAction(action) {

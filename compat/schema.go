@@ -141,9 +141,17 @@ type Index struct {
 	Where   *Expression   `json:"where,omitempty"`
 }
 
+// IndexColumn is one key of an index. Ordinarily the key is a plain column
+// (Column). When Expression is set the key is that catalog expression (Section
+// 3 grammar) compiled inside parentheses — an expression index, supported by
+// SQLite (>= 3.9) and PostgreSQL with identical `(expr)` key syntax — and
+// Column is left empty. Descending applies to either form. Expression is
+// additive and omitted from JSON when nil, so a plain-column index stays
+// byte-identical in canonical metadata and in every emitted statement.
 type IndexColumn struct {
-	Column     string `json:"column"`
-	Descending bool   `json:"descending,omitempty"`
+	Column     string      `json:"column,omitempty"`
+	Descending bool        `json:"descending,omitempty"`
+	Expression *Expression `json:"expression,omitempty"`
 }
 
 // Expression is an AST placeholder. Raw SQL is intentionally excluded from
@@ -405,6 +413,17 @@ func validateIndexes(indexes []Index, tables map[string]struct{}, tableColumns m
 			return fmt.Errorf("index %q references unknown table %q", index.Name, index.Table)
 		}
 		for _, column := range index.Columns {
+			if column.Expression != nil {
+				// An expression key carries no column name. Grammar validity of the
+				// expression is enforced at compile time by compileExpression (the
+				// same path as generated columns and CHECK constraints), which errors
+				// clearly on anything outside Section 3. A key must be one or the
+				// other, never both.
+				if column.Column != "" {
+					return fmt.Errorf("index %q key has both a column and an expression", index.Name)
+				}
+				continue
+			}
 			if column.Column == "" {
 				return fmt.Errorf("index %q has an empty column", index.Name)
 			}

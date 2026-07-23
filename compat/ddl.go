@@ -51,7 +51,18 @@ func CompileDDL(target Target, schema Schema) ([]string, error) {
 func compileIndex(engine Engine, index Index) (string, error) {
 	columns := make([]string, len(index.Columns))
 	for i, column := range index.Columns {
-		columns[i] = quoteIdentifier(column.Column)
+		if column.Expression != nil {
+			// An expression key compiles to `(expr)`: both SQLite (>= 3.9) and
+			// PostgreSQL require the parentheses around an expression index key.
+			// The plain-column path below stays byte-identical.
+			compiled, err := compileExpression(engine, *column.Expression)
+			if err != nil {
+				return "", err
+			}
+			columns[i] = "(" + compiled + ")"
+		} else {
+			columns[i] = quoteIdentifier(column.Column)
+		}
 		if column.Descending {
 			columns[i] += " DESC"
 		} else {

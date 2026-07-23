@@ -204,6 +204,86 @@ func TestCompileCanonicalCheckAndIndexesForBothEngines(t *testing.T) {
 	}
 }
 
+// TestCompileExpressionIndexForBothEngines freezes the SQL emitted for
+// expression index keys: a function key, an operator key with DESC, a UNIQUE
+// expression index, and a mix of plain-column and expression keys in one index.
+// An expression key compiles to `(expr)` — the parenthesized form both SQLite
+// (>= 3.9) and PostgreSQL require — and the SQL is byte-identical across engines
+// for these grammar constructs.
+func TestCompileExpressionIndexForBothEngines(t *testing.T) {
+	lowerEmail := Expression{Kind: "lower", Args: []Expression{{Kind: "column", Value: "email"}}}
+	sumAB := Expression{Kind: "add", Args: []Expression{
+		{Kind: "column", Value: "a"},
+		{Kind: "column", Value: "b"},
+	}}
+	schema := Schema{
+		Tables: []Table{{
+			Name: "users",
+			Columns: []Column{
+				{Name: "email", Type: Type{Family: TextType}},
+				{Name: "a", Type: Type{Family: IntegerType}},
+				{Name: "b", Type: Type{Family: IntegerType}},
+			},
+		}},
+		Indexes: []Index{
+			{Name: "users_lower_email", Table: "users", Columns: []IndexColumn{{Expression: &lowerEmail}}},
+			{Name: "users_sum_desc", Table: "users", Columns: []IndexColumn{{Expression: &sumAB, Descending: true}}},
+			{Name: "users_ulower", Table: "users", Unique: true, Columns: []IndexColumn{{Expression: &lowerEmail}}},
+			{Name: "users_mixed", Table: "users", Columns: []IndexColumn{
+				{Column: "a"},
+				{Expression: &lowerEmail},
+				{Column: "b", Descending: true},
+			}},
+		},
+	}
+	want := []string{
+		`CREATE INDEX "users_lower_email" ON "users" ((LOWER("email")) ASC)`,
+		`CREATE INDEX "users_sum_desc" ON "users" ((("a" + "b")) DESC)`,
+		`CREATE UNIQUE INDEX "users_ulower" ON "users" ((LOWER("email")) ASC)`,
+		`CREATE INDEX "users_mixed" ON "users" ("a" ASC, (LOWER("email")) ASC, "b" DESC)`,
+	}
+	for _, engine := range []Engine{SQLite, Postgres} {
+		statements, err := CompileDDL(Target{Engine: engine, Version: Version{Major: 17}}, schema)
+		if err != nil {
+			t.Fatalf("%s: %v", engine, err)
+		}
+		// statements[0] is the CREATE TABLE; the indexes follow in order.
+		indexes := statements[1:]
+		if len(indexes) != len(want) {
+			t.Fatalf("%s: expected %d index statements, got %#v", engine, len(want), indexes)
+		}
+		for i, expected := range want {
+			if indexes[i] != expected {
+				t.Fatalf("%s index[%d]:\n want %s\n  got %s", engine, i, expected, indexes[i])
+			}
+		}
+	}
+}
+
+// TestCompileExpressionIndexRejectsOutOfGrammar proves an expression key outside
+// the canonical grammar (a function not in the allowlist) is rejected with a
+// clear error instead of emitting SQL that would diverge between engines.
+func TestCompileExpressionIndexRejectsOutOfGrammar(t *testing.T) {
+	badKey := Expression{Kind: "substr", Args: []Expression{
+		{Kind: "column", Value: "email"},
+		{Kind: "integer", Value: "1"},
+	}}
+	schema := Schema{
+		Tables: []Table{{
+			Name:    "users",
+			Columns: []Column{{Name: "email", Type: Type{Family: TextType}}},
+		}},
+		Indexes: []Index{
+			{Name: "users_bad", Table: "users", Columns: []IndexColumn{{Expression: &badKey}}},
+		},
+	}
+	for _, engine := range []Engine{SQLite, Postgres} {
+		if _, err := CompileDDL(Target{Engine: engine, Version: Version{Major: 17}}, schema); err == nil {
+			t.Fatalf("%s: expected error for out-of-grammar expression index, got nil", engine)
+		}
+	}
+}
+
 func TestCompileLikePreservesSQLiteSemanticsForBothEngines(t *testing.T) {
 	like := Expression{Kind: "like", Args: []Expression{
 		{Kind: "column", Value: "code"},

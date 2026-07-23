@@ -1973,3 +1973,101 @@ func TestSystemGeneratedStoredColumnNativeInspectionRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// TestSystemExpressionIndexNativeInspectionRoundTrip proves, against real SQLite
+// and real PostgreSQL 17, that native catalog inspection reconstructs an
+// expression index key (lower(email)) exactly on BOTH engines, and honestly
+// exercises the divergence clause: an expression with a bare string literal
+// (coalesce(email, 'x')) is reconstructed exact on SQLite (which stores the
+// CREATE INDEX text verbatim), but PostgreSQL deparses it as
+// COALESCE(email, 'x'::text) — the added ::text cast is outside the canonical
+// grammar, so that index is placed in Unresolved rather than reconstructed as a
+// wrong AST. It recreates the public schema first so no canonical metadata
+// short-circuits the native catalog path; run last so it does not disturb
+// earlier tests.
+func TestSystemExpressionIndexNativeInspectionRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	sqlite := openSQLite(t, filepath.Join(t.TempDir(), "expr-index-native.db"))
+	postgres := openPostgres(t)
+	if _, err := postgres.DB.ExecContext(ctx, `DROP SCHEMA public CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := postgres.DB.ExecContext(ctx, `CREATE SCHEMA public`); err != nil {
+		t.Fatal(err)
+	}
+	ddl := map[compat.Engine][]string{
+		compat.SQLite: {
+			`CREATE TABLE cuboa4_expr_idx (id INTEGER PRIMARY KEY, email TEXT)`,
+			`CREATE INDEX cuboa4_lower ON cuboa4_expr_idx (lower(email))`,
+			`CREATE INDEX cuboa4_coalesce ON cuboa4_expr_idx (coalesce(email, 'x'))`,
+		},
+		compat.Postgres: {
+			`CREATE TABLE cuboa4_expr_idx (id BIGINT PRIMARY KEY, email TEXT)`,
+			`CREATE INDEX cuboa4_lower ON cuboa4_expr_idx (lower(email))`,
+			`CREATE INDEX cuboa4_coalesce ON cuboa4_expr_idx (coalesce(email, 'x'))`,
+		},
+	}
+	lowerEmail := compat.Expression{Kind: "lower", Args: []compat.Expression{{Kind: "column", Value: "email"}}}
+
+	findIndex := func(insp compat.Inspection, name string) (compat.Index, bool) {
+		for _, ix := range insp.Schema.Indexes {
+			if ix.Name == name {
+				return ix, true
+			}
+		}
+		return compat.Index{}, false
+	}
+	hasUnresolved := func(insp compat.Inspection, name string) bool {
+		for _, u := range insp.Unresolved {
+			if u.Name == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, store := range []*compat.Store{sqlite, postgres} {
+		engine := store.Target.Engine
+		for _, stmt := range ddl[engine] {
+			if _, err := store.DB.ExecContext(ctx, stmt); err != nil {
+				t.Fatalf("%s DDL %q: %v", engine, stmt, err)
+			}
+		}
+		inspection, err := store.InspectSchema(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The lower(email) key reconstructs exact on both engines.
+		lower, ok := findIndex(inspection, "cuboa4_lower")
+		if !ok {
+			t.Fatalf("%s: cuboa4_lower missing from inspection: %+v", engine, inspection)
+		}
+		if !reflect.DeepEqual(lower.Columns, []compat.IndexColumn{{Expression: &lowerEmail}}) {
+			t.Fatalf("%s: cuboa4_lower not reconstructed as lower(email): %+v", engine, lower.Columns)
+		}
+		switch engine {
+		case compat.SQLite:
+			// SQLite stores the CREATE INDEX text verbatim, so the literal survives
+			// and coalesce(email, 'x') reconstructs exact.
+			if _, ok := findIndex(inspection, "cuboa4_coalesce"); !ok {
+				t.Fatalf("sqlite: coalesce index must reconstruct exact: %+v", inspection)
+			}
+			if !inspection.Exact || len(inspection.Unresolved) != 0 {
+				t.Fatalf("sqlite: expression indexes must inspect as exact: %+v", inspection)
+			}
+		case compat.Postgres:
+			// PostgreSQL deparses coalesce(email, 'x') as COALESCE(email, 'x'::text);
+			// the ::text cast is outside the canonical grammar, so the index is
+			// honestly unresolved rather than reconstructed as a wrong AST.
+			if _, ok := findIndex(inspection, "cuboa4_coalesce"); ok {
+				t.Fatalf("postgres: coalesce index must NOT be reconstructed (deparse adds ::text): %+v", inspection)
+			}
+			if !hasUnresolved(inspection, "cuboa4_coalesce") {
+				t.Fatalf("postgres: coalesce index must be in Unresolved: %+v", inspection)
+			}
+			if inspection.Exact {
+				t.Fatalf("postgres: inspection must not be exact while an index is unresolved: %+v", inspection)
+			}
+		}
+	}
+}

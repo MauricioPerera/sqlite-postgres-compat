@@ -123,6 +123,131 @@ func TestInspectExternalSQLiteGeneratedStoredColumn(t *testing.T) {
 	}
 }
 
+// TestInspectExternalSQLiteExpressionIndex proves native catalog inspection of
+// an EXTERNAL SQLite database reconstructs expression index keys exactly: a
+// function key, an operator key with DESC, a UNIQUE expression index, and a mix
+// of plain-column and expression keys. An expression whose text is outside the
+// canonical grammar (a function not in the allowlist) is placed in Unresolved
+// rather than reconstructed as a wrong AST.
+func TestInspectExternalSQLiteExpressionIndex(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, stmt := range []string{
+		`CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT, a INTEGER, b INTEGER)`,
+		`CREATE INDEX i_lower ON t (lower(email))`,
+		`CREATE INDEX i_sum_desc ON t (a + b DESC)`,
+		`CREATE UNIQUE INDEX i_ulower ON t (lower(email))`,
+		`CREATE INDEX i_mixed ON t (a, lower(email), b DESC)`,
+	} {
+		if _, err := store.DB.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	inspection, err := store.InspectSchema(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inspection.Exact || len(inspection.Unresolved) != 0 {
+		t.Fatalf("expression indexes must inspect as exact: %+v", inspection)
+	}
+	byName := map[string]Index{}
+	for _, ix := range inspection.Schema.Indexes {
+		byName[ix.Name] = ix
+	}
+	lowerEmail := Expression{Kind: "lower", Args: []Expression{{Kind: "column", Value: "email"}}}
+	sumAB := Expression{Kind: "add", Args: []Expression{{Kind: "column", Value: "a"}, {Kind: "column", Value: "b"}}}
+	assertIndexColumns := func(name string, want []IndexColumn, unique bool) {
+		ix, ok := byName[name]
+		if !ok {
+			t.Fatalf("index %q missing from inspection: %+v", name, inspection.Schema.Indexes)
+		}
+		if ix.Unique != unique {
+			t.Fatalf("index %q unique=%v, want %v", name, ix.Unique, unique)
+		}
+		if !reflect.DeepEqual(ix.Columns, want) {
+			t.Fatalf("index %q columns:\n want %+v\n  got %+v", name, want, ix.Columns)
+		}
+	}
+	assertIndexColumns("i_lower", []IndexColumn{{Expression: &lowerEmail}}, false)
+	assertIndexColumns("i_sum_desc", []IndexColumn{{Expression: &sumAB, Descending: true}}, false)
+	assertIndexColumns("i_ulower", []IndexColumn{{Expression: &lowerEmail}}, true)
+	assertIndexColumns("i_mixed", []IndexColumn{
+		{Column: "a"},
+		{Expression: &lowerEmail},
+		{Column: "b", Descending: true},
+	}, false)
+
+	// A function outside the allowlist is honestly unresolved, never a wrong AST.
+	outside, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outside.Close()
+	for _, stmt := range []string{
+		`CREATE TABLE u (id INTEGER PRIMARY KEY, email TEXT)`,
+		`CREATE INDEX i_substr ON u (substr(email, 1, 2))`,
+	} {
+		if _, err := outside.DB.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	oi, err := outside.InspectSchema(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oi.Exact || len(oi.Unresolved) == 0 {
+		t.Fatalf("out-of-grammar expression index must be unresolved: %+v", oi)
+	}
+}
+
+// TestInspectCanonicalMetadataExpressionIndexRoundTrip proves the canonical
+// metadata path (__compat_schema) round-trips an expression index byte-for-byte:
+// a schema created by this layer inspects back to exactly the same Schema.
+func TestInspectCanonicalMetadataExpressionIndexRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	lowerEmail := Expression{Kind: "lower", Args: []Expression{{Kind: "column", Value: "email"}}}
+	sumAB := Expression{Kind: "add", Args: []Expression{{Kind: "column", Value: "a"}, {Kind: "column", Value: "b"}}}
+	schema := Schema{
+		Tables: []Table{{
+			Name: "users",
+			Columns: []Column{
+				{Name: "email", Type: Type{Family: TextType}},
+				{Name: "a", Type: Type{Family: IntegerType}},
+				{Name: "b", Type: Type{Family: IntegerType}},
+			},
+		}},
+		Indexes: []Index{
+			{Name: "users_lower_email", Table: "users", Columns: []IndexColumn{{Expression: &lowerEmail}}},
+			{Name: "users_mixed", Table: "users", Unique: true, Columns: []IndexColumn{
+				{Column: "a"},
+				{Expression: &sumAB, Descending: true},
+			}},
+		},
+	}
+	store, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := store.InspectSchema(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inspection.Exact || inspection.Source != "canonical_metadata" {
+		t.Fatalf("unexpected inspection: %+v", inspection)
+	}
+	if !reflect.DeepEqual(schema, inspection.Schema) {
+		t.Fatalf("schema mismatch:\n want %+v\n  got %+v", schema, inspection.Schema)
+	}
+}
+
 func TestReservedMetadataTableIsRejected(t *testing.T) {
 	for _, name := range []string{schemaMetadataTable, appliedChangesTable, captureStateTable, changeJournalTable} {
 		schema := Schema{Tables: []Table{{Name: name, Columns: []Column{{Name: "x", Type: Type{Family: TextType}}}}}}

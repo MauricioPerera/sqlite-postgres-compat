@@ -53,6 +53,17 @@ Native inspection reconstructs a STORED generated column as `exact` (SQLite `pra
 
 A constraint needs columns unless it is `check`.
 
+### Indexes
+
+`Index{Name, Table, Unique, Columns []IndexColumn, Where *Expression}` (`compat/schema.go`, compiled by `compileIndex` in `compat/ddl.go`) emits `CREATE [UNIQUE] INDEX name ON table (key [ASC|DESC], ...) [WHERE expr]`. The optional partial `Where` predicate uses the expression grammar (Section 3).
+
+`IndexColumn{Column, Descending, Expression}` is one key:
+
+- A **plain-column key** sets `Column`; it compiles to `quoteIdentifier(Column) [ASC|DESC]`. This path is byte-identical to before expression indexes existed.
+- An **expression key** sets `Expression` (a Section 3 catalog expression) and leaves `Column` empty; it compiles to `(<compiled expr>) [ASC|DESC]` — the parenthesized key form both SQLite (≥ 3.9) and PostgreSQL require. Function keys (`lower(email)`), operator keys (`a + b`), `UNIQUE` expression indexes, and a mix of column and expression keys in one index are all supported. Grammar validity is enforced at compile time (`compileExpression`), so an expression outside Section 3 is rejected with a clear error; a key that sets both `Column` and `Expression` is rejected by `Schema.Validate`.
+
+Native inspection reconstructs an expression index from external databases: in SQLite the key column name is NULL in `pragma_index_xinfo`, so the expression text is recovered from the `CREATE INDEX` SQL in `sqlite_master` and parsed with `parseCatalogExpression`; in PostgreSQL it comes from `pg_get_indexdef` per key column. **Honesty clause:** when an engine deparses the key into a form outside the canonical grammar the index is placed in `Inspection.Unresolved` (`Exact = false`) with a reason, never reconstructed as a wrong AST. In particular PostgreSQL deparses a bare string literal with an added `::type` cast (e.g. `coalesce(email, 'x')` → `COALESCE(email, 'x'::text)`), which is outside the grammar and lands in `Unresolved`, while SQLite stores the `CREATE INDEX` text verbatim and reconstructs the same index exact. The canonical path (a schema created by this layer, stored in `__compat_schema`) always round-trips exact; the limitation is only for external inspection of expressions the engine rewrites.
+
 ## 3. Expression grammar
 
 Parser: `compat/sqlparse.go` (`parseCatalogExpression`). Operator precedence, **loosest to tightest** (transcribed from the `levels` table):
