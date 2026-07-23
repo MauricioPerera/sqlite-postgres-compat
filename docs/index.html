@@ -145,6 +145,7 @@
       <a href="#architecture" data-i18n="nav.architecture">Arquitectura</a>
       <a href="#flow" data-i18n="nav.flow">Migración</a>
       <a href="#compat" data-i18n="nav.compat">Compatibilidad</a>
+      <a href="#grammar" data-i18n="nav.grammar">Gramática</a>
       <a href="#cli" data-i18n="nav.cli">CLI</a>
       <a href="#quickstart" data-i18n="nav.quickstart">Inicio</a>
     </nav>
@@ -276,6 +277,43 @@
     </div>
   </div></section>
 
+  <!-- GRAMMAR -->
+  <section id="grammar"><div class="wrap">
+    <div class="sec-label" data-i18n="gram.label">Cobertura</div>
+    <h2 data-i18n="gram.title">Gramática canónica</h2>
+    <p class="sec-desc" data-i18n="gram.desc">El subconjunto de SQL que se traduce y verifica en ambos motores — acotado a propósito y en crecimiento. Todo lo que queda fuera se rechaza con un error explícito, nunca se degrada en silencio.</p>
+    <div class="grid">
+      <div class="card">
+        <h3 data-i18n="gram.c1t">Expresiones y funciones</h3>
+        <div class="chips">
+          <span class="chip">AND OR NOT</span><span class="chip">= &lt;&gt; &lt; &gt; &lt;= &gt;=</span><span class="chip">IS [NOT] NULL</span><span class="chip">LIKE → ILIKE</span><span class="chip">BETWEEN</span><span class="chip">IN (…)</span><span class="chip">CASE WHEN</span><span class="chip">|| + - * /</span><span class="chip">count sum avg min max</span><span class="chip">lower upper length abs trim</span><span class="chip">coalesce nullif replace</span>
+        </div>
+      </div>
+      <div class="card">
+        <h3 data-i18n="gram.c2t">Vistas</h3>
+        <div class="chips">
+          <span class="chip">DISTINCT</span><span class="chip">JOIN inner/left/cross</span><span class="chip">WHERE</span><span class="chip">GROUP BY · HAVING</span><span class="chip">ORDER BY · LIMIT · OFFSET</span><span class="chip">UNION · UNION ALL</span><span class="chip">INTERSECT · EXCEPT</span><span class="chip">FROM (SELECT …)</span><span class="chip">WITH … AS (…)</span>
+        </div>
+      </div>
+      <div class="card">
+        <h3 data-i18n="gram.c3t">Tablas, columnas e índices</h3>
+        <div class="chips">
+          <span class="chip">PRIMARY KEY · UNIQUE</span><span class="chip">FOREIGN KEY + acciones</span><span class="chip">CHECK</span><span class="chip">GENERATED … STORED</span><span class="chip">índices únicos · parciales · DESC</span><span class="chip">índices de expresión</span>
+        </div>
+      </div>
+      <div class="card">
+        <h3 data-i18n="gram.c4t">Dominios, triggers y vectores</h3>
+        <div class="chips">
+          <span class="chip">CREATE DOMAIN</span><span class="chip">triggers BEFORE/AFTER (NEW/OLD)</span><span class="chip">rutinas transaccionales</span><span class="chip">vector(N) ↔ pgvector</span>
+        </div>
+      </div>
+    </div>
+    <div class="note">
+      <svg viewBox="0 0 24 24"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>
+      <span data-i18n="gram.note">Fuera de la gramática (rechazado con error, no traducido): código procedural arbitrario, FTS nativo con ranking/stemming, WITH RECURSIVE, subconsultas correlacionadas y EXISTS, y todo lo específico de un dialecto.</span>
+    </div>
+  </div></section>
+
   <!-- CLI -->
   <section id="cli"><div class="wrap">
     <div class="sec-label" data-i18n="cli.label">Interfaz</div>
@@ -366,7 +404,8 @@ go test ./...  &amp;&amp;  go vet ./...</pre>
 
   var I18N = {
     es:{
-      "nav.why":"¿Por qué?","nav.features":"Características","nav.architecture":"Arquitectura","nav.flow":"Migración","nav.compat":"Compatibilidad","nav.cli":"CLI","nav.quickstart":"Inicio",
+      "nav.why":"¿Por qué?","nav.features":"Características","nav.architecture":"Arquitectura","nav.flow":"Migración","nav.compat":"Compatibilidad","nav.grammar":"Gramática","nav.cli":"CLI","nav.quickstart":"Inicio",
+      "gram.label":"Cobertura","gram.title":"Gramática canónica","gram.desc":"El subconjunto de SQL que se traduce y verifica en ambos motores — acotado a propósito y en crecimiento. Todo lo que queda fuera se rechaza con un error explícito, nunca se degrada en silencio.","gram.c1t":"Expresiones y funciones","gram.c2t":"Vistas","gram.c3t":"Tablas, columnas e índices","gram.c4t":"Dominios, triggers y vectores","gram.note":"Fuera de la gramática (rechazado con error, no traducido): código procedural arbitrario, FTS nativo con ranking/stemming, WITH RECURSIVE, subconsultas correlacionadas y EXISTS, y todo lo específico de un dialecto.",
       "hero.eyebrow":"SQLite / libSQL → PostgreSQL",
       "hero.h1a":"Migración verificable,","hero.h1b":"sin ventana de corte.",
       "hero.sub":"Capa de compatibilidad en Go: contrato de esquema canónico, migración por snapshot, replicación incremental bidireccional y cutover en vivo. Si una capacidad no se puede garantizar en ambos motores, el proceso se detiene y lo dice — nunca degrada en silencio.",
@@ -401,7 +440,8 @@ go test ./...  &amp;&amp;  go vet ./...</pre>
       "footer.usage":"Guía de uso","footer.disclaimer":"El núcleo canónico funciona y está probado en ambos motores; el proyecto todavía no ofrece compatibilidad total con cualquier SQL arbitrario. La prueba global permanece roja hasta que esa afirmación sea verdadera."
     },
     en:{
-      "nav.why":"Why","nav.features":"Features","nav.architecture":"Architecture","nav.flow":"Migration","nav.compat":"Compatibility","nav.cli":"CLI","nav.quickstart":"Quick start",
+      "nav.why":"Why","nav.features":"Features","nav.architecture":"Architecture","nav.flow":"Migration","nav.compat":"Compatibility","nav.grammar":"Grammar","nav.cli":"CLI","nav.quickstart":"Quick start",
+      "gram.label":"Coverage","gram.title":"Canonical grammar","gram.desc":"The SQL subset that is translated and verified on both engines — deliberately bounded and growing. Anything outside it is rejected with an explicit error, never silently degraded.","gram.c1t":"Expressions & functions","gram.c2t":"Views","gram.c3t":"Tables, columns & indexes","gram.c4t":"Domains, triggers & vectors","gram.note":"Outside the grammar (rejected with an error, not translated): arbitrary procedural code, native FTS with ranking/stemming, WITH RECURSIVE, correlated subqueries and EXISTS, and anything dialect-specific.",
       "hero.eyebrow":"SQLite / libSQL → PostgreSQL",
       "hero.h1a":"Verifiable migration,","hero.h1b":"with zero downtime.",
       "hero.sub":"A Go compatibility layer: canonical schema contract, snapshot migration, bidirectional incremental replication and live cutover. If a capability can't be guaranteed on both engines, the process stops and says so — it never degrades silently.",
@@ -436,7 +476,8 @@ go test ./...  &amp;&amp;  go vet ./...</pre>
       "footer.usage":"Usage guide","footer.disclaimer":"The canonical core works and is tested on both engines; the project does not yet offer full compatibility with arbitrary SQL. The global test stays red until that claim is true."
     },
     pt:{
-      "nav.why":"Por quê","nav.features":"Recursos","nav.architecture":"Arquitetura","nav.flow":"Migração","nav.compat":"Compatibilidade","nav.cli":"CLI","nav.quickstart":"Início",
+      "nav.why":"Por quê","nav.features":"Recursos","nav.architecture":"Arquitetura","nav.flow":"Migração","nav.compat":"Compatibilidade","nav.grammar":"Gramática","nav.cli":"CLI","nav.quickstart":"Início",
+      "gram.label":"Cobertura","gram.title":"Gramática canônica","gram.desc":"O subconjunto de SQL que é traduzido e verificado nos dois motores — deliberadamente limitado e em crescimento. Tudo que fica de fora é rejeitado com um erro explícito, nunca degradado em silêncio.","gram.c1t":"Expressões e funções","gram.c2t":"Visões","gram.c3t":"Tabelas, colunas e índices","gram.c4t":"Domínios, triggers e vetores","gram.note":"Fora da gramática (rejeitado com erro, não traduzido): código procedural arbitrário, FTS nativo com ranking/stemming, WITH RECURSIVE, subconsultas correlacionadas e EXISTS, e tudo específico de um dialeto.",
       "hero.eyebrow":"SQLite / libSQL → PostgreSQL",
       "hero.h1a":"Migração verificável,","hero.h1b":"sem janela de parada.",
       "hero.sub":"Uma camada de compatibilidade em Go: contrato de esquema canônico, migração por snapshot, replicação incremental bidirecional e cutover ao vivo. Se uma capacidade não puder ser garantida nos dois motores, o processo para e avisa — nunca degrada em silêncio.",
@@ -545,7 +586,7 @@ go test ./...  &amp;&amp;  go vet ./...</pre>
   applyLang(saved);
 
   // Scroll-spy for nav highlight
-  var secIds=['why','features','architecture','flow','compat','cli','quickstart'];
+  var secIds=['why','features','architecture','flow','compat','grammar','cli','quickstart'];
   var linkFor={};
   document.querySelectorAll('nav.links a').forEach(function(a){
     linkFor[a.getAttribute('href').slice(1)]=a;
