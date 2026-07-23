@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sqlite-postgres-compat — migración verificable SQLite → PostgreSQL</title>
+<meta name="description" content="Capa de compatibilidad en Go: contrato de esquema canónico, migración por snapshot, replicación incremental y cutover en vivo de SQLite/libSQL a PostgreSQL. Veredicto determinista en cada paso.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%230d1117'/%3E%3Cpath d='M24 38h22M24 50h22M24 62h22' stroke='%2338bdf8' stroke-width='6' stroke-linecap='round'/%3E%3Cpath d='M56 50h20m0 0-8-8m8 8-8 8' stroke='%233fb950' stroke-width='6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#0b0f16; --bg-2:#0d1117; --panel:#111823; --panel-2:#0f151f;
+    --border:#232c3a; --border-soft:#1a2230;
+    --fg:#e6edf3; --muted:#9aa7b6; --muted-2:#6b7787;
+    --sqlite:#38bdf8; --pg:#5aa0ff; --ok:#3fb950; --warn:#d29922; --err:#f85149;
+    --accent:#38bdf8; --accent-2:#3fb950;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --radius:14px; --maxw:1080px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+  body{
+    margin:0; font-family:var(--sans); color:var(--fg); background:var(--bg);
+    line-height:1.6; -webkit-font-smoothing:antialiased;
+    background-image:radial-gradient(900px 500px at 78% -8%,rgba(56,189,248,.10),transparent 60%),radial-gradient(760px 480px at 8% 4%,rgba(63,185,80,.07),transparent 55%);
+    background-attachment:fixed;
+  }
+  a{color:var(--accent); text-decoration:none}
+  a:hover{text-decoration:underline}
+  code,pre{font-family:var(--mono)}
+  .wrap{max-width:var(--maxw); margin:0 auto; padding:0 22px}
+
+  /* NAV */
+  header.nav{position:sticky; top:0; z-index:50; backdrop-filter:blur(10px);
+    background:rgba(11,15,22,.78); border-bottom:1px solid var(--border-soft)}
+  .nav-inner{max-width:var(--maxw); margin:0 auto; padding:12px 22px; display:flex; align-items:center; gap:18px}
+  .brand{display:flex; align-items:center; gap:10px; font-weight:700; letter-spacing:-.01em; white-space:nowrap}
+  .brand .dot{width:10px; height:10px; border-radius:3px; background:linear-gradient(135deg,var(--sqlite),var(--ok))}
+  .brand code{font-size:.94rem; color:var(--fg)}
+  nav.links{display:flex; gap:4px; margin-left:auto; flex-wrap:wrap}
+  nav.links a{color:var(--muted); padding:6px 10px; border-radius:8px; font-size:.9rem}
+  nav.links a:hover{color:var(--fg); background:var(--panel); text-decoration:none}
+  nav.links a.active{color:var(--fg); background:var(--panel)}
+  .lang{display:flex; gap:2px; border:1px solid var(--border); border-radius:9px; padding:2px; margin-left:6px}
+  .lang button{background:transparent; border:0; color:var(--muted); font:inherit; font-size:.8rem; font-weight:600;
+    padding:4px 9px; border-radius:7px; cursor:pointer}
+  .lang button.active{background:var(--accent); color:#04121d}
+  @media(max-width:820px){ nav.links{display:none} }
+
+  /* HERO */
+  .hero{padding:74px 0 44px}
+  .eyebrow{display:inline-flex; align-items:center; gap:8px; font-size:.8rem; font-weight:600; letter-spacing:.04em;
+    text-transform:uppercase; color:var(--accent-2); background:rgba(63,185,80,.08);
+    border:1px solid rgba(63,185,80,.22); padding:5px 12px; border-radius:999px}
+  h1{font-size:clamp(2rem,5vw,3.2rem); line-height:1.08; letter-spacing:-.02em; margin:20px 0 0; max-width:20ch}
+  h1 .grad{background:linear-gradient(120deg,var(--sqlite),var(--ok)); -webkit-background-clip:text; background-clip:text; color:transparent}
+  .lede{font-size:1.12rem; color:var(--muted); max-width:60ch; margin:20px 0 0}
+  .cta{display:flex; gap:12px; margin-top:28px; flex-wrap:wrap}
+  .btn{display:inline-flex; align-items:center; gap:9px; padding:11px 18px; border-radius:11px; font-weight:600; font-size:.95rem; cursor:pointer; border:1px solid transparent}
+  .btn.primary{background:var(--accent); color:#04121d}
+  .btn.primary:hover{filter:brightness(1.08); text-decoration:none}
+  .btn.ghost{background:var(--panel); color:var(--fg); border-color:var(--border)}
+  .btn.ghost:hover{border-color:var(--accent); text-decoration:none}
+  .badges{display:flex; gap:10px; margin-top:26px; flex-wrap:wrap}
+  .badge{font-size:.78rem; color:var(--muted); background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:5px 10px; font-family:var(--mono)}
+  .badge b{color:var(--ok)}
+
+  /* SECTIONS */
+  section{padding:52px 0; border-top:1px solid var(--border-soft)}
+  .sec-label{font-size:.78rem; font-weight:700; letter-spacing:.08em; text-transform:uppercase; color:var(--accent)}
+  h2{font-size:clamp(1.5rem,3.2vw,2.05rem); letter-spacing:-.015em; margin:10px 0 0}
+  .sec-desc{color:var(--muted); max-width:64ch; margin:14px 0 0; font-size:1.02rem}
+
+  /* FEATURES */
+  .grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px; margin-top:32px}
+  .card{background:linear-gradient(180deg,var(--panel),var(--panel-2)); border:1px solid var(--border); border-radius:var(--radius); padding:22px}
+  .card .ic{width:38px; height:38px; border-radius:10px; display:grid; place-items:center; background:rgba(56,189,248,.1); border:1px solid rgba(56,189,248,.22); margin-bottom:14px}
+  .card .ic svg{width:20px; height:20px; stroke:var(--accent); fill:none; stroke-width:1.8}
+  .card h3{margin:0 0 8px; font-size:1.06rem; letter-spacing:-.01em}
+  .card p{margin:0; color:var(--muted); font-size:.94rem}
+
+  /* DIAGRAM */
+  .diagram{margin-top:30px; background:var(--panel-2); border:1px solid var(--border); border-radius:var(--radius); padding:20px; overflow-x:auto}
+  .diagram svg{max-width:100%; height:auto; display:block; margin:0 auto}
+  .diagram .fallback{color:var(--muted-2); font-family:var(--mono); font-size:.85rem; white-space:pre-wrap}
+  .legend{display:flex; gap:16px; flex-wrap:wrap; margin-top:16px; font-size:.86rem; color:var(--muted)}
+  .legend span{display:inline-flex; align-items:center; gap:7px}
+  .legend i{width:11px; height:11px; border-radius:3px; display:inline-block}
+
+  /* TABLE */
+  .tablewrap{margin-top:30px; border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; overflow-x:auto}
+  table{border-collapse:collapse; width:100%; font-size:.92rem; min-width:640px}
+  thead th{text-align:left; background:var(--panel); color:var(--muted); font-weight:600; font-size:.8rem; letter-spacing:.03em; text-transform:uppercase; padding:12px 16px; border-bottom:1px solid var(--border)}
+  tbody td{padding:12px 16px; border-bottom:1px solid var(--border-soft); vertical-align:top}
+  tbody tr:last-child td{border-bottom:0}
+  tbody tr:hover{background:rgba(255,255,255,.015)}
+  td.fam{font-weight:600}
+  td .t{font-family:var(--mono); font-size:.85rem; color:var(--sqlite)}
+  td .p{font-family:var(--mono); font-size:.85rem; color:var(--ok)}
+  .note{margin-top:18px; display:flex; gap:12px; align-items:flex-start; background:rgba(210,153,34,.06); border:1px solid rgba(210,153,34,.24); border-radius:12px; padding:14px 16px; color:#e8d9b0; font-size:.92rem}
+  .note svg{flex:0 0 auto; width:18px; height:18px; stroke:var(--warn); fill:none; stroke-width:1.8; margin-top:2px}
+
+  /* CLI */
+  .cli-grid{display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:30px}
+  @media(max-width:760px){ .cli-grid{grid-template-columns:1fr} }
+  .cmd{background:var(--panel-2); border:1px solid var(--border); border-radius:var(--radius); padding:18px}
+  .cmd code.sub{font-size:.95rem; color:var(--fg)}
+  .cmd code.sub b{color:var(--accent)}
+  .cmd p{margin:8px 0 0; color:var(--muted); font-size:.9rem}
+  .terminal{margin-top:22px; background:#080b11; border:1px solid var(--border); border-radius:var(--radius); overflow:hidden}
+  .terminal .bar{display:flex; gap:7px; padding:11px 14px; border-bottom:1px solid var(--border)}
+  .terminal .bar i{width:11px; height:11px; border-radius:50%; background:var(--border)}
+  .terminal pre{margin:0; padding:16px 18px; overflow-x:auto; font-size:.84rem; line-height:1.75}
+  .terminal .pr{color:var(--muted-2)}
+  .terminal .ok{color:var(--ok)}
+  .terminal .er{color:var(--err)}
+  .terminal .cm{color:var(--muted-2); font-style:italic}
+  .chips{display:flex; flex-wrap:wrap; gap:8px; margin-top:20px}
+  .chip{font-family:var(--mono); font-size:.8rem; padding:5px 10px; border-radius:8px; background:var(--panel); border:1px solid var(--border); color:var(--muted)}
+  .chip.e{border-color:rgba(248,81,73,.3); color:#ffb3b0; background:rgba(248,81,73,.05)}
+
+  /* QUICKSTART */
+  .steps{display:grid; gap:14px; margin-top:28px}
+  .step{display:flex; gap:16px; align-items:flex-start; background:var(--panel-2); border:1px solid var(--border); border-radius:var(--radius); padding:16px 18px}
+  .step .n{flex:0 0 auto; width:30px; height:30px; border-radius:9px; display:grid; place-items:center; font-weight:700; font-size:.9rem; background:rgba(56,189,248,.12); border:1px solid rgba(56,189,248,.28); color:var(--accent)}
+  .step .body{min-width:0; flex:1}
+  .step p{margin:0 0 8px; color:var(--muted); font-size:.92rem}
+  .step pre{margin:0; background:#080b11; border:1px solid var(--border); border-radius:9px; padding:11px 14px; overflow-x:auto; font-size:.84rem; color:var(--fg)}
+
+  /* FOOTER */
+  footer{border-top:1px solid var(--border-soft); padding:40px 0 60px; color:var(--muted); font-size:.9rem}
+  .foot-inner{display:flex; justify-content:space-between; gap:20px; flex-wrap:wrap; align-items:center}
+  .foot-disc{max-width:56ch; color:var(--muted-2); font-size:.86rem; margin-top:22px}
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="nav-inner">
+    <div class="brand"><span class="dot"></span><code>sqlite-postgres-compat</code></div>
+    <nav class="links">
+      <a href="#why" data-i18n="nav.why">¿Por qué?</a>
+      <a href="#features" data-i18n="nav.features">Características</a>
+      <a href="#architecture" data-i18n="nav.architecture">Arquitectura</a>
+      <a href="#flow" data-i18n="nav.flow">Migración</a>
+      <a href="#compat" data-i18n="nav.compat">Compatibilidad</a>
+      <a href="#cli" data-i18n="nav.cli">CLI</a>
+      <a href="#quickstart" data-i18n="nav.quickstart">Inicio</a>
+    </nav>
+    <div class="lang" role="group" aria-label="Language">
+      <button data-lang="es" class="active">ES</button>
+      <button data-lang="en">EN</button>
+      <button data-lang="pt">PT</button>
+    </div>
+  </div>
+</header>
+
+<main>
+  <!-- HERO -->
+  <div class="hero wrap">
+    <span class="eyebrow" data-i18n="hero.eyebrow">SQLite / libSQL → PostgreSQL</span>
+    <h1><span data-i18n="hero.h1a">Migración verificable,</span> <span class="grad" data-i18n="hero.h1b">sin ventana de corte.</span></h1>
+    <p class="lede" data-i18n="hero.sub">Capa de compatibilidad en Go: contrato de esquema canónico, migración por snapshot, replicación incremental bidireccional y cutover en vivo. Si una capacidad no se puede garantizar en ambos motores, el proceso se detiene y lo dice — nunca degrada en silencio.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/MauricioPerera/sqlite-postgres-compat" target="_blank" rel="noopener">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span data-i18n="hero.cta_github">Ver en GitHub</span>
+      </a>
+      <a class="btn ghost" href="#quickstart"><span data-i18n="hero.cta_start">Inicio rápido</span> →</a>
+    </div>
+    <div class="badges">
+      <span class="badge">MIT</span>
+      <span class="badge">Go 1.26</span>
+      <span class="badge"><b data-i18n="hero.badge_pg">PostgreSQL 17 real</b></span>
+      <span class="badge" data-i18n="hero.badge_audit">8 rondas de auditoría</span>
+    </div>
+  </div>
+
+  <!-- WHY -->
+  <section id="why"><div class="wrap">
+    <div class="sec-label" data-i18n="why.label">El problema</div>
+    <h2 data-i18n="why.title">¿Por qué?</h2>
+    <p class="sec-desc" data-i18n="why.p1">El caso de uso: arrancar un SaaS con SQLite o libSQL —cero operación, sin servidor de base de datos que administrar— y migrar a PostgreSQL más adelante, cuando el crecimiento lo exija, sin apagar la aplicación.</p>
+    <p class="sec-desc" data-i18n="why.p2">Cada fase —auditoría de capacidades, snapshot, replicación, cutover— produce un veredicto verificable (exit code y JSON) en vez de una promesa optimista. La compatibilidad la certifican pruebas contra motores reales, no la confianza.</p>
+  </div></section>
+
+  <!-- FEATURES -->
+  <section id="features"><div class="wrap">
+    <div class="sec-label" data-i18n="features.label">Capacidades</div>
+    <h2 data-i18n="features.title">Qué hace</h2>
+    <div class="grid">
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></div>
+        <h3 data-i18n="feat.contract.t">Contrato de esquema canónico</h3>
+        <p data-i18n="feat.contract.d">Declara motor, versión y capacidades requeridas. La auditoría devuelve un veredicto por capacidad (exact / unknown) y corta la migración ante cualquier cosa no garantizada.</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24"><path d="M12 3v18"/><path d="M3 7l9-4 9 4-9 4-9-4Z"/><path d="M3 12l9 4 9-4"/></svg></div>
+        <h3 data-i18n="feat.snapshot.t">Snapshot verificado por digest</h3>
+        <p data-i18n="feat.snapshot.d">Exporta esquema y datos a una forma canónica, los importa en el destino y compara hashes canónicos de ambos lados antes de dar la copia por buena.</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24"><path d="M17 2l4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></svg></div>
+        <h3 data-i18n="feat.replication.t">Replicación incremental por triggers</h3>
+        <p data-i18n="feat.replication.d">Captura automática de INSERT/UPDATE/DELETE, aplicación idempotente por secuencia, detección de conflictos y supresión de ecos transaccional bajo MVCC.</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></div>
+        <h3 data-i18n="feat.cutover.t">Cutover sin ventana</h3>
+        <p data-i18n="feat.cutover.d">Audita, instala captura, hace snapshot, drena el journal y verifica equivalencia. Incluye un modo --dry-run de sólo lectura que imprime el plan sin escribir nada.</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24"><path d="M12 2 2 7l10 5 10-5-10-5Z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/></svg></div>
+        <h3 data-i18n="feat.vector.t">Tipo vector(N) de primera clase</h3>
+        <p data-i18n="feat.vector.d">SQLite/libSQL (F32_BLOB(N)) ↔ PostgreSQL (pgvector), validado end-to-end contra motores reales, incluida inspección de dimensión, snapshot y replicación.</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24"><path d="M4 17l6-6-6-6"/><path d="M12 19h8"/></svg></div>
+        <h3 data-i18n="feat.agents.t">Diseñado para agentes de IA</h3>
+        <p data-i18n="feat.agents.d">Un único binario compat con salidas JSON parseables y una taxonomía cerrada de códigos de error tipados: un agente ramifica por código, sin parsear texto libre.</p>
+      </div>
+    </div>
+  </div></section>
+
+  <!-- ARCHITECTURE -->
+  <section id="architecture"><div class="wrap">
+    <div class="sec-label" data-i18n="arch.label">Diseño</div>
+    <h2 data-i18n="arch.title">Arquitectura</h2>
+    <p class="sec-desc" data-i18n="arch.desc">Una representación canónica se coloca entre los dos motores. Ningún componente considera una transformación exacta si no puede reconstruir y comprobar su semántica en ambos lados.</p>
+    <div class="diagram" id="d-arch"><div class="fallback">SQLite/libSQL → Inspección → AST canónico → Auditoría → (exact) Compilador DDL → PostgreSQL / (unknown) Detener. Snapshot y Journal → Replicación → Verificación.</div></div>
+    <div class="legend">
+      <span><i style="background:#38bdf8"></i><span data-i18n="arch.lg_src">Origen / destino</span></span>
+      <span><i style="background:#d29922"></i><span data-i18n="arch.lg_gate">Puerta de auditoría</span></span>
+      <span><i style="background:#f85149"></i><span data-i18n="arch.lg_stop">Detención honesta</span></span>
+      <span><i style="background:#3fb950"></i><span data-i18n="arch.lg_verify">Verificación</span></span>
+    </div>
+  </div></section>
+
+  <!-- FLOW -->
+  <section id="flow"><div class="wrap">
+    <div class="sec-label" data-i18n="flow.label">Proceso</div>
+    <h2 data-i18n="flow.title">Ciclo de migración</h2>
+    <p class="sec-desc" data-i18n="flow.desc">Cuatro fases, cada una con su veredicto determinista. Un fallo detiene el proceso con un código tipado; el corte final del DSN de la aplicación es manual, tras recibir status=ready.</p>
+    <div class="diagram" id="d-flow"><div class="fallback">1 Audit → 2 Snapshot → 3 Replicate → 4 Cutover → status=ready → corte manual del DSN.</div></div>
+  </div></section>
+
+  <!-- COMPAT -->
+  <section id="compat"><div class="wrap">
+    <div class="sec-label" data-i18n="compat.label">Compatibilidad</div>
+    <h2 data-i18n="compat.title">Representación de valores</h2>
+    <p class="sec-desc" data-i18n="compat.desc">Cómo se materializa cada familia de tipos en cada motor. Varias familias usan una representación deliberadamente conservadora (texto) para preservar el valor exacto y evitar normalizaciones que cambien la representación.</p>
+    <div class="tablewrap"><table>
+      <thead><tr>
+        <th data-i18n="compat.h_family">Familia</th>
+        <th>SQLite</th><th>PostgreSQL</th>
+        <th data-i18n="compat.h_reason">Motivo</th>
+      </tr></thead>
+      <tbody>
+        <tr><td class="fam">Boolean</td><td><span class="t">INTEGER</span></td><td><span class="p">BOOLEAN</span></td><td data-i18n="cm.boolean">Conversión canónica true/false</td></tr>
+        <tr><td class="fam">Integer</td><td><span class="t">INTEGER</span></td><td><span class="p">BIGINT</span></td><td data-i18n="cm.integer">Rango entero común del modelo</td></tr>
+        <tr><td class="fam">Decimal</td><td><span class="t">TEXT</span></td><td><span class="p">NUMERIC</span></td><td data-i18n="cm.decimal">Evita el redondeo binario IEEE-754</td></tr>
+        <tr><td class="fam">Float</td><td><span class="t">REAL</span></td><td><span class="p">DOUBLE PRECISION</span></td><td data-i18n="cm.float">Punto flotante explícito</td></tr>
+        <tr><td class="fam">Text</td><td><span class="t">TEXT</span></td><td><span class="p">TEXT</span></td><td data-i18n="cm.text">Representación común</td></tr>
+        <tr><td class="fam">Binary</td><td><span class="t">BLOB</span></td><td><span class="p">BYTEA</span></td><td data-i18n="cm.binary">Journal en hex, artefacto en base64</td></tr>
+        <tr><td class="fam">Date</td><td><span class="t">TEXT</span></td><td><span class="p">TEXT</span></td><td data-i18n="cm.date">Preserva el valor exacto (DATE nativo divergiría)</td></tr>
+        <tr><td class="fam">Timestamp</td><td><span class="t">TEXT</span></td><td><span class="p">TEXT</span></td><td data-i18n="cm.timestamp">Conserva RFC3339Nano sin truncar</td></tr>
+        <tr><td class="fam">JSON</td><td><span class="t">TEXT</span></td><td><span class="p">TEXT</span></td><td data-i18n="cm.json">Preserva orden, espacios y números originales</td></tr>
+        <tr><td class="fam">UUID</td><td><span class="t">TEXT</span></td><td><span class="p">TEXT</span></td><td data-i18n="cm.uuid">Preserva la representación textual exacta</td></tr>
+        <tr><td class="fam">Vector</td><td><span class="t">TEXT</span></td><td><span class="p">vector(N)</span></td><td data-i18n="cm.vector">Carrier de texto interoperable; pgvector en el destino</td></tr>
+      </tbody>
+    </table></div>
+    <div class="note">
+      <svg viewBox="0 0 24 24"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>
+      <span data-i18n="compat.note">El sistema no declara compatibilidad total: la aceptación global sigue fallando mientras exista una familia genérica requerida con estado distinto de exact. Es una decisión de honestidad, no un defecto.</span>
+    </div>
+  </div></section>
+
+  <!-- CLI -->
+  <section id="cli"><div class="wrap">
+    <div class="sec-label" data-i18n="cli.label">Interfaz</div>
+    <h2 data-i18n="cli.title">La interfaz de línea de comandos</h2>
+    <p class="sec-desc" data-i18n="cli.desc">Un único binario compat despacha tres subcomandos. Cada operación devuelve JSON legible por máquina, un envelope de error tipado y un exit code estable.</p>
+    <div class="cli-grid">
+      <div class="cmd"><code class="sub">compat <b>audit</b> &lt;contract.json&gt;</code><p data-i18n="cli.audit_d">Audita un contrato y evalúa cada capacidad requerida. Exit 0 si todo es exact; 2 ante uso incorrecto.</p></div>
+      <div class="cmd"><code class="sub">compat <b>copy</b> &lt;migration.json&gt;</code><p data-i18n="cli.copy_d">Migración por snapshot: audita, exporta el origen, importa en el destino y verifica digests.</p></div>
+      <div class="cmd"><code class="sub">compat <b>cutover</b> [--dry-run] &lt;cutover.json&gt;</code><p data-i18n="cli.cutover_d">Cutover sin ventana: audita, instala captura, hace snapshot, drena el journal y verifica. --dry-run sólo audita y prueba conectividad.</p></div>
+      <div class="cmd"><code class="sub">compat</code><p data-i18n="cli.usage_d">Sin subcomando, con uno desconocido o con --help: uso en stderr y un envelope ERR_USAGE (exit 2).</p></div>
+    </div>
+
+    <div class="terminal">
+      <div class="bar"><i></i><i></i><i></i></div>
+      <pre><span class="pr">$</span> compat audit ./contract.json
+[{<span class="ok">"feature":"canonical_foreign_keys","status":"exact"</span>},
+ {<span class="ok">"feature":"canonical_triggers","status":"exact"</span>}]
+<span class="cm"># exit 0</span>
+
+<span class="pr">$</span> compat copy ./migration.json   <span class="cm"># destino divergente</span>
+{<span class="er">"status":"error","code":"ERR_VERIFY_DIVERGED"</span>,
+ "message":"snapshot mismatch: source 7fcf9d… destination 7369f5…"}
+<span class="cm"># exit 1</span></pre>
+    </div>
+
+    <h3 style="margin-top:30px;font-size:1.05rem" data-i18n="cli.errors_title">Taxonomía de errores</h3>
+    <p class="sec-desc" style="margin-top:8px" data-i18n="cli.errors_d">Toda salida es JSON parseable, incluidos los errores. Un fallo emite un envelope { status, code, message } sobre esta taxonomía cerrada.</p>
+    <div class="chips">
+      <span class="chip">ERR_USAGE</span>
+      <span class="chip">ERR_CONFIG</span>
+      <span class="chip e">ERR_AUDIT_NOT_EXACT</span>
+      <span class="chip">ERR_CONNECT_SOURCE</span>
+      <span class="chip">ERR_CONNECT_DESTINATION</span>
+      <span class="chip">ERR_SCHEMA</span>
+      <span class="chip">ERR_SNAPSHOT</span>
+      <span class="chip e">ERR_REPLICATION_CONFLICT</span>
+      <span class="chip">ERR_CAPTURE</span>
+      <span class="chip e">ERR_VERIFY_DIVERGED</span>
+      <span class="chip">ERR_INTERNAL</span>
+    </div>
+  </div></section>
+
+  <!-- QUICKSTART -->
+  <section id="quickstart"><div class="wrap">
+    <div class="sec-label" data-i18n="qs.label">Empezar</div>
+    <h2 data-i18n="qs.title">Inicio rápido</h2>
+    <p class="sec-desc" data-i18n="qs.desc">Requiere Go. Cloná el repositorio y ejecutá:</p>
+    <div class="steps">
+      <div class="step"><div class="n">1</div><div class="body">
+        <p data-i18n="qs.s1">Cloná y verificá que compila y pasa las pruebas:</p>
+        <pre>git clone https://github.com/MauricioPerera/sqlite-postgres-compat
+cd sqlite-postgres-compat
+go test ./...  &amp;&amp;  go vet ./...</pre>
+      </div></div>
+      <div class="step"><div class="n">2</div><div class="body">
+        <p data-i18n="qs.s2">Auditá un contrato de ejemplo (no necesita bases de datos):</p>
+        <pre>go run ./cmd/compat audit ./examples/contract.example.json</pre>
+      </div></div>
+      <div class="step"><div class="n">3</div><div class="body">
+        <p data-i18n="qs.s3">Probá un cutover en seco (editá examples/ con DSN reales primero):</p>
+        <pre>go run ./cmd/compat cutover --dry-run ./examples/cutover.example.json</pre>
+      </div></div>
+    </div>
+    <div class="note" style="background:rgba(56,189,248,.05);border-color:rgba(56,189,248,.22);color:#bfe3f7">
+      <svg viewBox="0 0 24 24" style="stroke:var(--accent)"><path d="M12 16v-4"/><path d="M12 8h.01"/><circle cx="12" cy="12" r="9"/></svg>
+      <span data-i18n="qs.note">Para copiar un snapshot o hacer un cutover real, editá los ejemplos de examples/ con DSN reales primero. El contrato AGENTS.md documenta la gramática canónica machine-facing.</span>
+    </div>
+  </div></section>
+</main>
+
+<footer><div class="wrap">
+  <div class="foot-inner">
+    <div class="brand"><span class="dot"></span><code>sqlite-postgres-compat</code></div>
+    <div>
+      <a href="https://github.com/MauricioPerera/sqlite-postgres-compat" target="_blank" rel="noopener">GitHub</a> ·
+      <a href="https://github.com/MauricioPerera/sqlite-postgres-compat/blob/main/AGENTS.md" target="_blank" rel="noopener">AGENTS.md</a> ·
+      <a href="https://github.com/MauricioPerera/sqlite-postgres-compat/blob/main/docs/USAGE.md" target="_blank" rel="noopener" data-i18n="footer.usage">Guía de uso</a> ·
+      <a href="https://github.com/MauricioPerera/sqlite-postgres-compat/blob/main/LICENSE" target="_blank" rel="noopener">MIT</a>
+    </div>
+  </div>
+  <p class="foot-disc" data-i18n="footer.disclaimer">El núcleo canónico funciona y está probado en ambos motores; el proyecto todavía no ofrece compatibilidad total con cualquier SQL arbitrario. La prueba global permanece roja hasta que esa afirmación sea verdadera.</p>
+</div></footer>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+(function(){
+  "use strict";
+
+  var I18N = {
+    es:{
+      "nav.why":"¿Por qué?","nav.features":"Características","nav.architecture":"Arquitectura","nav.flow":"Migración","nav.compat":"Compatibilidad","nav.cli":"CLI","nav.quickstart":"Inicio",
+      "hero.eyebrow":"SQLite / libSQL → PostgreSQL",
+      "hero.h1a":"Migración verificable,","hero.h1b":"sin ventana de corte.",
+      "hero.sub":"Capa de compatibilidad en Go: contrato de esquema canónico, migración por snapshot, replicación incremental bidireccional y cutover en vivo. Si una capacidad no se puede garantizar en ambos motores, el proceso se detiene y lo dice — nunca degrada en silencio.",
+      "hero.cta_github":"Ver en GitHub","hero.cta_start":"Inicio rápido",
+      "hero.badge_pg":"PostgreSQL 17 real","hero.badge_audit":"8 rondas de auditoría",
+      "why.label":"El problema","why.title":"¿Por qué?",
+      "why.p1":"El caso de uso: arrancar un SaaS con SQLite o libSQL —cero operación, sin servidor de base de datos que administrar— y migrar a PostgreSQL más adelante, cuando el crecimiento lo exija, sin apagar la aplicación.",
+      "why.p2":"Cada fase —auditoría de capacidades, snapshot, replicación, cutover— produce un veredicto verificable (exit code y JSON) en vez de una promesa optimista. La compatibilidad la certifican pruebas contra motores reales, no la confianza.",
+      "features.label":"Capacidades","features.title":"Qué hace",
+      "feat.contract.t":"Contrato de esquema canónico","feat.contract.d":"Declara motor, versión y capacidades requeridas. La auditoría devuelve un veredicto por capacidad (exact / unknown) y corta la migración ante cualquier cosa no garantizada.",
+      "feat.snapshot.t":"Snapshot verificado por digest","feat.snapshot.d":"Exporta esquema y datos a una forma canónica, los importa en el destino y compara hashes canónicos de ambos lados antes de dar la copia por buena.",
+      "feat.replication.t":"Replicación incremental por triggers","feat.replication.d":"Captura automática de INSERT/UPDATE/DELETE, aplicación idempotente por secuencia, detección de conflictos y supresión de ecos transaccional bajo MVCC.",
+      "feat.cutover.t":"Cutover sin ventana","feat.cutover.d":"Audita, instala captura, hace snapshot, drena el journal y verifica equivalencia. Incluye un modo --dry-run de sólo lectura que imprime el plan sin escribir nada.",
+      "feat.vector.t":"Tipo vector(N) de primera clase","feat.vector.d":"SQLite/libSQL (F32_BLOB(N)) ↔ PostgreSQL (pgvector), validado end-to-end contra motores reales, incluida inspección de dimensión, snapshot y replicación.",
+      "feat.agents.t":"Diseñado para agentes de IA","feat.agents.d":"Un único binario compat con salidas JSON parseables y una taxonomía cerrada de códigos de error tipados: un agente ramifica por código, sin parsear texto libre.",
+      "arch.label":"Diseño","arch.title":"Arquitectura","arch.desc":"Una representación canónica se coloca entre los dos motores. Ningún componente considera una transformación exacta si no puede reconstruir y comprobar su semántica en ambos lados.",
+      "arch.lg_src":"Origen / destino","arch.lg_gate":"Puerta de auditoría","arch.lg_stop":"Detención honesta","arch.lg_verify":"Verificación",
+      "flow.label":"Proceso","flow.title":"Ciclo de migración","flow.desc":"Cuatro fases, cada una con su veredicto determinista. Un fallo detiene el proceso con un código tipado; el corte final del DSN de la aplicación es manual, tras recibir status=ready.",
+      "compat.label":"Compatibilidad","compat.title":"Representación de valores","compat.desc":"Cómo se materializa cada familia de tipos en cada motor. Varias familias usan una representación deliberadamente conservadora (texto) para preservar el valor exacto y evitar normalizaciones que cambien la representación.",
+      "compat.h_family":"Familia","compat.h_reason":"Motivo",
+      "cm.boolean":"Conversión canónica true/false","cm.integer":"Rango entero común del modelo","cm.decimal":"Evita el redondeo binario IEEE-754","cm.float":"Punto flotante explícito","cm.text":"Representación común","cm.binary":"Journal en hex, artefacto en base64","cm.date":"Preserva el valor exacto (DATE nativo divergiría)","cm.timestamp":"Conserva RFC3339Nano sin truncar","cm.json":"Preserva orden, espacios y números originales","cm.uuid":"Preserva la representación textual exacta","cm.vector":"Carrier de texto interoperable; pgvector en el destino",
+      "compat.note":"El sistema no declara compatibilidad total: la aceptación global sigue fallando mientras exista una familia genérica requerida con estado distinto de exact. Es una decisión de honestidad, no un defecto.",
+      "cli.label":"Interfaz","cli.title":"La interfaz de línea de comandos","cli.desc":"Un único binario compat despacha tres subcomandos. Cada operación devuelve JSON legible por máquina, un envelope de error tipado y un exit code estable.",
+      "cli.audit_d":"Audita un contrato y evalúa cada capacidad requerida. Exit 0 si todo es exact; 2 ante uso incorrecto.",
+      "cli.copy_d":"Migración por snapshot: audita, exporta el origen, importa en el destino y verifica digests.",
+      "cli.cutover_d":"Cutover sin ventana: audita, instala captura, hace snapshot, drena el journal y verifica. --dry-run sólo audita y prueba conectividad.",
+      "cli.usage_d":"Sin subcomando, con uno desconocido o con --help: uso en stderr y un envelope ERR_USAGE (exit 2).",
+      "cli.errors_title":"Taxonomía de errores","cli.errors_d":"Toda salida es JSON parseable, incluidos los errores. Un fallo emite un envelope { status, code, message } sobre esta taxonomía cerrada.",
+      "qs.label":"Empezar","qs.title":"Inicio rápido","qs.desc":"Requiere Go. Cloná el repositorio y ejecutá:",
+      "qs.s1":"Cloná y verificá que compila y pasa las pruebas:","qs.s2":"Auditá un contrato de ejemplo (no necesita bases de datos):","qs.s3":"Probá un cutover en seco (editá examples/ con DSN reales primero):",
+      "qs.note":"Para copiar un snapshot o hacer un cutover real, editá los ejemplos de examples/ con DSN reales primero. El contrato AGENTS.md documenta la gramática canónica machine-facing.",
+      "footer.usage":"Guía de uso","footer.disclaimer":"El núcleo canónico funciona y está probado en ambos motores; el proyecto todavía no ofrece compatibilidad total con cualquier SQL arbitrario. La prueba global permanece roja hasta que esa afirmación sea verdadera."
+    },
+    en:{
+      "nav.why":"Why","nav.features":"Features","nav.architecture":"Architecture","nav.flow":"Migration","nav.compat":"Compatibility","nav.cli":"CLI","nav.quickstart":"Quick start",
+      "hero.eyebrow":"SQLite / libSQL → PostgreSQL",
+      "hero.h1a":"Verifiable migration,","hero.h1b":"with zero downtime.",
+      "hero.sub":"A Go compatibility layer: canonical schema contract, snapshot migration, bidirectional incremental replication and live cutover. If a capability can't be guaranteed on both engines, the process stops and says so — it never degrades silently.",
+      "hero.cta_github":"View on GitHub","hero.cta_start":"Quick start",
+      "hero.badge_pg":"real PostgreSQL 17","hero.badge_audit":"8 audit rounds",
+      "why.label":"The problem","why.title":"Why?",
+      "why.p1":"The use case: launch a SaaS on SQLite or libSQL — zero ops, no database server to run — and migrate to PostgreSQL later, when growth demands it, without shutting the app down.",
+      "why.p2":"Each phase — capability audit, snapshot, replication, cutover — produces a verifiable verdict (exit code and JSON) instead of an optimistic promise. Compatibility is certified by tests against real engines, not by trust.",
+      "features.label":"Capabilities","features.title":"What it does",
+      "feat.contract.t":"Canonical schema contract","feat.contract.d":"Declares engine, version and required capabilities. The audit returns a per-capability verdict (exact / unknown) and halts the migration on anything not guaranteed.",
+      "feat.snapshot.t":"Digest-verified snapshot","feat.snapshot.d":"Exports schema and data to a canonical form, imports it into the destination and compares canonical hashes on both sides before accepting the copy.",
+      "feat.replication.t":"Trigger-based incremental replication","feat.replication.d":"Automatic INSERT/UPDATE/DELETE capture, idempotent apply by sequence, conflict detection and transaction-local echo suppression under MVCC.",
+      "feat.cutover.t":"Zero-downtime cutover","feat.cutover.d":"Audits, installs capture, snapshots, drains the journal and verifies equivalence. Includes a read-only --dry-run mode that prints the plan without writing anything.",
+      "feat.vector.t":"First-class vector(N) type","feat.vector.d":"SQLite/libSQL (F32_BLOB(N)) ↔ PostgreSQL (pgvector), validated end-to-end against real engines, including dimension inspection, snapshot and replication.",
+      "feat.agents.t":"Built for AI agents","feat.agents.d":"A single compat binary with parseable JSON output and a closed taxonomy of typed error codes: an agent branches on the code, no free-text parsing.",
+      "arch.label":"Design","arch.title":"Architecture","arch.desc":"A canonical representation sits between the two engines. No component treats a transformation as exact unless it can reconstruct and verify its semantics on both sides.",
+      "arch.lg_src":"Source / destination","arch.lg_gate":"Audit gate","arch.lg_stop":"Honest stop","arch.lg_verify":"Verification",
+      "flow.label":"Process","flow.title":"Migration lifecycle","flow.desc":"Four phases, each with its deterministic verdict. A failure halts the process with a typed code; the final app DSN switch is manual, once you receive status=ready.",
+      "compat.label":"Compatibility","compat.title":"Value representation","compat.desc":"How each type family materializes on each engine. Several families use a deliberately conservative representation (text) to preserve the exact value and avoid normalizations that change the representation.",
+      "compat.h_family":"Family","compat.h_reason":"Reason",
+      "cm.boolean":"Canonical true/false conversion","cm.integer":"Common integer range of the model","cm.decimal":"Avoids binary IEEE-754 rounding","cm.float":"Explicit floating point","cm.text":"Common representation","cm.binary":"Hex journal, base64 artifact","cm.date":"Preserves the exact value (native DATE would diverge)","cm.timestamp":"Keeps RFC3339Nano without truncation","cm.json":"Preserves original order, spacing and numbers","cm.uuid":"Preserves the exact textual representation","cm.vector":"Interoperable text carrier; pgvector on the destination",
+      "compat.note":"The system does not claim full compatibility: the global check keeps failing while any required generic family is in a state other than exact. It's a design choice for honesty, not a defect.",
+      "cli.label":"Interface","cli.title":"The command-line interface","cli.desc":"A single compat binary dispatches three subcommands. Every operation returns machine-readable JSON, a typed error envelope and a stable exit code.",
+      "cli.audit_d":"Audits a contract and evaluates each required capability. Exit 0 if all exact; 2 on misuse.",
+      "cli.copy_d":"Snapshot migration: audits, exports the source, imports into the destination and verifies digests.",
+      "cli.cutover_d":"Zero-downtime cutover: audits, installs capture, snapshots, drains the journal and verifies. --dry-run only audits and tests connectivity.",
+      "cli.usage_d":"With no subcommand, an unknown one, or --help: usage on stderr and an ERR_USAGE envelope (exit 2).",
+      "cli.errors_title":"Error taxonomy","cli.errors_d":"All output is parseable JSON, including errors. A failure emits a { status, code, message } envelope over this closed taxonomy.",
+      "qs.label":"Get started","qs.title":"Quick start","qs.desc":"Requires Go. Clone the repository and run:",
+      "qs.s1":"Clone and verify it builds and passes the tests:","qs.s2":"Audit an example contract (no databases needed):","qs.s3":"Try a dry-run cutover (edit examples/ with real DSNs first):",
+      "qs.note":"To copy a snapshot or run a real cutover, edit the examples in examples/ with real DSNs first. The AGENTS.md contract documents the machine-facing canonical grammar.",
+      "footer.usage":"Usage guide","footer.disclaimer":"The canonical core works and is tested on both engines; the project does not yet offer full compatibility with arbitrary SQL. The global test stays red until that claim is true."
+    },
+    pt:{
+      "nav.why":"Por quê","nav.features":"Recursos","nav.architecture":"Arquitetura","nav.flow":"Migração","nav.compat":"Compatibilidade","nav.cli":"CLI","nav.quickstart":"Início",
+      "hero.eyebrow":"SQLite / libSQL → PostgreSQL",
+      "hero.h1a":"Migração verificável,","hero.h1b":"sem janela de parada.",
+      "hero.sub":"Uma camada de compatibilidade em Go: contrato de esquema canônico, migração por snapshot, replicação incremental bidirecional e cutover ao vivo. Se uma capacidade não puder ser garantida nos dois motores, o processo para e avisa — nunca degrada em silêncio.",
+      "hero.cta_github":"Ver no GitHub","hero.cta_start":"Início rápido",
+      "hero.badge_pg":"PostgreSQL 17 real","hero.badge_audit":"8 rodadas de auditoria",
+      "why.label":"O problema","why.title":"Por quê?",
+      "why.p1":"O caso de uso: lançar um SaaS com SQLite ou libSQL — zero operação, sem servidor de banco para administrar — e migrar para PostgreSQL mais tarde, quando o crescimento exigir, sem desligar a aplicação.",
+      "why.p2":"Cada fase — auditoria de capacidades, snapshot, replicação, cutover — produz um veredito verificável (exit code e JSON) em vez de uma promessa otimista. A compatibilidade é certificada por testes contra motores reais, não pela confiança.",
+      "features.label":"Capacidades","features.title":"O que faz",
+      "feat.contract.t":"Contrato de esquema canônico","feat.contract.d":"Declara motor, versão e capacidades exigidas. A auditoria retorna um veredito por capacidade (exact / unknown) e interrompe a migração diante de qualquer coisa não garantida.",
+      "feat.snapshot.t":"Snapshot verificado por digest","feat.snapshot.d":"Exporta esquema e dados para uma forma canônica, importa no destino e compara hashes canônicos dos dois lados antes de aceitar a cópia.",
+      "feat.replication.t":"Replicação incremental por triggers","feat.replication.d":"Captura automática de INSERT/UPDATE/DELETE, aplicação idempotente por sequência, detecção de conflitos e supressão de ecos transacional sob MVCC.",
+      "feat.cutover.t":"Cutover sem janela","feat.cutover.d":"Audita, instala captura, faz snapshot, drena o journal e verifica equivalência. Inclui um modo --dry-run somente leitura que imprime o plano sem escrever nada.",
+      "feat.vector.t":"Tipo vector(N) de primeira classe","feat.vector.d":"SQLite/libSQL (F32_BLOB(N)) ↔ PostgreSQL (pgvector), validado ponta a ponta contra motores reais, incluindo inspeção de dimensão, snapshot e replicação.",
+      "feat.agents.t":"Feito para agentes de IA","feat.agents.d":"Um único binário compat com saídas JSON parseáveis e uma taxonomia fechada de códigos de erro tipados: um agente decide pelo código, sem parsear texto livre.",
+      "arch.label":"Design","arch.title":"Arquitetura","arch.desc":"Uma representação canônica fica entre os dois motores. Nenhum componente considera uma transformação exata se não puder reconstruir e verificar sua semântica dos dois lados.",
+      "arch.lg_src":"Origem / destino","arch.lg_gate":"Portão de auditoria","arch.lg_stop":"Parada honesta","arch.lg_verify":"Verificação",
+      "flow.label":"Processo","flow.title":"Ciclo de migração","flow.desc":"Quatro fases, cada uma com seu veredito determinístico. Uma falha interrompe o processo com um código tipado; a troca final do DSN da aplicação é manual, após receber status=ready.",
+      "compat.label":"Compatibilidade","compat.title":"Representação de valores","compat.desc":"Como cada família de tipos se materializa em cada motor. Várias famílias usam uma representação deliberadamente conservadora (texto) para preservar o valor exato e evitar normalizações que alterem a representação.",
+      "compat.h_family":"Família","compat.h_reason":"Motivo",
+      "cm.boolean":"Conversão canônica true/false","cm.integer":"Faixa inteira comum do modelo","cm.decimal":"Evita o arredondamento binário IEEE-754","cm.float":"Ponto flutuante explícito","cm.text":"Representação comum","cm.binary":"Journal em hex, artefato em base64","cm.date":"Preserva o valor exato (DATE nativo divergiria)","cm.timestamp":"Mantém RFC3339Nano sem truncar","cm.json":"Preserva ordem, espaços e números originais","cm.uuid":"Preserva a representação textual exata","cm.vector":"Carrier de texto interoperável; pgvector no destino",
+      "compat.note":"O sistema não declara compatibilidade total: a verificação global continua falhando enquanto houver uma família genérica exigida em estado diferente de exact. É uma decisão de honestidade, não um defeito.",
+      "cli.label":"Interface","cli.title":"A interface de linha de comando","cli.desc":"Um único binário compat despacha três subcomandos. Cada operação retorna JSON legível por máquina, um envelope de erro tipado e um exit code estável.",
+      "cli.audit_d":"Audita um contrato e avalia cada capacidade exigida. Exit 0 se tudo for exact; 2 em uso incorreto.",
+      "cli.copy_d":"Migração por snapshot: audita, exporta a origem, importa no destino e verifica digests.",
+      "cli.cutover_d":"Cutover sem janela: audita, instala captura, faz snapshot, drena o journal e verifica. --dry-run apenas audita e testa conectividade.",
+      "cli.usage_d":"Sem subcomando, com um desconhecido ou com --help: uso no stderr e um envelope ERR_USAGE (exit 2).",
+      "cli.errors_title":"Taxonomia de erros","cli.errors_d":"Toda saída é JSON parseável, incluindo erros. Uma falha emite um envelope { status, code, message } sobre esta taxonomia fechada.",
+      "qs.label":"Começar","qs.title":"Início rápido","qs.desc":"Requer Go. Clone o repositório e execute:",
+      "qs.s1":"Clone e verifique que compila e passa nos testes:","qs.s2":"Audite um contrato de exemplo (não precisa de bancos):","qs.s3":"Teste um cutover a seco (edite examples/ com DSNs reais primeiro):",
+      "qs.note":"Para copiar um snapshot ou fazer um cutover real, edite os exemplos em examples/ com DSNs reais primeiro. O contrato AGENTS.md documenta a gramática canônica machine-facing.",
+      "footer.usage":"Guia de uso","footer.disclaimer":"O núcleo canônico funciona e é testado nos dois motores; o projeto ainda não oferece compatibilidade total com qualquer SQL arbitrário. O teste global permanece vermelho até que essa afirmação seja verdadeira."
+    }
+  };
+
+  // Diagram bodies per language. Shared style/class tail appended below.
+  var ARCH = {
+    es:'flowchart LR\n SRC["Origen<br/>SQLite · libSQL"] --> INS["Inspeccion<br/>de catalogo"]\n CON["Contrato<br/>explicito"] --> AUD{"Auditoria de<br/>capacidades"}\n INS --> AST["AST canonico<br/>esquema + valores"]\n AST --> AUD\n AUD -->|"exact"| DDL["Compilador DDL<br/>por motor"]\n AUD -->|"unknown"| STOP["Detener<br/>y reportar"]\n DDL --> DST["Destino<br/>PostgreSQL"]\n SRC --> SNP["Snapshot<br/>canonico"] --> DST\n SRC --> JRN["Journal<br/>automatico"] --> REP["Replicacion<br/>transaccional"] --> DST\n DST --> VER["Verificacion<br/>hashes + comportamiento"]\n',
+    en:'flowchart LR\n SRC["Source<br/>SQLite · libSQL"] --> INS["Catalog<br/>inspection"]\n CON["Explicit<br/>contract"] --> AUD{"Capability<br/>audit"}\n INS --> AST["Canonical AST<br/>schema + values"]\n AST --> AUD\n AUD -->|"exact"| DDL["Per-engine<br/>DDL compiler"]\n AUD -->|"unknown"| STOP["Stop<br/>and report"]\n DDL --> DST["Destination<br/>PostgreSQL"]\n SRC --> SNP["Canonical<br/>snapshot"] --> DST\n SRC --> JRN["Automatic<br/>journal"] --> REP["Transactional<br/>replication"] --> DST\n DST --> VER["Verification<br/>hashes + behavior"]\n',
+    pt:'flowchart LR\n SRC["Origem<br/>SQLite · libSQL"] --> INS["Inspecao<br/>de catalogo"]\n CON["Contrato<br/>explicito"] --> AUD{"Auditoria de<br/>capacidades"}\n INS --> AST["AST canonico<br/>esquema + valores"]\n AST --> AUD\n AUD -->|"exact"| DDL["Compilador DDL<br/>por motor"]\n AUD -->|"unknown"| STOP["Parar<br/>e reportar"]\n DDL --> DST["Destino<br/>PostgreSQL"]\n SRC --> SNP["Snapshot<br/>canonico"] --> DST\n SRC --> JRN["Journal<br/>automatico"] --> REP["Replicacao<br/>transacional"] --> DST\n DST --> VER["Verificacao<br/>hashes + comportamento"]\n'
+  };
+  var ARCH_TAIL=['classDef src fill:#0e2233,stroke:#38bdf8,color:#cfe8ff','classDef step fill:#131a24,stroke:#2b3440,color:#e6edf3','classDef gate fill:#2a2410,stroke:#d29922,color:#f5e6b8','classDef stop fill:#2a1416,stroke:#f85149,color:#ffd0cf','classDef verify fill:#10281c,stroke:#3fb950,color:#c7f0d2','class SRC src','class DST src','class INS step','class CON step','class AST step','class DDL step','class SNP step','class JRN step','class REP step','class AUD gate','class STOP stop','class VER verify'].join('\n');
+
+  var FLOW = {
+    es:'flowchart LR\n A["1 · Auditoria"] -->|"exact"| B["2 · Snapshot"]\n B -->|"digests OK"| C["3 · Replicacion"]\n C --> D["4 · Cutover"]\n D -->|"status=ready"| OK(["Corte manual<br/>del DSN"])\n A -.->|"ERR_AUDIT_NOT_EXACT"| X(["Detener"])\n B -.->|"ERR_SNAPSHOT"| X\n D -.->|"ERR_VERIFY_DIVERGED"| X\n',
+    en:'flowchart LR\n A["1 · Audit"] -->|"exact"| B["2 · Snapshot"]\n B -->|"digests OK"| C["3 · Replicate"]\n C --> D["4 · Cutover"]\n D -->|"status=ready"| OK(["Manual DSN<br/>switch"])\n A -.->|"ERR_AUDIT_NOT_EXACT"| X(["Stop"])\n B -.->|"ERR_SNAPSHOT"| X\n D -.->|"ERR_VERIFY_DIVERGED"| X\n',
+    pt:'flowchart LR\n A["1 · Auditoria"] -->|"exact"| B["2 · Snapshot"]\n B -->|"digests OK"| C["3 · Replicacao"]\n C --> D["4 · Cutover"]\n D -->|"status=ready"| OK(["Troca manual<br/>do DSN"])\n A -.->|"ERR_AUDIT_NOT_EXACT"| X(["Parar"])\n B -.->|"ERR_SNAPSHOT"| X\n D -.->|"ERR_VERIFY_DIVERGED"| X\n'
+  };
+  var FLOW_TAIL=['classDef step fill:#131a24,stroke:#38bdf8,color:#e6edf3','classDef ok fill:#10281c,stroke:#3fb950,color:#c7f0d2','classDef stop fill:#2a1416,stroke:#f85149,color:#ffd0cf','class A step','class B step','class C step','class D step','class OK ok','class X stop'].join('\n');
+
+  var mermaidReady=false, renderSeq=0;
+  if(typeof mermaid!=='undefined'){
+    try{
+      mermaid.initialize({startOnLoad:false, securityLevel:'strict', theme:'base',
+        themeVariables:{ fontFamily:'ui-monospace,Menlo,Consolas,monospace', fontSize:'14px',
+          lineColor:'#6b7787', primaryColor:'#131a24', primaryTextColor:'#e6edf3', primaryBorderColor:'#2b3440',
+          clusterBkg:'transparent', edgeLabelBackground:'#0d1117', tertiaryColor:'#0d1117' }});
+      mermaidReady=true;
+    }catch(e){ mermaidReady=false; }
+  }
+
+  function renderOne(containerId, def){
+    var el=document.getElementById(containerId);
+    if(!el) return;
+    if(!mermaidReady){ return; } // keep the text fallback already in the DOM
+    var id='mmd-'+(renderSeq++);
+    try{
+      mermaid.render(id, def).then(function(res){ el.innerHTML=res.svg; })
+        .catch(function(){ /* keep fallback */ });
+    }catch(e){ /* keep fallback */ }
+  }
+  function renderDiagrams(lang){
+    renderOne('d-arch', ARCH[lang]+'\n'+ARCH_TAIL);
+    renderOne('d-flow', FLOW[lang]+'\n'+FLOW_TAIL);
+  }
+
+  function applyLang(lang){
+    var dict=I18N[lang]; if(!dict) return;
+    document.documentElement.lang=lang;
+    var nodes=document.querySelectorAll('[data-i18n]');
+    for(var i=0;i<nodes.length;i++){
+      var k=nodes[i].getAttribute('data-i18n');
+      if(dict[k]!==undefined) nodes[i].textContent=dict[k];
+    }
+    var btns=document.querySelectorAll('.lang button');
+    for(var j=0;j<btns.length;j++){
+      btns[j].classList.toggle('active', btns[j].getAttribute('data-lang')===lang);
+    }
+    try{ localStorage.setItem('spc.lang', lang); }catch(e){}
+    renderDiagrams(lang);
+  }
+
+  var saved='es';
+  try{ var s=localStorage.getItem('spc.lang'); if(s && I18N[s]) saved=s; }catch(e){}
+  if(saved==='es'){
+    var nav=navigator.language ? navigator.language.slice(0,2) : 'es';
+    // only auto-pick if the user never chose and browser is en/pt
+    try{ if(!localStorage.getItem('spc.lang') && (nav==='en'||nav==='pt')) saved=nav; }catch(e){}
+  }
+
+  var langBtns=document.querySelectorAll('.lang button');
+  for(var b=0;b<langBtns.length;b++){
+    langBtns[b].addEventListener('click', function(){ applyLang(this.getAttribute('data-lang')); });
+  }
+
+  applyLang(saved);
+
+  // Scroll-spy for nav highlight
+  var secIds=['why','features','architecture','flow','compat','cli','quickstart'];
+  var linkFor={};
+  document.querySelectorAll('nav.links a').forEach(function(a){
+    linkFor[a.getAttribute('href').slice(1)]=a;
+  });
+  if('IntersectionObserver' in window){
+    var obs=new IntersectionObserver(function(entries){
+      entries.forEach(function(en){
+        var l=linkFor[en.target.id];
+        if(l && en.isIntersecting){
+          document.querySelectorAll('nav.links a').forEach(function(x){x.classList.remove('active');});
+          l.classList.add('active');
+        }
+      });
+    },{rootMargin:'-45% 0px -50% 0px'});
+    secIds.forEach(function(id){ var s=document.getElementById(id); if(s) obs.observe(s); });
+  }
+})();
+</script>
+</body>
+</html>
