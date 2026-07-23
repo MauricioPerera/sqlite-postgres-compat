@@ -1,4 +1,4 @@
-module example.com/sqlite-postgres-compat
+module github.com/MauricioPerera/sqlite-postgres-compat
 
 go 1.26
 

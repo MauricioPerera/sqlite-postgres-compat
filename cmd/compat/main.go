@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"os"
 
-	"example.com/sqlite-postgres-compat/cmd/internal/cliout"
+	"github.com/MauricioPerera/sqlite-postgres-compat/cmd/internal/cliout"
 )
 
 // usageHint is the top-level usage printed to stderr when compat is invoked

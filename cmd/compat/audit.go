@@ -1,8 +1,8 @@
 package main
 
 import (
-	"example.com/sqlite-postgres-compat/cmd/internal/cliout"
-	"example.com/sqlite-postgres-compat/compat"
+	"github.com/MauricioPerera/sqlite-postgres-compat/cmd/internal/cliout"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // runAudit implements `compat audit <contract.json>`: it audits a Contract and

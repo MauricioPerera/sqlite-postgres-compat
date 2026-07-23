@@ -14,7 +14,7 @@ import (
 	"sync"
 	"testing"
 
-	"example.com/sqlite-postgres-compat/compat"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 func cutoverSchema(name string) compat.Schema {

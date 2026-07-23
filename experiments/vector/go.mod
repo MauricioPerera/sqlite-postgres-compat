@@ -3,7 +3,7 @@ module example.com/vector-exp
 go 1.26
 
 require (
-	example.com/sqlite-postgres-compat v0.0.0-00010101000000-000000000000
+	github.com/MauricioPerera/sqlite-postgres-compat v0.0.0-00010101000000-000000000000
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/tursodatabase/libsql-client-go v0.0.0-20260528064733-9d5d30a29a60
 )
@@ -29,4 +29,4 @@ require (
 	modernc.org/sqlite v1.54.0 // indirect
 )
 
-replace example.com/sqlite-postgres-compat => ../..
+replace github.com/MauricioPerera/sqlite-postgres-compat => ../..

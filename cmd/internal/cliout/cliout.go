@@ -20,7 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"example.com/sqlite-postgres-compat/compat"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // ErrorCode is one value from the closed CLI error taxonomy.

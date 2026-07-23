@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"example.com/sqlite-postgres-compat/compat"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/tursodatabase/libsql-client-go/libsql"

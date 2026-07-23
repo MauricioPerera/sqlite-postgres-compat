@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"example.com/sqlite-postgres-compat/compat"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 var postgresTestDSN string

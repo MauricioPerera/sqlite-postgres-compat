@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"os"
 
-	"example.com/sqlite-postgres-compat/cmd/internal/cliout"
-	"example.com/sqlite-postgres-compat/compat"
+	"github.com/MauricioPerera/sqlite-postgres-compat/cmd/internal/cliout"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // migrationConfig is the JSON config for `compat copy`: the two store DSNs, the

@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"example.com/sqlite-postgres-compat/compat"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // captureStdout runs fn with os.Stdout swapped for a pipe and returns everything

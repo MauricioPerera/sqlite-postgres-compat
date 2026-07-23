@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"example.com/sqlite-postgres-compat/cmd/internal/cliout"
-	"example.com/sqlite-postgres-compat/compat"
+	"github.com/MauricioPerera/sqlite-postgres-compat/cmd/internal/cliout"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // cutoverConfig is the JSON config for `compat cutover`: the two store DSNs, the

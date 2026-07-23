@@ -7,7 +7,7 @@ import (
 	"database/sql"
 	"testing"
 
-	"example.com/sqlite-postgres-compat/compat"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // suppressSchema is a single-table schema used by the suppression e2e tests.
