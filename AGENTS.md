@@ -308,7 +308,7 @@ This is a **tooling version boundary**, not a data format the journal is self-de
 This is a **schema mapping boundary**. Observe it when upgrading the tool across it:
 
 - **Recreate a legacy destination's schema.** A destination created by an **older** tool version still holds native `DATE` columns. Re-create the destination schema (drop and re-`ApplySchema`, or re-run the full `compat copy`/`compat cutover` migration from a clean source) so the columns become `TEXT`. `canonicalValue` is defensive: when the family is `date` it still canonicalizes a `time.Time` from a legacy native-`DATE` column to the date-only form, so a stray re-verify against such a column converges rather than diverging — but the supported path is to recreate the schema.
-- **Divergence is detected, never silent.** The first `compat copy`/`compat cutover` verify against a legacy native-`DATE` destination reports `ERR_VERIFY_DIVERGED` / `status=diverged` (exit `1`); there is no silent corruption. Recreate the destination schema to clear it.
+- **Nothing is silent either way.** Thanks to the defensive branch above, an isolated re-verify against a legacy native-`DATE` destination **converges** when the stored values are date-only (divergence only appears if the source carried a time component that the native `DATE` column truncated). Running `compat copy`/`compat cutover` against a pre-existing legacy destination does not reach verify at all: schema import collides with the existing table and fails with `ERR_SNAPSHOT` (`relation already exists`). Either way there is no silent corruption; the supported path remains recreating the destination schema.
 
 ## Interface note
 
