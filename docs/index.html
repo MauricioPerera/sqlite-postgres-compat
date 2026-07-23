@@ -34,19 +34,23 @@
   /* NAV */
   header.nav{position:sticky; top:0; z-index:50; backdrop-filter:blur(10px);
     background:rgba(11,15,22,.78); border-bottom:1px solid var(--border-soft)}
-  .nav-inner{max-width:var(--maxw); margin:0 auto; padding:12px 22px; display:flex; align-items:center; gap:18px}
+  .nav-inner{max-width:1280px; margin:0 auto; padding:12px 22px; display:flex; align-items:center; gap:14px}
   .brand{display:flex; align-items:center; gap:10px; font-weight:700; letter-spacing:-.01em; white-space:nowrap}
   .brand .dot{width:10px; height:10px; border-radius:3px; background:linear-gradient(135deg,var(--sqlite),var(--ok))}
   .brand code{font-size:.94rem; color:var(--fg)}
-  nav.links{display:flex; gap:4px; margin-left:auto; flex-wrap:wrap}
-  nav.links a{color:var(--muted); padding:6px 10px; border-radius:8px; font-size:.9rem}
+  nav.links{display:flex; gap:2px; margin-left:auto; flex-wrap:nowrap; white-space:nowrap}
+  nav.links a{color:var(--muted); padding:6px 8px; border-radius:8px; font-size:.86rem}
   nav.links a:hover{color:var(--fg); background:var(--panel); text-decoration:none}
   nav.links a.active{color:var(--fg); background:var(--panel)}
-  .lang{display:flex; gap:2px; border:1px solid var(--border); border-radius:9px; padding:2px; margin-left:6px}
+  .lang{display:flex; gap:2px; border:1px solid var(--border); border-radius:9px; padding:2px; margin-left:6px; flex:0 0 auto}
   .lang button{background:transparent; border:0; color:var(--muted); font:inherit; font-size:.8rem; font-weight:600;
     padding:4px 9px; border-radius:7px; cursor:pointer}
   .lang button.active{background:var(--accent); color:#04121d}
-  @media(max-width:820px){ nav.links{display:none} }
+  /* nav.links needs ~940px to fit its 8 items on one line at 1280px nav-inner
+     width (measured: brand 198 + links 699 + lang 109 + gaps/padding ~100).
+     Below that it hides entirely (rather than wrapping) so the header is
+     always exactly one line. */
+  @media(max-width:1140px){ nav.links{display:none} }
 
   /* HERO */
   .hero{padding:74px 0 44px}
