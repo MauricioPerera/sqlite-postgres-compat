@@ -1118,6 +1118,187 @@ func TestDatabaseDSNPreservesConnectionParameters(t *testing.T) {
 	}
 }
 
+// TestSystemCuboaConstructsProduceEquivalentResults drives the FEAT-CUBOA-1
+// grammar extensions (BETWEEN/NOT BETWEEN, IN/NOT IN, searched CASE, nullif)
+// through the real engines. It does two independent things against real
+// PostgreSQL, not just compilation:
+//
+//  1. Applies a table whose CHECK constraints exercise every new construct. If
+//     any construct compiled to SQL that PostgreSQL rejected, ImportSnapshot
+//     would fail here — so a green import proves the DDL is accepted by real PG.
+//  2. Runs two views (a WHERE filter using BETWEEN/NOT BETWEEN/IN/NOT IN, and a
+//     projection using CASE and nullif) on both engines over identical data,
+//     including NULL rows that trigger three-valued logic, and asserts the
+//     results match row-for-row — proving the runtime semantics coincide.
+func TestSystemCuboaConstructsProduceEquivalentResults(t *testing.T) {
+	ctx := context.Background()
+
+	col := func(name string) compat.Expression { return compat.Expression{Kind: "column", Value: name} }
+	intLit := func(v string) compat.Expression { return compat.Expression{Kind: "integer", Value: v} }
+	strLit := func(v string) compat.Expression { return compat.Expression{Kind: "string", Value: v} }
+	cmp := func(kind, c, v string) compat.Expression {
+		return compat.Expression{Kind: kind, Args: []compat.Expression{col(c), intLit(v)}}
+	}
+
+	// CHECK constraints, one per new construct. Every inserted row satisfies all
+	// of them; the point is that the compiled DDL is accepted by both engines.
+	checks := []compat.Constraint{
+		// between: score in [0,100]
+		{Kind: compat.Check, Expression: &compat.Expression{Kind: "between", Args: []compat.Expression{col("score"), intLit("0"), intLit("100")}}},
+		// not_between: score outside [200,300] (always true for valid data)
+		{Kind: compat.Check, Expression: &compat.Expression{Kind: "not_between", Args: []compat.Expression{col("score"), intLit("200"), intLit("300")}}},
+		// in: status in the allowed set
+		{Kind: compat.Check, Expression: &compat.Expression{Kind: "in", Args: []compat.Expression{col("status"), intLit("0"), intLit("1"), intLit("2"), intLit("3"), intLit("9")}}},
+		// not_in: status never 99
+		{Kind: compat.Check, Expression: &compat.Expression{Kind: "not_in", Args: []compat.Expression{col("status"), intLit("99")}}},
+		// nullif: id is the primary key (never NULL and never 0), so
+		// nullif(id, 0) = id and IS NOT NULL holds for every row.
+		{Kind: compat.Check, Expression: &compat.Expression{Kind: "is_not_null", Args: []compat.Expression{
+			{Kind: "nullif", Args: []compat.Expression{col("id"), intLit("0")}},
+		}}},
+		// case: a searched CASE whose value is always a member of the IN list
+		{Kind: compat.Check, Expression: &compat.Expression{Kind: "in", Args: []compat.Expression{
+			{Kind: "case", Args: []compat.Expression{
+				cmp("gte", "score", "60"), strLit("pass"),
+				strLit("fail"),
+			}},
+			strLit("pass"), strLit("fail"),
+		}}},
+	}
+
+	// View A: WHERE filter exercising BETWEEN / NOT BETWEEN / IN / NOT IN.
+	whereFilter := compat.Expression{Kind: "and", Args: []compat.Expression{
+		{Kind: "and", Args: []compat.Expression{
+			{Kind: "and", Args: []compat.Expression{
+				{Kind: "between", Args: []compat.Expression{col("score"), intLit("50"), intLit("100")}},
+				{Kind: "not_between", Args: []compat.Expression{col("score"), intLit("70"), intLit("75")}},
+			}},
+			{Kind: "in", Args: []compat.Expression{col("status"), intLit("1"), intLit("2"), intLit("3")}},
+		}},
+		{Kind: "not_in", Args: []compat.Expression{col("status"), intLit("2")}},
+	}}
+
+	// View B: projection with searched CASE (text) and nullif (int/NULL); both
+	// representations are engine-neutral, so rows compare directly.
+	gradeCase := compat.Expression{Kind: "case", Args: []compat.Expression{
+		cmp("gte", "score", "90"), strLit("A"),
+		cmp("gte", "score", "60"), strLit("B"),
+		strLit("F"),
+	}}
+	statusOrNull := compat.Expression{Kind: "nullif", Args: []compat.Expression{col("status"), intLit("1")}}
+
+	schema := compat.Schema{
+		Tables: []compat.Table{{
+			Name: "cuboa1_items",
+			Columns: []compat.Column{
+				{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+				{Name: "score", Type: compat.Type{Family: compat.IntegerType}, Nullable: true},
+				{Name: "status", Type: compat.Type{Family: compat.IntegerType}, Nullable: true},
+			},
+			Constraints: append([]compat.Constraint{{Kind: compat.PrimaryKey, Columns: []string{"id"}}}, checks...),
+		}},
+		Views: []compat.View{
+			{
+				Name: "cuboa1_filtered",
+				Query: compat.SelectQuery{
+					Columns: []compat.Projection{{Expression: col("id"), Alias: "id"}},
+					From:    compat.TableSource{Table: "cuboa1_items"},
+					Where:   &whereFilter,
+					OrderBy: []compat.Ordering{{Expression: col("id")}},
+				},
+			},
+			{
+				Name: "cuboa1_projected",
+				Query: compat.SelectQuery{
+					Columns: []compat.Projection{
+						{Expression: col("id"), Alias: "id"},
+						{Expression: gradeCase, Alias: "grade"},
+						{Expression: statusOrNull, Alias: "status_or_null"},
+					},
+					From:    compat.TableSource{Table: "cuboa1_items"},
+					OrderBy: []compat.Ordering{{Expression: col("id")}},
+				},
+			},
+		},
+	}
+
+	source := openSQLite(t, filepath.Join(t.TempDir(), "cuboa.db"))
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	// Rows 6 and 7 carry NULLs to exercise three-valued logic in the WHERE view.
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO cuboa1_items (id, score, status) VALUES
+		(1, 55, 1), (2, 72, 2), (3, 73, 3), (4, 90, 9), (5, 100, 0), (6, NULL, 1), (7, 60, NULL)`); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := source.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postgres := openPostgres(t)
+	// A green ImportSnapshot proves real PostgreSQL accepts every CHECK/view DDL.
+	if err := postgres.ImportSnapshot(ctx, snapshot); err != nil {
+		t.Fatal(err)
+	}
+
+	sqliteFiltered := queryIntColumn(t, source.DB, `SELECT id FROM cuboa1_filtered ORDER BY id`)
+	postgresFiltered := queryIntColumn(t, postgres.DB, `SELECT id FROM cuboa1_filtered ORDER BY id`)
+	if fmt.Sprint(sqliteFiltered) != fmt.Sprint(postgresFiltered) {
+		t.Fatalf("filter view diverged: sqlite=%v postgres=%v", sqliteFiltered, postgresFiltered)
+	}
+
+	sqliteProjected := queryProjectedRows(t, source.DB)
+	postgresProjected := queryProjectedRows(t, postgres.DB)
+	if fmt.Sprint(sqliteProjected) != fmt.Sprint(postgresProjected) {
+		t.Fatalf("projection view diverged:\n sqlite=%v\n postgres=%v", sqliteProjected, postgresProjected)
+	}
+}
+
+func queryIntColumn(t *testing.T, db *sql.DB, query string) []int64 {
+	t.Helper()
+	rows, err := db.Query(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var result []int64
+	for rows.Next() {
+		var value int64
+		if err := rows.Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		result = append(result, value)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func queryProjectedRows(t *testing.T, db *sql.DB) []string {
+	t.Helper()
+	rows, err := db.Query(`SELECT id, grade, status_or_null FROM cuboa1_projected ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var result []string
+	for rows.Next() {
+		var id int64
+		var grade string
+		var statusOrNull sql.NullInt64
+		if err := rows.Scan(&id, &grade, &statusOrNull); err != nil {
+			t.Fatal(err)
+		}
+		result = append(result, fmt.Sprintf("%d|%s|%v", id, grade, statusOrNull))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
 // TestSystemDateFamilyRoundTripsEquivalent guards the ALTA fix from AUDIT5 §4.1.
 // Before the fix, a schema with a `date` column made `compat copy` ALWAYS fail
 // verification with ERR_VERIFY_DIVERGED: Postgres mapped DateType to native DATE,

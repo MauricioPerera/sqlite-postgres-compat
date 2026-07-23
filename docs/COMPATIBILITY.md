@@ -28,11 +28,19 @@
 
 El parser canónico (`compat/sqlparse.go`) reconoce un subconjunto deliberadamente acotado de SQL. Las expresiones, predicados `CHECK`, `WHERE` de índices parciales, condiciones de trigger y cuerpos de vista se traducen sólo dentro de esa gramática; todo lo demás se rechaza con error explícito en vez de aceptarse de forma silenciosa.
 
-Operadores por nivel de precedencia (de menor a mayor): `OR` · `AND` · `NOT` · `IS NULL`/`IS NOT NULL` · comparaciones (`<=`, `>=`, `<>`, `!=`, `=`, `<`, `>`, `LIKE`) · `||` (concatenación) · `+`/`-` · `*`/`/`. `NOT` se resuelve entre `AND` y las comparaciones, de modo que `NOT a = b` se parsea como `not(eq(a, b))`. La forma `a NOT LIKE b` se pliega a `not(like(a, b))`.
+Operadores por nivel de precedencia (de menor a mayor): `OR` · `AND` · `NOT` · `IS NULL`/`IS NOT NULL` · comparaciones (`<=`, `>=`, `<>`, `!=`, `=`, `<`, `>`, `LIKE`) y los predicados `BETWEEN`/`IN` (mismo nivel que las comparaciones) · `||` (concatenación) · `+`/`-` · `*`/`/`. `NOT` se resuelve entre `AND` y las comparaciones, de modo que `NOT a = b` se parsea como `not(eq(a, b))`. La forma `a NOT LIKE b` se pliega a `not(like(a, b))`.
 
 `LIKE` se compila a `ILIKE` en PostgreSQL para preservar la semántica de SQLite (insensible a mayúsculas/minúsculas en ASCII); es el mapeo pragmático estándar y se acepta como compromiso conocido (ILIKE pliega todo el rango Unicode, SQLite sólo ASCII).
 
-Funciones escalares admitidas (allowlist exacta): agregadas `count`, `sum`, `avg`, `min`, `max` (aceptan `*` o una expresión); de caja `lower`, `upper` (una expresión); `length`, `abs`, `trim` (una expresión); `coalesce` (al menos un argumento); `replace` (exactamente tres argumentos). Cualquier otra función se rechaza con `unsupported catalog function`.
+Predicados y expresiones condicionales admitidos:
+
+- `a BETWEEN x AND y` y `a NOT BETWEEN x AND y`: se compilan a `BETWEEN`/`NOT BETWEEN` nativo en ambos motores. La forma es inclusiva (`x <= a <= y`) e idéntica en SQLite y PostgreSQL; el `AND` delimitador del `BETWEEN` no divide el predicado al nivel del `AND` lógico.
+- `a IN (v1, v2, …)` y `a NOT IN (…)` sobre una **lista de valores explícita** (sin subconsultas, que quedan fuera de alcance). Se compilan a `IN`/`NOT IN` nativo; la semántica de pertenencia, incluida la lógica de tres valores con `NULL`, coincide en ambos motores. Una lista vacía o un elemento que no sea una expresión de la gramática se rechaza.
+- `CASE` con búsqueda (searched): `CASE WHEN cond THEN val [WHEN …] [ELSE val] END`. Se compila a `CASE` nativo en ambos motores, con evaluación por primera coincidencia idéntica. La forma simple con operando (`CASE x WHEN …`) se rechaza.
+
+Funciones escalares admitidas (allowlist exacta): agregadas `count`, `sum`, `avg`, `min`, `max` (aceptan `*` o una expresión); de caja `lower`, `upper` (una expresión); `length`, `abs`, `trim` (una expresión); `coalesce` (al menos un argumento); `nullif` (exactamente dos argumentos); `replace` (exactamente tres argumentos). Cualquier otra función se rechaza con `unsupported catalog function`.
+
+Funciones descartadas por divergencia entre motores (verificado contra PostgreSQL 17 real; evidencia en [reports/FEAT-CUBOA-1-REPORT.md](reports/FEAT-CUBOA-1-REPORT.md)): `round` (PostgreSQL redondea `double precision` half-to-even, SQLite half-away-from-zero), `substr` (índices y longitud negativos divergen: SQLite cuenta desde el final / recorta, PostgreSQL devuelve vacío o lanza error) y `cast(... AS integer)` (SQLite trunca hacia cero, PostgreSQL redondea). Se rechazan como cualquier otra función no incluida. `IS DISTINCT FROM` queda diferido (requiere gating de versión de SQLite ≥ 3.39).
 
 Literales admitidos: cadenas `'...'` (con `''` como escape), booleanos `TRUE`/`FALSE`, `NULL`, `CURRENT_TIMESTAMP`, enteros y decimales (`123`, `1.5`, `1e3`), y literales hexadecimales SQLite `0x10`/`0XABCDEF` convertidos a su valor decimal. Identificadores pueden cualificarse con `.` y citarse con `"..."`.
 

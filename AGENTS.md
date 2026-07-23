@@ -49,12 +49,26 @@ Parser: `compat/sqlparse.go` (`parseCatalogExpression`). Operator precedence, **
 2. `AND`
 3. `NOT` — handled between `AND` and the `IS NULL`/comparison levels, so `NOT a = b` parses as `not(eq(a, b))`, not `eq(not(a), b)`.
 4. `IS NULL` / `IS NOT NULL`
-5. comparisons: `<=`, `>=`, `<>`, `!=`, `=`, `<`, `>`, `LIKE`
+5. comparisons: `<=`, `>=`, `<>`, `!=`, `=`, `<`, `>`, `LIKE`; and the `BETWEEN` / `IN` predicates (same precedence as comparisons)
 6. `||` (concatenation)
 7. `+`, `-`
 8. `*`, `/` (tightest)
 
 Same-precedence binary operators associate to the left. The infix form `a NOT LIKE b` is folded into `not(like(a, b))`, matching the prefix form `NOT a LIKE b`.
+
+### Predicates and conditional expressions
+
+| Construct | AST kind | Args layout | Compiles to (both engines) |
+|---|---|---|---|
+| `a BETWEEN x AND y` | `between` | `[a, x, y]` | `(a BETWEEN x AND y)` |
+| `a NOT BETWEEN x AND y` | `not_between` | `[a, x, y]` | `(a NOT BETWEEN x AND y)` |
+| `a IN (v1, v2, …)` | `in` | `[a, v1, v2, …]` (≥1 value) | `(a IN (v1, v2, …))` |
+| `a NOT IN (v1, …)` | `not_in` | `[a, v1, …]` (≥1 value) | `(a NOT IN (v1, …))` |
+| `CASE WHEN c THEN v … [ELSE e] END` | `case` | `[c1, v1, c2, v2, …, (e)]` | `CASE WHEN c THEN v … [ELSE e] END` |
+
+- `BETWEEN` is inclusive (`x <= a <= y`); the delimiting `AND` is part of the predicate, not a logical `AND`. `NOT BETWEEN` negates it.
+- `IN`/`NOT IN` take an explicit **value list only** — subqueries are out of scope and rejected. Empty lists and non-value elements are rejected. Membership (including three-valued logic on `NULL`) is identical in both engines.
+- `CASE` is the **searched** form only. Args are `WHEN`/`THEN` pairs; an **odd** Args length means the trailing element is the `ELSE` value, an **even** length means there is no `ELSE`. The simple/operand form `CASE x WHEN v …` is rejected.
 
 ### Literals
 
@@ -76,9 +90,10 @@ Recognized by `parseCatalogExpression` and compiled by `compileExpression`:
 | `lower`, `upper` | one expression | |
 | `length`, `abs`, `trim` | one expression | |
 | `coalesce` | at least one argument | variadic |
+| `nullif` | exactly two arguments | returns `NULL` when the arguments are equal |
 | `replace` | exactly three arguments | |
 
-Every other function name is rejected with `unsupported catalog function %q`.
+Every other function name is rejected with `unsupported catalog function %q`. In particular `round`, `substr`/`substring` and `cast` are **deliberately excluded**: they are not byte-identical between SQLite and PostgreSQL (round: half-to-even vs half-away-from-zero on doubles; substr: negative index/length; cast to integer: round vs truncate). `IS DISTINCT FROM` is deferred (needs SQLite ≥ 3.39 version gating). See `docs/reports/FEAT-CUBOA-1-REPORT.md`.
 
 ### LIKE → ILIKE
 

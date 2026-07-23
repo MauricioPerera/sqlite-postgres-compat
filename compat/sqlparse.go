@@ -19,6 +19,15 @@ func parseCatalogExpression(input string) (Expression, error) {
 		return Expression{}, fmt.Errorf("empty expression")
 	}
 
+	// A searched CASE is a primary that spans from CASE to its matching END. It
+	// is detected before the binary-operator levels so a whole "CASE ... END"
+	// operand is treated as one unit; parseCatalogCase defers (ok=false) when the
+	// text merely starts with CASE but the matching END is not the final token,
+	// letting the operator splitters carve it out (e.g. "CASE ... END = 1").
+	if expression, ok, err := parseCatalogCase(text); ok {
+		return expression, err
+	}
+
 	levels := [][]catalogOperator{
 		{{"OR", "or"}},
 		{{"AND", "and"}},
@@ -67,6 +76,21 @@ func parseCatalogExpression(input string) (Expression, error) {
 				return Expression{Kind: "not", Args: []Expression{like}}, nil
 			}
 			return like, nil
+		}
+		// BETWEEN and IN sit at comparison precedence. They are attempted only
+		// after the comparison split above fails, so a bare comparison like
+		// "a = b" still splits normally, while "a BETWEEN x AND y" and
+		// "a IN (v, ...)" — which carry no top-level comparison symbol — are
+		// recognized here. The BETWEEN delimiter AND was protected from the AND
+		// level split by betweenDelimiterANDs, so the whole predicate reaches
+		// this point intact.
+		if index == 3 {
+			if expression, ok, err := parseCatalogBetween(text); ok {
+				return expression, err
+			}
+			if expression, ok, err := parseCatalogIn(text); ok {
+				return expression, err
+			}
 		}
 	}
 
@@ -130,6 +154,18 @@ func parseCatalogExpression(input string) (Expression, error) {
 				return Expression{}, fmt.Errorf("replace requires three arguments")
 			}
 			return Expression{Kind: "replace", Args: args}, nil
+		case "nullif":
+			// nullif(a, b) returns NULL when a = b, else a. It is standard and
+			// byte-identical in both engines (verified against real PostgreSQL in
+			// docs/reports/FEAT-CUBOA-1-REPORT.md).
+			args, err := parseFunctionArguments(argument)
+			if err != nil {
+				return Expression{}, err
+			}
+			if len(args) != 2 {
+				return Expression{}, fmt.Errorf("nullif requires two arguments")
+			}
+			return Expression{Kind: "nullif", Args: args}, nil
 		default:
 			return Expression{}, fmt.Errorf("unsupported catalog function %q", function)
 		}
@@ -212,6 +248,23 @@ type catalogOperator struct {
 }
 
 func splitCatalogOperator(text string, operators []catalogOperator) (string, catalogOperator, string, bool) {
+	// A searched CASE ... END is opaque to operator splitting: the WHEN/THEN
+	// bodies carry their own comparisons and AND/OR that must not be mistaken for
+	// top-level operators. mask marks every byte inside a top-level CASE ... END
+	// so those positions are skipped, the same way parenthesized and quoted
+	// regions already are.
+	mask := caseSpanMask(text)
+	// The AND that delimits a BETWEEN ("x BETWEEN lo AND hi") is syntactically an
+	// AND but must not split the predicate. When this level includes the logical
+	// AND operator, precompute which AND positions are BETWEEN delimiters so they
+	// can be skipped, leaving only genuine logical ANDs as split points.
+	var betweenANDs map[int]bool
+	for _, operator := range operators {
+		if operator.kind == "and" {
+			betweenANDs = betweenDelimiterANDs(text, mask)
+			break
+		}
+	}
 	depth := 0
 	inSingle := false
 	inDouble := false
@@ -238,7 +291,7 @@ func splitCatalogOperator(text string, operators []catalogOperator) (string, cat
 				depth--
 			}
 		}
-		if depth != 0 || inSingle || inDouble {
+		if depth != 0 || inSingle || inDouble || mask[i] {
 			continue
 		}
 		for _, operator := range operators {
@@ -247,6 +300,9 @@ func splitCatalogOperator(text string, operators []catalogOperator) (string, cat
 				continue
 			}
 			if catalogWordOperator(operator.token) && (!wordBoundary(text, start-1) || !wordBoundary(text, i+1)) {
+				continue
+			}
+			if operator.kind == "and" && betweenANDs[start] {
 				continue
 			}
 			left := strings.TrimSpace(text[:start])
@@ -535,4 +591,513 @@ func isHexDigit(character rune) bool {
 	return unicode.IsDigit(character) ||
 		(character >= 'a' && character <= 'f') ||
 		(character >= 'A' && character <= 'F')
+}
+
+// matchWordAt reports whether keyword (case-insensitive) starts at index i in
+// text as a standalone word, i.e. bounded by a non-identifier character (or the
+// string edge) on both sides. Keywords in this grammar are ASCII, so byte
+// indexing is safe.
+func matchWordAt(text string, i int, keyword string) bool {
+	n := len(keyword)
+	if i < 0 || i+n > len(text) {
+		return false
+	}
+	if !strings.EqualFold(text[i:i+n], keyword) {
+		return false
+	}
+	return wordBoundary(text, i-1) && wordBoundary(text, i+n)
+}
+
+// caseSpanMask returns a per-byte mask marking every character that lies inside
+// a top-level "CASE ... END" span (the CASE, the END, and everything between).
+// Spans are matched with nesting: an inner CASE ... END is absorbed by the
+// enclosing one, so the whole outer construct is masked as a single opaque unit.
+//
+// Only CASE keywords at parenthesis depth zero and outside quotes open a span,
+// and an END without a matching open CASE is ignored — so a column literally
+// named "end" (unquoted) does not spuriously mask surrounding operators. Callers
+// use the mask to keep the expression splitters from reaching inside a CASE.
+func caseSpanMask(text string) []bool {
+	mask := make([]bool, len(text))
+	depth := 0
+	inSingle, inDouble := false, false
+	var stack []int
+	for i := 0; i < len(text); i++ {
+		character := text[i]
+		if inSingle {
+			if character == '\'' {
+				if i+1 < len(text) && text[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if character == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		switch character {
+		case '\'':
+			inSingle = true
+			continue
+		case '"':
+			inDouble = true
+			continue
+		case '(':
+			depth++
+			continue
+		case ')':
+			depth--
+			continue
+		}
+		if depth != 0 {
+			continue
+		}
+		if matchWordAt(text, i, "CASE") {
+			stack = append(stack, i)
+			continue
+		}
+		if matchWordAt(text, i, "END") && len(stack) > 0 {
+			start := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if len(stack) == 0 {
+				for j := start; j < i+len("END"); j++ {
+					mask[j] = true
+				}
+			}
+		}
+	}
+	return mask
+}
+
+// betweenDelimiterANDs returns the set of start indices of the "AND" keywords
+// that delimit a BETWEEN ("x BETWEEN lo AND hi"), so the AND-level splitter can
+// skip them. A left-to-right scan at parenthesis depth zero (outside quotes and
+// outside CASE spans) pairs each BETWEEN with the next unpaired AND; because a
+// BETWEEN bound cannot contain a bare top-level AND, this pairing is exact.
+func betweenDelimiterANDs(text string, mask []bool) map[int]bool {
+	result := make(map[int]bool)
+	depth := 0
+	inSingle, inDouble := false, false
+	pending := 0
+	for i := 0; i < len(text); i++ {
+		character := text[i]
+		if inSingle {
+			if character == '\'' {
+				if i+1 < len(text) && text[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if character == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		switch character {
+		case '\'':
+			inSingle = true
+			continue
+		case '"':
+			inDouble = true
+			continue
+		case '(':
+			depth++
+			continue
+		case ')':
+			depth--
+			continue
+		}
+		if depth != 0 || (mask != nil && mask[i]) {
+			continue
+		}
+		if matchWordAt(text, i, "BETWEEN") {
+			pending++
+			continue
+		}
+		if matchWordAt(text, i, "AND") {
+			if pending > 0 {
+				result[i] = true
+				pending--
+			}
+		}
+	}
+	return result
+}
+
+// findCatalogKeyword returns the byte range [start, end) of the leftmost
+// standalone occurrence of keyword at parenthesis depth zero, outside quotes and
+// outside CASE spans. It underpins BETWEEN and IN detection.
+func findCatalogKeyword(text, keyword string, mask []bool) (start, end int, found bool) {
+	depth := 0
+	inSingle, inDouble := false, false
+	for i := 0; i < len(text); i++ {
+		character := text[i]
+		if inSingle {
+			if character == '\'' {
+				if i+1 < len(text) && text[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if character == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		switch character {
+		case '\'':
+			inSingle = true
+			continue
+		case '"':
+			inDouble = true
+			continue
+		case '(':
+			depth++
+			continue
+		case ')':
+			depth--
+			continue
+		}
+		if depth != 0 || (mask != nil && mask[i]) {
+			continue
+		}
+		if matchWordAt(text, i, keyword) {
+			return i, i + len(keyword), true
+		}
+	}
+	return 0, 0, false
+}
+
+// parseCatalogBetween recognizes "operand BETWEEN low AND high" and its negated
+// form "operand NOT BETWEEN low AND high". It returns ok=false when no top-level
+// BETWEEN is present so the caller can try the next rule. The construct compiles
+// to a native BETWEEN on both engines, which is inclusive and evaluated as
+// low <= operand <= high identically in SQLite and PostgreSQL.
+func parseCatalogBetween(text string) (Expression, bool, error) {
+	mask := caseSpanMask(text)
+	betweenStart, betweenEnd, ok := findCatalogKeyword(text, "BETWEEN", mask)
+	if !ok {
+		return Expression{}, false, nil
+	}
+	left := strings.TrimSpace(text[:betweenStart])
+	negated := false
+	if stripped, stripOK := stripTrailingNot(left); stripOK {
+		left = stripped
+		negated = true
+	}
+	if left == "" {
+		return Expression{}, true, fmt.Errorf("BETWEEN requires an operand")
+	}
+	rest := text[betweenEnd:]
+	restMask := caseSpanMask(rest)
+	andStart, andEnd, ok := findCatalogKeyword(rest, "AND", restMask)
+	if !ok {
+		return Expression{}, true, fmt.Errorf("BETWEEN requires an AND delimiter")
+	}
+	lowText := strings.TrimSpace(rest[:andStart])
+	highText := strings.TrimSpace(rest[andEnd:])
+	if lowText == "" || highText == "" {
+		return Expression{}, true, fmt.Errorf("BETWEEN requires low and high bounds")
+	}
+	operand, err := parseCatalogExpression(left)
+	if err != nil {
+		return Expression{}, true, err
+	}
+	low, err := parseCatalogExpression(lowText)
+	if err != nil {
+		return Expression{}, true, err
+	}
+	high, err := parseCatalogExpression(highText)
+	if err != nil {
+		return Expression{}, true, err
+	}
+	kind := "between"
+	if negated {
+		kind = "not_between"
+	}
+	return Expression{Kind: kind, Args: []Expression{operand, low, high}}, true, nil
+}
+
+// parseCatalogIn recognizes "operand IN (v1, v2, ...)" and "operand NOT IN
+// (...)" over an explicit value list. Subqueries are intentionally out of scope:
+// any non-value list element fails to parse and the whole predicate is rejected.
+// It compiles to a native IN list on both engines, whose membership semantics
+// (including three-valued logic on NULL) are identical in SQLite and PostgreSQL.
+func parseCatalogIn(text string) (Expression, bool, error) {
+	mask := caseSpanMask(text)
+	inStart, inEnd, ok := findCatalogKeyword(text, "IN", mask)
+	if !ok {
+		return Expression{}, false, nil
+	}
+	left := strings.TrimSpace(text[:inStart])
+	negated := false
+	if stripped, stripOK := stripTrailingNot(left); stripOK {
+		left = stripped
+		negated = true
+	}
+	if left == "" {
+		return Expression{}, true, fmt.Errorf("IN requires an operand")
+	}
+	rest := strings.TrimSpace(text[inEnd:])
+	if len(rest) < 2 || rest[0] != '(' || matchingParenthesis(rest, 0) != len(rest)-1 {
+		return Expression{}, true, fmt.Errorf("IN requires a parenthesized value list")
+	}
+	inner := strings.TrimSpace(rest[1 : len(rest)-1])
+	if inner == "" {
+		return Expression{}, true, fmt.Errorf("IN requires at least one value")
+	}
+	operand, err := parseCatalogExpression(left)
+	if err != nil {
+		return Expression{}, true, err
+	}
+	args := []Expression{operand}
+	for _, part := range splitTopLevelCommas(inner) {
+		value, err := parseCatalogExpression(part)
+		if err != nil {
+			return Expression{}, true, err
+		}
+		args = append(args, value)
+	}
+	kind := "in"
+	if negated {
+		kind = "not_in"
+	}
+	return Expression{Kind: kind, Args: args}, true, nil
+}
+
+// parseCatalogCase recognizes a searched CASE expression:
+//
+//	CASE WHEN cond THEN value [WHEN cond THEN value ...] [ELSE value] END
+//
+// The simple form "CASE operand WHEN value ..." is rejected: only the searched
+// form has identical evaluation in both engines without operand-type coercion
+// surprises. Args layout is [cond1, value1, cond2, value2, ..., (elseValue)];
+// an odd Args length means the trailing element is the ELSE value, an even
+// length means there is no ELSE. It compiles to a native CASE on both engines.
+//
+// ok=false is returned when text does not begin with CASE, or begins with CASE
+// but its matching END is not the final token (so a larger expression such as
+// "CASE ... END = 1" is left for the operator splitters to divide first).
+func parseCatalogCase(text string) (Expression, bool, error) {
+	if !matchWordAt(text, 0, "CASE") {
+		return Expression{}, false, nil
+	}
+	endStart, ok := matchingCaseEnd(text)
+	if !ok {
+		return Expression{}, true, fmt.Errorf("CASE has no matching END")
+	}
+	if strings.TrimSpace(text[endStart+len("END"):]) != "" {
+		// CASE is only a prefix of a larger expression; defer to the splitters.
+		return Expression{}, false, nil
+	}
+	interior := text[len("CASE"):endStart]
+	segments, ok := splitCaseSegments(interior)
+	if !ok {
+		return Expression{}, true, fmt.Errorf("CASE structure is outside the canonical grammar")
+	}
+	if segments.leading != "" {
+		return Expression{}, true, fmt.Errorf("simple CASE (operand form) is outside the canonical grammar")
+	}
+	if len(segments.whens) == 0 {
+		return Expression{}, true, fmt.Errorf("CASE requires at least one WHEN branch")
+	}
+	args := make([]Expression, 0, len(segments.whens)*2+1)
+	for _, branch := range segments.whens {
+		cond, err := parseCatalogExpression(branch.cond)
+		if err != nil {
+			return Expression{}, true, err
+		}
+		value, err := parseCatalogExpression(branch.value)
+		if err != nil {
+			return Expression{}, true, err
+		}
+		args = append(args, cond, value)
+	}
+	if segments.hasElse {
+		value, err := parseCatalogExpression(segments.elseValue)
+		if err != nil {
+			return Expression{}, true, err
+		}
+		args = append(args, value)
+	}
+	return Expression{Kind: "case", Args: args}, true, nil
+}
+
+// matchingCaseEnd returns the start index of the END that closes the CASE at
+// index 0, honouring nested CASE ... END, parentheses and quotes.
+func matchingCaseEnd(text string) (int, bool) {
+	depth := 0
+	inSingle, inDouble := false, false
+	caseDepth := 0
+	for i := 0; i < len(text); i++ {
+		character := text[i]
+		if inSingle {
+			if character == '\'' {
+				if i+1 < len(text) && text[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if character == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		switch character {
+		case '\'':
+			inSingle = true
+			continue
+		case '"':
+			inDouble = true
+			continue
+		case '(':
+			depth++
+			continue
+		case ')':
+			depth--
+			continue
+		}
+		if depth != 0 {
+			continue
+		}
+		if matchWordAt(text, i, "CASE") {
+			caseDepth++
+			continue
+		}
+		if matchWordAt(text, i, "END") {
+			caseDepth--
+			if caseDepth == 0 {
+				return i, true
+			}
+		}
+	}
+	return 0, false
+}
+
+type caseBranch struct {
+	cond  string
+	value string
+}
+
+type caseSegments struct {
+	leading   string // text between CASE and the first WHEN (must be empty: searched form)
+	whens     []caseBranch
+	hasElse   bool
+	elseValue string
+}
+
+// splitCaseSegments parses the interior of a CASE (the text between CASE and its
+// matching END) into WHEN/THEN branches and an optional ELSE, honouring nested
+// CASE spans, parentheses and quotes. It returns ok=false on any structural
+// violation (missing THEN, ELSE after ELSE, empty branch, trailing tokens).
+func splitCaseSegments(interior string) (caseSegments, bool) {
+	mask := caseSpanMask(interior)
+	// Collect the positions of this CASE's own WHEN/THEN/ELSE keywords.
+	type marker struct {
+		kw    string
+		start int
+		end   int
+	}
+	var markers []marker
+	depth := 0
+	inSingle, inDouble := false, false
+	for i := 0; i < len(interior); i++ {
+		character := interior[i]
+		if inSingle {
+			if character == '\'' {
+				if i+1 < len(interior) && interior[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if character == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		switch character {
+		case '\'':
+			inSingle = true
+			continue
+		case '"':
+			inDouble = true
+			continue
+		case '(':
+			depth++
+			continue
+		case ')':
+			depth--
+			continue
+		}
+		if depth != 0 || mask[i] {
+			continue
+		}
+		for _, kw := range []string{"WHEN", "THEN", "ELSE"} {
+			if matchWordAt(interior, i, kw) {
+				markers = append(markers, marker{kw: kw, start: i, end: i + len(kw)})
+				break
+			}
+		}
+	}
+	if len(markers) == 0 {
+		return caseSegments{}, false
+	}
+	result := caseSegments{leading: strings.TrimSpace(interior[:markers[0].start])}
+	// Walk the markers building WHEN/THEN pairs and an optional trailing ELSE.
+	i := 0
+	for i < len(markers) {
+		if markers[i].kw != "WHEN" {
+			return caseSegments{}, false
+		}
+		if i+1 >= len(markers) || markers[i+1].kw != "THEN" {
+			return caseSegments{}, false
+		}
+		cond := strings.TrimSpace(interior[markers[i].end:markers[i+1].start])
+		valueEnd := len(interior)
+		next := i + 2
+		if next < len(markers) {
+			valueEnd = markers[next].start
+		}
+		value := strings.TrimSpace(interior[markers[i+1].end:valueEnd])
+		if cond == "" || value == "" {
+			return caseSegments{}, false
+		}
+		result.whens = append(result.whens, caseBranch{cond: cond, value: value})
+		i = next
+		if i < len(markers) && markers[i].kw == "ELSE" {
+			elseEnd := len(interior)
+			if i+1 < len(markers) {
+				// Only one ELSE is allowed and it must be the final segment.
+				return caseSegments{}, false
+			}
+			result.hasElse = true
+			result.elseValue = strings.TrimSpace(interior[markers[i].end:elseEnd])
+			if result.elseValue == "" {
+				return caseSegments{}, false
+			}
+			i++
+		}
+	}
+	return result, true
 }

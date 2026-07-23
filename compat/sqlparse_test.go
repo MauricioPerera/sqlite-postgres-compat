@@ -210,6 +210,274 @@ func TestParseCatalogExpressionRejectsUnlistedFunction(t *testing.T) {
 	}
 }
 
+// TestParseCatalogExpressionBetween covers the searched BETWEEN / NOT BETWEEN
+// predicate (FEAT-CUBOA-1). The AND that delimits the bounds must not split the
+// predicate at the AND level, and the construct must compose with logical AND/OR
+// at the correct precedence.
+func TestParseCatalogExpressionBetween(t *testing.T) {
+	column := func(name string) Expression { return Expression{Kind: "column", Value: name} }
+	integer := func(v string) Expression { return Expression{Kind: "integer", Value: v} }
+
+	tests := []struct {
+		name  string
+		input string
+		want  Expression
+	}{
+		{
+			name:  "simple between",
+			input: "a BETWEEN 1 AND 10",
+			want:  Expression{Kind: "between", Args: []Expression{column("a"), integer("1"), integer("10")}},
+		},
+		{
+			name:  "not between",
+			input: "a NOT BETWEEN 1 AND 10",
+			want:  Expression{Kind: "not_between", Args: []Expression{column("a"), integer("1"), integer("10")}},
+		},
+		{
+			name:  "between with column bounds",
+			input: "price BETWEEN low AND high",
+			want:  Expression{Kind: "between", Args: []Expression{column("price"), column("low"), column("high")}},
+		},
+		{
+			name:  "between binds tighter than logical AND",
+			input: "price BETWEEN low AND high AND active = TRUE",
+			want: Expression{Kind: "and", Args: []Expression{
+				{Kind: "between", Args: []Expression{column("price"), column("low"), column("high")}},
+				{Kind: "eq", Args: []Expression{column("active"), {Kind: "boolean", Value: "true"}}},
+			}},
+		},
+		{
+			name:  "prefix NOT over between folds to not(between)",
+			input: "NOT a BETWEEN 1 AND 10",
+			want: Expression{Kind: "not", Args: []Expression{
+				{Kind: "between", Args: []Expression{column("a"), integer("1"), integer("10")}},
+			}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseCatalogExpression(test.input)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("got %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+// TestParseCatalogExpressionIn covers IN / NOT IN over an explicit value list
+// (FEAT-CUBOA-1). Subqueries and empty lists are rejected.
+func TestParseCatalogExpressionIn(t *testing.T) {
+	column := func(name string) Expression { return Expression{Kind: "column", Value: name} }
+	integer := func(v string) Expression { return Expression{Kind: "integer", Value: v} }
+	str := func(v string) Expression { return Expression{Kind: "string", Value: v} }
+
+	tests := []struct {
+		name  string
+		input string
+		want  Expression
+	}{
+		{
+			name:  "integer list",
+			input: "a IN (1, 2, 3)",
+			want:  Expression{Kind: "in", Args: []Expression{column("a"), integer("1"), integer("2"), integer("3")}},
+		},
+		{
+			name:  "not in string list",
+			input: "a NOT IN ('x', 'y')",
+			want:  Expression{Kind: "not_in", Args: []Expression{column("a"), str("x"), str("y")}},
+		},
+		{
+			name:  "single value list",
+			input: "a IN (1)",
+			want:  Expression{Kind: "in", Args: []Expression{column("a"), integer("1")}},
+		},
+		{
+			name:  "in composes with OR at comparison precedence",
+			input: "status IN (1, 2) OR active = TRUE",
+			want: Expression{Kind: "or", Args: []Expression{
+				{Kind: "in", Args: []Expression{column("status"), integer("1"), integer("2")}},
+				{Kind: "eq", Args: []Expression{column("active"), {Kind: "boolean", Value: "true"}}},
+			}},
+		},
+		{
+			name:  "list preserves string with comma",
+			input: "a IN ('x,y', 'z')",
+			want:  Expression{Kind: "in", Args: []Expression{column("a"), str("x,y"), str("z")}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseCatalogExpression(test.input)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("got %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestParseCatalogExpressionInRejects(t *testing.T) {
+	for _, in := range []string{
+		"a IN ()",
+		"a IN (SELECT id FROM t)",
+	} {
+		if _, err := parseCatalogExpression(in); err == nil {
+			t.Fatalf("expected %q to be rejected", in)
+		}
+	}
+}
+
+// TestParseCatalogExpressionCase covers the searched CASE form (FEAT-CUBOA-1).
+// Args layout is [cond1, value1, ..., condN, valueN, (elseValue)]; an odd length
+// carries a trailing ELSE. The simple (operand) form is rejected.
+func TestParseCatalogExpressionCase(t *testing.T) {
+	column := func(name string) Expression { return Expression{Kind: "column", Value: name} }
+	integer := func(v string) Expression { return Expression{Kind: "integer", Value: v} }
+	str := func(v string) Expression { return Expression{Kind: "string", Value: v} }
+
+	tests := []struct {
+		name  string
+		input string
+		want  Expression
+	}{
+		{
+			name:  "two branches with else",
+			input: "CASE WHEN a > 1 THEN 'big' WHEN a = 1 THEN 'one' ELSE 'small' END",
+			want: Expression{Kind: "case", Args: []Expression{
+				{Kind: "gt", Args: []Expression{column("a"), integer("1")}}, str("big"),
+				{Kind: "eq", Args: []Expression{column("a"), integer("1")}}, str("one"),
+				str("small"),
+			}},
+		},
+		{
+			name:  "single branch without else",
+			input: "CASE WHEN a > 1 THEN 'big' END",
+			want: Expression{Kind: "case", Args: []Expression{
+				{Kind: "gt", Args: []Expression{column("a"), integer("1")}}, str("big"),
+			}},
+		},
+		{
+			name:  "case as operand of a comparison",
+			input: "CASE WHEN t THEN 1 ELSE 0 END = 1",
+			want: Expression{Kind: "eq", Args: []Expression{
+				{Kind: "case", Args: []Expression{column("t"), integer("1"), integer("0")}},
+				integer("1"),
+			}},
+		},
+		{
+			name:  "between inside a case branch does not leak its AND",
+			input: "CASE WHEN x BETWEEN 1 AND 2 THEN 1 ELSE 0 END",
+			want: Expression{Kind: "case", Args: []Expression{
+				{Kind: "between", Args: []Expression{column("x"), integer("1"), integer("2")}}, integer("1"),
+				integer("0"),
+			}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseCatalogExpression(test.input)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("got %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestParseCatalogExpressionCaseRejects(t *testing.T) {
+	for _, in := range []string{
+		"CASE a WHEN 1 THEN 2 END",    // simple/operand form
+		"CASE WHEN a THEN 1 ELSE END", // empty ELSE
+		"CASE WHEN a THEN END",        // empty THEN value
+		"CASE WHEN a THEN 1",          // no END
+		"CASE END",                    // no WHEN branch
+	} {
+		if _, err := parseCatalogExpression(in); err == nil {
+			t.Fatalf("expected %q to be rejected", in)
+		}
+	}
+}
+
+// TestParseCatalogExpressionNullif covers nullif(a, b) (FEAT-CUBOA-1).
+func TestParseCatalogExpressionNullif(t *testing.T) {
+	column := func(name string) Expression { return Expression{Kind: "column", Value: name} }
+	got, err := parseCatalogExpression("nullif(a, b)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Expression{Kind: "nullif", Args: []Expression{column("a"), column("b")}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+	if _, err := parseCatalogExpression("nullif(a)"); err == nil {
+		t.Fatal("expected nullif with wrong arity to be rejected")
+	}
+	if _, err := parseCatalogExpression("nullif(a, b, c)"); err == nil {
+		t.Fatal("expected nullif with three arguments to be rejected")
+	}
+}
+
+// TestParseCatalogExpressionDiscardedFunctionsStayRejected locks in the
+// FEAT-CUBOA-1 honesty decision: round, substr and cast are NOT byte-identical
+// across SQLite and real PostgreSQL, so they must stay outside the grammar
+// rather than be accepted and silently diverge. Evidence (real PG 17) is in
+// docs/reports/FEAT-CUBOA-1-REPORT.md:
+//   - round(x): PG rounds double precision half-to-even, SQLite half-away-from-zero
+//     (round(2.5::float) = 2 on PG, 3 on SQLite).
+//   - substr(x, y): negative start diverges (SQLite counts from end, PG returns
+//     empty/full); negative length diverges (SQLite trims, PG errors).
+//   - cast(x AS integer): SQLite truncates toward zero, PG rounds
+//     (cast(3.7 AS integer) = 3 on SQLite, 4 on PG).
+func TestParseCatalogExpressionDiscardedFunctionsStayRejected(t *testing.T) {
+	for _, in := range []string{
+		"round(a)",
+		"round(a, 2)",
+		"substr(a, 1)",
+		"substr(a, 1, 2)",
+		"cast(a AS integer)",
+		"cast(a AS text)",
+	} {
+		if _, err := parseCatalogExpression(in); err == nil {
+			t.Fatalf("expected discarded construct %q to be rejected", in)
+		}
+	}
+}
+
+// TestParseCatalogExpressionColumnNamedLikeKeyword guards that an unquoted
+// identifier that merely contains a keyword substring, and a comparison whose
+// operand happens to be spelled like a bare keyword, are not mis-detected as the
+// BETWEEN/IN/CASE constructs.
+func TestParseCatalogExpressionColumnNamedLikeKeyword(t *testing.T) {
+	// "main" contains "in" but is a single identifier.
+	got, err := parseCatalogExpression("main = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Expression{Kind: "eq", Args: []Expression{{Kind: "column", Value: "main"}, {Kind: "integer", Value: "1"}}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+	// A quoted column named "end" must not open a CASE span.
+	got, err = parseCatalogExpression(`"end" = 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = Expression{Kind: "eq", Args: []Expression{{Kind: "column", Value: "end"}, {Kind: "integer", Value: "1"}}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+}
+
 func TestParsePostgresCatalogDefaultRemovesKnownLiteralCast(t *testing.T) {
 	got, err := parsePostgresCatalogDefault(`'new'::text`)
 	if err != nil {

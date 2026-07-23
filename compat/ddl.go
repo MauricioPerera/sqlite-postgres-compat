@@ -276,6 +276,21 @@ func compileExpressionIn(engine Engine, expression Expression, inTrigger bool) (
 		return compileUnaryExpression(engine, expression, inTrigger)
 	case "count", "sum", "avg", "min", "max", "lower", "upper", "length", "abs", "trim":
 		return compileScalarFunction(engine, expression, inTrigger)
+	case "between", "not_between":
+		return compileBetween(engine, expression, inTrigger)
+	case "in", "not_in":
+		return compileIn(engine, expression, inTrigger)
+	case "case":
+		return compileCase(engine, expression, inTrigger)
+	case "nullif":
+		if len(expression.Args) != 2 {
+			return "", fmt.Errorf("function %q requires two arguments", expression.Kind)
+		}
+		compiled, err := compileExpressionArgs(engine, expression.Args, inTrigger)
+		if err != nil {
+			return "", err
+		}
+		return "NULLIF(" + compiled[0] + ", " + compiled[1] + ")", nil
 	case "coalesce":
 		if len(expression.Args) < 1 {
 			return "", fmt.Errorf("function %q requires at least one argument", expression.Kind)
@@ -387,6 +402,76 @@ func compileScalarFunction(engine Engine, expression Expression, inTrigger bool)
 		return "", err
 	}
 	return strings.ToUpper(expression.Kind) + "(" + argument + ")", nil
+}
+
+// compileBetween compiles a BETWEEN / NOT BETWEEN predicate. Both engines
+// implement the SQL-standard, inclusive form (low <= operand <= high) with
+// identical evaluation, so the native operator is emitted on both rather than
+// desugaring to a pair of comparisons — the output stays close to the source
+// intent while remaining exactly equivalent. Args are [operand, low, high].
+func compileBetween(engine Engine, expression Expression, inTrigger bool) (string, error) {
+	if len(expression.Args) != 3 {
+		return "", fmt.Errorf("expression %q requires three arguments", expression.Kind)
+	}
+	compiled, err := compileExpressionArgs(engine, expression.Args, inTrigger)
+	if err != nil {
+		return "", err
+	}
+	operator := "BETWEEN"
+	if expression.Kind == "not_between" {
+		operator = "NOT BETWEEN"
+	}
+	return "(" + compiled[0] + " " + operator + " " + compiled[1] + " AND " + compiled[2] + ")", nil
+}
+
+// compileIn compiles an IN / NOT IN predicate over an explicit value list. The
+// membership test — including three-valued logic when a value or the operand is
+// NULL — is identical in SQLite and PostgreSQL. Args are [operand, v1, v2, ...]
+// with at least one value.
+func compileIn(engine Engine, expression Expression, inTrigger bool) (string, error) {
+	if len(expression.Args) < 2 {
+		return "", fmt.Errorf("expression %q requires an operand and at least one value", expression.Kind)
+	}
+	compiled, err := compileExpressionArgs(engine, expression.Args, inTrigger)
+	if err != nil {
+		return "", err
+	}
+	operator := "IN"
+	if expression.Kind == "not_in" {
+		operator = "NOT IN"
+	}
+	return "(" + compiled[0] + " " + operator + " (" + strings.Join(compiled[1:], ", ") + "))", nil
+}
+
+// compileCase compiles a searched CASE expression. Args are laid out as pairs
+// [cond1, value1, cond2, value2, ...] with an optional trailing ELSE value: an
+// odd Args length carries an ELSE, an even length does not. The native CASE
+// syntax and its first-match evaluation are identical in both engines. The
+// explicit END makes the construct self-delimiting, so no extra wrapping parens
+// are needed for correct precedence when it is nested in a larger expression.
+func compileCase(engine Engine, expression Expression, inTrigger bool) (string, error) {
+	if len(expression.Args) < 2 {
+		return "", fmt.Errorf("expression %q requires at least one WHEN/THEN pair", expression.Kind)
+	}
+	compiled, err := compileExpressionArgs(engine, expression.Args, inTrigger)
+	if err != nil {
+		return "", err
+	}
+	hasElse := len(compiled)%2 == 1
+	pairEnd := len(compiled)
+	if hasElse {
+		pairEnd--
+	}
+	var builder strings.Builder
+	builder.WriteString("CASE")
+	for i := 0; i < pairEnd; i += 2 {
+		builder.WriteString(" WHEN " + compiled[i] + " THEN " + compiled[i+1])
+	}
+	if hasElse {
+		builder.WriteString(" ELSE " + compiled[len(compiled)-1])
+	}
+	builder.WriteString(" END")
+	return builder.String(), nil
 }
 
 // compileExpressionArgs compiles each argument expression, returning the

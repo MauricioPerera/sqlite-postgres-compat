@@ -354,6 +354,103 @@ func TestCompileNotLikeForBothEngines(t *testing.T) {
 	}
 }
 
+// TestCompileBetweenInCaseNullifForBothEngines pins the exact SQL emitted for
+// the FEAT-CUBOA-1 constructs. Every construct compiles byte-identically for
+// SQLite and PostgreSQL (native operators/keywords whose semantics coincide in
+// both engines), so a single expected string is asserted for both.
+func TestCompileBetweenInCaseNullifForBothEngines(t *testing.T) {
+	column := func(name string) Expression { return Expression{Kind: "column", Value: name} }
+	integer := func(v string) Expression { return Expression{Kind: "integer", Value: v} }
+	str := func(v string) Expression { return Expression{Kind: "string", Value: v} }
+
+	tests := []struct {
+		name string
+		expr Expression
+		want string
+	}{
+		{
+			name: "between",
+			expr: Expression{Kind: "between", Args: []Expression{column("price"), integer("0"), integer("100")}},
+			want: `("price" BETWEEN 0 AND 100)`,
+		},
+		{
+			name: "not between",
+			expr: Expression{Kind: "not_between", Args: []Expression{column("price"), column("lo"), column("hi")}},
+			want: `("price" NOT BETWEEN "lo" AND "hi")`,
+		},
+		{
+			name: "in list",
+			expr: Expression{Kind: "in", Args: []Expression{column("status"), integer("1"), integer("2"), integer("3")}},
+			want: `("status" IN (1, 2, 3))`,
+		},
+		{
+			name: "not in list",
+			expr: Expression{Kind: "not_in", Args: []Expression{column("code"), str("x"), str("y")}},
+			want: `("code" NOT IN ('x', 'y'))`,
+		},
+		{
+			name: "case with else",
+			expr: Expression{Kind: "case", Args: []Expression{
+				{Kind: "gt", Args: []Expression{column("a"), integer("1")}}, str("big"),
+				{Kind: "eq", Args: []Expression{column("a"), integer("1")}}, str("one"),
+				str("small"),
+			}},
+			want: `CASE WHEN ("a" > 1) THEN 'big' WHEN ("a" = 1) THEN 'one' ELSE 'small' END`,
+		},
+		{
+			name: "case without else",
+			expr: Expression{Kind: "case", Args: []Expression{
+				{Kind: "gt", Args: []Expression{column("a"), integer("1")}}, str("big"),
+			}},
+			want: `CASE WHEN ("a" > 1) THEN 'big' END`,
+		},
+		{
+			name: "nullif",
+			expr: Expression{Kind: "nullif", Args: []Expression{column("a"), integer("0")}},
+			want: `NULLIF("a", 0)`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, engine := range []Engine{SQLite, Postgres} {
+				got, err := compileExpression(engine, test.expr)
+				if err != nil {
+					t.Fatalf("%s: %v", engine, err)
+				}
+				if got != test.want {
+					t.Fatalf("%s: got %q, want %q", engine, got, test.want)
+				}
+			}
+		})
+	}
+}
+
+// TestCompileInLikeUsesIlikeOnPostgres verifies that a LIKE nested inside one of
+// the new constructs still maps to ILIKE on PostgreSQL (the constructs reuse the
+// shared argument compiler, so the LIKE→ILIKE rule is inherited, not bypassed).
+func TestCompileInLikeInsideCaseKeepsIlikeMapping(t *testing.T) {
+	expr := Expression{Kind: "case", Args: []Expression{
+		{Kind: "like", Args: []Expression{{Kind: "column", Value: "code"}, {Kind: "string", Value: "x%"}}},
+		{Kind: "integer", Value: "1"},
+		{Kind: "integer", Value: "0"},
+	}}
+	sqlite, err := compileExpression(SQLite, expr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(sqlite, `("code" LIKE 'x%')`) {
+		t.Fatalf("sqlite must keep LIKE inside CASE: %s", sqlite)
+	}
+	postgres, err := compileExpression(Postgres, expr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(postgres, `("code" ILIKE 'x%')`) {
+		t.Fatalf("postgres must use ILIKE inside CASE: %s", postgres)
+	}
+}
+
 func TestSchemaRejectsIndexOnUnknownColumn(t *testing.T) {
 	schema := Schema{
 		Tables:  []Table{{Name: "products", Columns: []Column{{Name: "id", Type: Type{Family: IntegerType}}}}},
