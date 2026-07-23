@@ -1,16 +1,3 @@
-// compat-cutover runs a zero-window SQLite -> PostgreSQL cutover: it audits the
-// contract, installs change capture on the source, snapshots the source into the
-// destination, drains the overlapping change journal with the tolerant catch-up
-// policy, and verifies equivalence. It refuses plans that do not prove exact
-// equivalence.
-//
-// With --dry-run it executes only the read-only phases (parse config, audit
-// contract, connect both stores, count source rows per contract table, detect
-// whether the destination already holds those tables) and prints a plan JSON.
-// It never installs capture, creates tables, or writes a journal.
-//
-// Cutting the application's DSN over to the destination is NOT this tool's
-// responsibility and must be done manually once it prints status=ready.
 package main
 
 import (
@@ -25,6 +12,8 @@ import (
 	"example.com/sqlite-postgres-compat/compat"
 )
 
+// cutoverConfig is the JSON config for `compat cutover`: the two store DSNs, the
+// contract, exactly one of an inline schema or a schema_ref path, and options.
 type cutoverConfig struct {
 	SourceDSN      string          `json:"source_dsn"`
 	DestinationDSN string          `json:"destination_dsn"`
@@ -79,11 +68,23 @@ type planTable struct {
 // cutoverPhases is the fixed phase list a real cutover would run after the plan.
 var cutoverPhases = []string{"install_capture", "snapshot", "catch_up", "verify"}
 
-func main() {
-	present, positional := cliout.ParseArgsStrict([]string{"--dry-run"}, os.Args[1:], 1,
-		"uso: compat-cutover [--dry-run] <cutover.json>\nel corte del DSN de la aplicación no es responsabilidad de esta herramienta: cortá la conexión de la app manualmente tras recibir status=ready.",
-		"compat-cutover: unexpected flag %q",
-		"usage: compat-cutover [--dry-run] <cutover.json>")
+// runCutover implements `compat cutover [--dry-run] <cutover.json>`: a
+// zero-window SQLite -> PostgreSQL cutover. It is the exact behavior of the
+// former compat-cutover binary, with the message prefix changed from
+// "compat-cutover:" to "compat cutover:".
+//
+// With --dry-run it executes only the read-only phases (parse config, audit
+// contract, connect both stores, count source rows per contract table, detect
+// whether the destination already holds those tables) and prints a plan JSON.
+// It never installs capture, creates tables, or writes a journal.
+//
+// Cutting the application's DSN over to the destination is NOT this tool's
+// responsibility and must be done manually once it prints status=ready.
+func runCutover(args []string) {
+	present, positional := cliout.ParseArgsStrict([]string{"--dry-run"}, args, 1,
+		"uso: compat cutover [--dry-run] <cutover.json>\nel corte del DSN de la aplicación no es responsabilidad de esta herramienta: cortá la conexión de la app manualmente tras recibir status=ready.",
+		"compat cutover: unexpected flag %q",
+		"usage: compat cutover [--dry-run] <cutover.json>")
 	dryRun := present["--dry-run"]
 	var config cutoverConfig
 	if err := cliout.DecodeFileStrict(positional[0], &config); err != nil {
@@ -318,5 +319,5 @@ func drainChanges(ctx context.Context, source, destination *compat.Store, schema
 }
 
 func logf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "compat-cutover: "+format+"\n", args...)
+	fmt.Fprintf(os.Stderr, "compat cutover: "+format+"\n", args...)
 }

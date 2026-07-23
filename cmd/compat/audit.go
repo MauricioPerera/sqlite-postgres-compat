@@ -1,17 +1,19 @@
 package main
 
 import (
-	"os"
-
 	"example.com/sqlite-postgres-compat/cmd/internal/cliout"
 	"example.com/sqlite-postgres-compat/compat"
 )
 
-func main() {
-	_, positional := cliout.ParseArgsStrict(nil, os.Args[1:], 1,
-		"uso: compat-audit <contract.json>",
-		"compat-audit: unexpected flag %q",
-		"compat-audit requires exactly one contract JSON argument")
+// runAudit implements `compat audit <contract.json>`: it audits a Contract and
+// prints one Finding per required feature as a JSON array on stdout. It is the
+// exact behavior of the former compat-audit binary, with the message prefix
+// changed from "compat-audit:" to "compat audit:".
+func runAudit(args []string) {
+	_, positional := cliout.ParseArgsStrict(nil, args, 1,
+		"uso: compat audit <contract.json>",
+		"compat audit: unexpected flag %q",
+		"compat audit requires exactly one contract JSON argument")
 
 	var contract compat.Contract
 	if err := cliout.DecodeFileStrict(positional[0], &contract); err != nil {

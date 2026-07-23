@@ -173,9 +173,13 @@ The layer never silently degrades. These are rejected with explicit errors:
 - `Version{0,0,0}` as a source/destination version (invalid dedup key).
 - Trigger/routine actions outside the three canonical forms.
 
-## 8. CLIs
+## 8. CLI
 
-All CLIs take exactly one JSON config argument (`compat-cutover` accepts an optional `--dry-run` flag). Any argument that begins with `-` and is not a recognized flag (`--dry-run` for `compat-cutover`; none for `compat-audit`/`compat-copy`) is rejected as `ERR_USAGE` (exit 2) — it is never treated as the positional config path. Exit codes: `0` success; `1` any error or non-exact/non-equivalent result; `2` wrong argument count or an unexpected flag.
+A single `compat` binary dispatches three subcommands — `audit`, `copy`, `cutover` — that previously lived in three separate binaries (`compat-audit`, `compat-copy`, `compat-cutover`). Each subcommand preserves the observable behavior of its former binary byte-for-byte (same JSON envelopes, exit codes, streams, line order, findings/reports/dry-run plan) with one deliberate exception: the message prefixes changed from `compat-audit:` / `compat-copy:` / `compat-cutover:` to `compat audit:` / `compat copy:` / `compat cutover:`.
+
+Invoked with no subcommand, an unknown subcommand, or any `--help`-ish leading token, `compat` prints a shared usage hint to stderr and emits a typed `ERR_USAGE` JSON envelope to stdout, exiting 2 — the same style as each subcommand's own usage path.
+
+Each subcommand takes exactly one JSON config argument (`compat cutover` accepts an optional `--dry-run` flag, in any position after the subcommand). Any argument that begins with `-` and is not a recognized flag (`--dry-run` for `compat cutover`; none for `compat audit`/`compat copy`) is rejected as `ERR_USAGE` (exit 2) — it is never treated as the positional config path. Exit codes: `0` success; `1` any error or non-exact/non-equivalent result; `2` wrong argument count, an unexpected flag, or a missing/unknown subcommand.
 
 ### 8.1 Typed error protocol (machine-facing)
 
@@ -187,28 +191,28 @@ On any failure each CLI exits with its current code (`1`, or `2` for `ERR_USAGE`
 {"status":"error","code":"<CODE>","message":"<detalle>"}
 ```
 
-- **`compat-cutover` diverged.** `ERR_VERIFY_DIVERGED` emits exactly **one** JSON line on stdout — the `cutoverReport` with the typed `code` embedded (`{"status":"diverged","code":"ERR_VERIFY_DIVERGED",...}`). There is no separate `{"status":"error",...}` envelope on this path.
-- **`compat-copy` not-exact or diverged.** Before the simple error envelope on stdout, `compat-copy` emits a structured JSON payload to **stderr**: the `[]Finding` array on `ERR_AUDIT_NOT_EXACT`, or the `VerificationReport` object on `ERR_VERIFY_DIVERGED`. The plain error envelope still follows on stdout with the same `code`; an agent reads the structured detail from stderr and the typed code from stdout.
+- **`compat cutover` diverged.** `ERR_VERIFY_DIVERGED` emits exactly **one** JSON line on stdout — the `cutoverReport` with the typed `code` embedded (`{"status":"diverged","code":"ERR_VERIFY_DIVERGED",...}`). There is no separate `{"status":"error",...}` envelope on this path.
+- **`compat copy` not-exact or diverged.** Before the simple error envelope on stdout, `compat copy` emits a structured JSON payload to **stderr**: the `[]Finding` array on `ERR_AUDIT_NOT_EXACT`, or the `VerificationReport` object on `ERR_VERIFY_DIVERGED`. The plain error envelope still follows on stdout with the same `code`; an agent reads the structured detail from stderr and the typed code from stdout.
 
 Each envelope line is one parseable JSON object (the message is JSON-encoded, so embedded newlines never break it). An agent branches on `code`. The taxonomy is closed; the CLI picks the most specific applicable code. Free-text diagnostics also go to stderr for humans.
 
 | Code | Emitted when | Exit |
 |---|---|---|
-| `ERR_USAGE` | Wrong argument count (or an unexpected flag). | `2` |
+| `ERR_USAGE` | Wrong argument count, an unexpected flag, or a missing/unknown subcommand at the top level. | `2` |
 | `ERR_CONFIG` | The config file is unreadable, fails to decode, or `compat.Audit` rejects the contract (`Contract.Validate`). Every config is decoded with `json.Decoder.DisallowUnknownFields`, so an unknown key is an explicit error rather than a silently-dropped key; a `schema`/`schema_ref` violation (both, neither, or an unreadable/invalid `schema_ref` file) is also `ERR_CONFIG`. | `1` |
-| `ERR_AUDIT_NOT_EXACT` | A required (or inferred) feature is not `exact` (`RequireExact` fails). `compat-audit` emits its findings array to stdout, then this envelope; `compat-copy` and `compat-cutover` emit the findings array to stderr, then this envelope. | `1` |
+| `ERR_AUDIT_NOT_EXACT` | A required (or inferred) feature is not `exact` (`RequireExact` fails). `compat audit` emits its findings array to stdout, then this envelope; `compat copy` and `compat cutover` emit the findings array to stderr, then this envelope. | `1` |
 | `ERR_CONNECT_SOURCE` | The source store cannot be opened or pinged (`OpenStore`/`Ping` for the source). | `1` |
 | `ERR_CONNECT_DESTINATION` | The destination store cannot be opened or pinged (`OpenStore`/`Ping` for the destination). | `1` |
 | `ERR_SCHEMA` | `Schema.Validate` or `ApplySchema` fails. | `1` |
 | `ERR_SNAPSHOT` | `ExportSnapshot` or `ImportSnapshot` fails. | `1` |
 | `ERR_REPLICATION_CONFLICT` | A `compat.ConflictError` is raised while replaying the journal during catch-up (`ApplyChangesTolerant`). | `1` |
 | `ERR_CAPTURE` | `InstallChangeCapture` or `ReadCapturedChanges` fails. | `1` |
-| `ERR_VERIFY_DIVERGED` | Verification digests differ (`VerifySnapshots` → `Equivalent == false`). `compat-cutover` emits one JSON line — its `diverged` result with this `code` embedded (no separate envelope). `compat-copy` emits its `VerificationReport` to stderr, then the error envelope with this `code`. | `1` |
+| `ERR_VERIFY_DIVERGED` | Verification digests differ (`VerifySnapshots` → `Equivalent == false`). `compat cutover` emits one JSON line — its `diverged` result with this `code` embedded (no separate envelope). `compat copy` emits its `VerificationReport` to stderr, then the error envelope with this `code`. | `1` |
 | `ERR_INTERNAL` | Any failure not covered above (e.g. `VerifySnapshots` returns an error, encoding fails, context cancellation). | `1` |
 
-Errors are classified by **phase heuristic** (which step of the flow failed) plus `errors.As` against the existing exported `compat.ConflictError`; the public `compat/` API is not extended. `compat-copy` maps a non-equivalent `VerificationReport` to `ERR_VERIFY_DIVERGED`.
+Errors are classified by **phase heuristic** (which step of the flow failed) plus `errors.As` against the existing exported `compat.ConflictError`; the public `compat/` API is not extended. `compat copy` maps a non-equivalent `VerificationReport` to `ERR_VERIFY_DIVERGED`.
 
-### `compat-audit <contract.json>`
+### `compat audit <contract.json>`
 
 Audits a `Contract` (`{source, destination, required_features}`) and prints one `Finding` per required feature as a JSON array on stdout.
 
@@ -222,7 +226,7 @@ Audits a `Contract` (`{source, destination, required_features}`) and prints one 
 - Exit `1`: any feature is not `exact`. The findings array is still printed to stdout first, followed by a typed `{"status":"error","code":"ERR_AUDIT_NOT_EXACT",...}` line; the failing reason is also printed to stderr. Any read/parse/audit error prints `ERR_CONFIG` instead.
 - Exit `2`: argument count is not 1 (`ERR_USAGE`).
 
-### `compat-copy <migration.json>`
+### `compat copy <migration.json>`
 
 Config: `{source_dsn, destination_dsn, contract, schema | schema_ref}`. Exactly one of `schema` (an inline `compat.Schema`) or `schema_ref` (a path to a JSON file holding a bare `compat.Schema` object, resolved **relative to the config file**, not the cwd) is required; both or neither is `ERR_CONFIG`, and an unreadable or JSON-invalid `schema_ref` file is `ERR_CONFIG`. Infers features from the schema (`InferFeatures`), audits, requires exact, then exports the source snapshot, imports it into the destination, re-exports the destination, and verifies digests. Prints a `VerificationReport` on stdout:
 
@@ -234,7 +238,7 @@ Config: `{source_dsn, destination_dsn, contract, schema | schema_ref}`. Exactly 
 - Exit `1`: any typed error (see 8.1). On `ERR_AUDIT_NOT_EXACT` the `[]Finding` array is printed to stderr before the envelope; on `ERR_VERIFY_DIVERGED` (digests differ) the `VerificationReport` is printed to stderr before the envelope, so the digests are recoverable as JSON rather than only as free text in the message.
 - Exit `2`: wrong argument count (`ERR_USAGE`). The destination must be empty for the described objects (import is additive).
 
-### `compat-cutover <cutover.json>`
+### `compat cutover <cutover.json>`
 
 Config: `{source_dsn, destination_dsn, contract, schema | schema_ref, options}`. Exactly one of `schema` (inline `compat.Schema`) or `schema_ref` (a path to a JSON file holding a bare `compat.Schema` object, resolved **relative to the config file**, not the cwd) is required; both or neither is `ERR_CONFIG`, and an unreadable or JSON-invalid `schema_ref` file is `ERR_CONFIG`. `options` is optional with defaults `poll_interval_ms=1000`, `drain_polls=3`, `batch_limit=500`. Orchestrates a zero-window SQLite → PostgreSQL cutover: audit → install change capture on source → export+import snapshot → drain the journal with `ApplyChangesTolerant` until `drain_polls` consecutive empty reads → verify digests. Prints a `cutoverReport` on stdout and progress lines on stderr:
 
@@ -253,7 +257,7 @@ The `diverged` report carries the typed code inline:
 {"status":"diverged","code":"ERR_VERIFY_DIVERGED","source_digest":"...","destination_digest":"...","changes_applied":N}
 ```
 
-#### `compat-cutover --dry-run <cutover.json>`
+#### `compat cutover --dry-run <cutover.json>`
 
 Runs only the read-only phases: parse config, audit the contract (refusing non-exact with `ERR_AUDIT_NOT_EXACT`), connect and ping both stores (`ERR_CONNECT_SOURCE`/`ERR_CONNECT_DESTINATION`), count source rows per contract table, and detect whether the destination already holds those tables. It prints a plan JSON on stdout and exits `0`:
 
@@ -275,13 +279,13 @@ Runs only the read-only phases: parse config, audit the contract (refusing non-e
 
 A migration is a sequence of auditable verdicts. Each phase produces a machine-checkable result.
 
-1. **Audit** — `compat-audit contract.json` (or the audit step inside `compat-copy`/`compat-cutover`, which appends `InferFeatures(schema)` to `required_features`).
+1. **Audit** — `compat audit contract.json` (or the audit step inside `compat copy`/`compat cutover`, which appends `InferFeatures(schema)` to `required_features`).
    - Verdict: every finding `status=exact` (exit `0`). Any `unknown`/`unsupported`/`transformed`/`emulated` stops the migration (exit `1`).
 2. **Move** — choose one:
-   - Offline snapshot copy: `compat-copy migration.json`.
-   - Zero-window cutover: `compat-cutover cutover.json`.
+   - Offline snapshot copy: `compat copy migration.json`.
+   - Zero-window cutover: `compat cutover cutover.json`.
    - Verdict (copy): `VerificationReport.equivalent == true` (exit `0`). Verdict (cutover): `cutoverReport.status == "ready"` (exit `0`).
-3. **Verify** — `compat-copy`/`compat-cutover` verify internally (digest comparison via `VerifySnapshots`). Programmatic callers can re-verify at any time with `compat.VerifySnapshots(source, destination)`, expecting `Equivalent == true` and equal `SourceDigest`/`DestinationDigest`.
+3. **Verify** — `compat copy`/`compat cutover` verify internally (digest comparison via `VerifySnapshots`). Programmatic callers can re-verify at any time with `compat.VerifySnapshots(source, destination)`, expecting `Equivalent == true` and equal `SourceDigest`/`DestinationDigest`.
 
 A canonical schema that contains a `vector` column infers `canonical_vectors`; one with views/triggers/routines/indexes infers the corresponding `canonical_*` features. Generic families (`foreign_keys`, `check_constraints`, `indexes`, `views`, `triggers`, `stored_routines`, `full_text`) remain `unknown` because they represent arbitrary native SQL and are not audited as exact.
 

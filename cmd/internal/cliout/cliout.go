@@ -129,7 +129,7 @@ func EmitJSON(v any) error {
 // letting an unknown flag fall through to the positional config path.
 //
 // present holds the recognized flags that were seen (empty when knownFlags is
-// empty, e.g. for compat-audit/compat-copy). positional holds the non-flag
+// empty, e.g. for the audit/copy subcommands). positional holds the non-flag
 // tokens in order; the caller still validates the expected count.
 func SplitArgs(knownFlags []string, args []string) (present map[string]bool, positional []string, unexpected string, ok bool) {
 	known := make(map[string]bool, len(knownFlags))

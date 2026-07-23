@@ -45,7 +45,7 @@ Usa TLS y un usuario con privilegios mínimos en producción. Las pruebas E2E so
 7. Persiste un cursor independiente para cada origen.
 8. Inicia la replicación incremental.
 
-No ejecutes `compat-copy` repetidamente sobre las mismas tablas: la importación no reemplaza ni elimina objetos existentes.
+No ejecutes `compat copy` repetidamente sobre las mismas tablas: la importación no reemplaza ni elimina objetos existentes.
 
 ## Cursores y entrega
 

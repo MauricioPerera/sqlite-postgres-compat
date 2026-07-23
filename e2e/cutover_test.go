@@ -28,7 +28,7 @@ func cutoverSchema(name string) compat.Schema {
 	}}}
 }
 
-// TestCutoverCLIEndToEnd drives the compat-cutover CLI as a subprocess: a SQLite
+// TestCutoverCLIEndToEnd drives the compat cutover CLI as a subprocess: a SQLite
 // source with data is cut over to a temporary PostgreSQL database, the process
 // exits 0 with status=ready, and the migrated data is verified equivalent.
 func TestCutoverCLIEndToEnd(t *testing.T) {
@@ -73,13 +73,13 @@ func TestCutoverCLIEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	command := exec.Command("go", "run", "./cmd/compat-cutover", configPath)
+	command := exec.Command("go", "run", "./cmd/compat", "cutover", configPath)
 	command.Dir = ".."
 	var stderr strings.Builder
 	command.Stderr = &stderr
 	stdout, err := command.Output()
 	if err != nil {
-		t.Fatalf("compat-cutover failed: %v\nstderr:\n%s", err, stderr.String())
+		t.Fatalf("compat cutover failed: %v\nstderr:\n%s", err, stderr.String())
 	}
 	output := stdout
 	var report struct {
@@ -89,7 +89,7 @@ func TestCutoverCLIEndToEnd(t *testing.T) {
 		ChangesApplied    int    `json:"changes_applied"`
 	}
 	if err := json.Unmarshal(output, &report); err != nil {
-		t.Fatalf("invalid compat-cutover output %q: %v", output, err)
+		t.Fatalf("invalid compat cutover output %q: %v", output, err)
 	}
 	if report.Status != "ready" {
 		t.Fatalf("expected status=ready, got %+v\n%s", report, output)
@@ -334,7 +334,7 @@ func firstErrorJSONLine(t *testing.T, stdout string) map[string]any {
 	return nil
 }
 
-// TestDryRunCLISuccessPlan drives compat-cutover --dry-run against a real
+// TestDryRunCLISuccessPlan drives compat cutover --dry-run against a real
 // PostgreSQL destination: it exits 0 with a plan JSON carrying the correct
 // source row counts and destination_has_tables=false, and it writes NOTHING to
 // either store (no capture triggers, no journal, no destination tables).
@@ -377,7 +377,7 @@ func TestDryRunCLISuccessPlan(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stdout, stderr, exitCode := runCLI(t, "./cmd/compat-cutover", "--dry-run", configPath)
+	stdout, stderr, exitCode := runCLI(t, "./cmd/compat", "cutover", "--dry-run", configPath)
 	if exitCode != 0 {
 		t.Fatalf("expected exit 0, got %d\nstderr:\n%s\nstdout:\n%s", exitCode, stderr, stdout)
 	}
@@ -453,7 +453,7 @@ func TestDryRunCLIInvalidConfigError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stdout, _, exitCode := runCLI(t, "./cmd/compat-cutover", "--dry-run", configPath)
+	stdout, _, exitCode := runCLI(t, "./cmd/compat", "cutover", "--dry-run", configPath)
 	if exitCode != 1 {
 		t.Fatalf("expected exit 1 for invalid config, got %d\nstdout:\n%s", exitCode, stdout)
 	}
@@ -506,7 +506,7 @@ func TestDryRunCLIUnreachableDestinationError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stdout, _, exitCode := runCLI(t, "./cmd/compat-cutover", "--dry-run", configPath)
+	stdout, _, exitCode := runCLI(t, "./cmd/compat", "cutover", "--dry-run", configPath)
 	if exitCode != 1 {
 		t.Fatalf("expected exit 1 for unreachable destination, got %d\nstdout:\n%s", exitCode, stdout)
 	}
@@ -530,10 +530,10 @@ func TestDryRunCLIUnreachableDestinationError(t *testing.T) {
 	}
 }
 
-// TestAuditCLIErrorCodeOnNotExact verifies that compat-audit emits a
+// TestAuditCLIErrorCodeOnNotExact verifies that compat audit emits a
 // typed ERR_AUDIT_NOT_EXACT error JSON (in addition to its findings array) and
-// exits 1 when a required feature is not exact. It drives ./cmd/compat-audit
-// (not compat-cutover) and needs no PostgreSQL.
+// exits 1 when a required feature is not exact. It drives ./cmd/compat audit
+// (not compat cutover) and needs no PostgreSQL.
 func TestAuditCLIErrorCodeOnNotExact(t *testing.T) {
 	contract := map[string]any{
 		"source":            map[string]any{"engine": "sqlite", "version": map[string]any{"major": 3, "minor": 45, "patch": 0}},
@@ -549,7 +549,7 @@ func TestAuditCLIErrorCodeOnNotExact(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stdout, _, exitCode := runCLI(t, "./cmd/compat-audit", contractPath)
+	stdout, _, exitCode := runCLI(t, "./cmd/compat", "audit", contractPath)
 	if exitCode != 1 {
 		t.Fatalf("expected exit 1 for non-exact audit, got %d\nstdout:\n%s", exitCode, stdout)
 	}
@@ -609,7 +609,7 @@ func builtCLI(t *testing.T, pkg string) string {
 	return p.(string)
 }
 
-// runBuiltCLI builds pkg (e.g. "cmd/compat-cutover") and runs the resulting binary
+// runBuiltCLI builds pkg (e.g. "cmd/compat") and runs the resulting binary
 // with args, returning stdout, stderr and the real process exit code.
 func runBuiltCLI(t *testing.T, pkg string, args ...string) (stdout, stderr string, exitCode int) {
 	t.Helper()
@@ -631,26 +631,56 @@ func runBuiltCLI(t *testing.T, pkg string, args ...string) (stdout, stderr strin
 
 // TestCLIRejectsUnknownFlagAsUsage verifies that an unrecognized flag (a token
 // starting with "-" that is not a known flag like --dry-run) is reported as
-// ERR_USAGE with exit 2 across all three CLIs, instead of being treated as the
-// positional config path (the prior ERR_CONFIG/exit-1 behavior).
+// ERR_USAGE with exit 2 across all three subcommands, instead of being treated
+// as the positional config path (the prior ERR_CONFIG/exit-1 behavior). The
+// unified binary takes the subcommand as its first argument, so each case
+// prefixes the subcommand before the offending flag.
 func TestCLIRejectsUnknownFlagAsUsage(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		pkg  string
 		args []string
 	}{
-		{"cutover", "cmd/compat-cutover", []string{"--bogus", "x.json"}},
-		{"copy", "cmd/compat-copy", []string{"--bogus", "x.json"}},
-		{"audit", "cmd/compat-audit", []string{"--bogus", "x.json"}},
+		{"cutover", []string{"cutover", "--bogus", "x.json"}},
+		{"copy", []string{"copy", "--bogus", "x.json"}},
+		{"audit", []string{"audit", "--bogus", "x.json"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			stdout, _, exitCode := runBuiltCLI(t, tc.pkg, tc.args...)
+			stdout, _, exitCode := runBuiltCLI(t, "cmd/compat", tc.args...)
 			if exitCode != 2 {
 				t.Fatalf("expected exit 2 for unknown flag, got %d\nstdout:\n%s", exitCode, stdout)
 			}
 			parsed := firstErrorJSONLine(t, stdout)
 			if code, _ := parsed["code"].(string); code != "ERR_USAGE" {
 				t.Fatalf("expected code=ERR_USAGE, got %v\nstdout:\n%s", parsed["code"], stdout)
+			}
+		})
+	}
+}
+
+// TestCLIDispatchUsage verifies the unified binary's top-level dispatch: invoked
+// with no subcommand, an unknown subcommand, or a --help-ish leading token, it
+// emits the shared usage hint to stderr and a typed ERR_USAGE envelope to stdout,
+// exiting 2 — never treating the token as a positional config path.
+func TestCLIDispatchUsage(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"no-subcommand", []string{}},
+		{"unknown-subcommand", []string{"bogus", "x.json"}},
+		{"help-ish-flag", []string{"--help"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, stderr, exitCode := runBuiltCLI(t, "cmd/compat", tc.args...)
+			if exitCode != 2 {
+				t.Fatalf("expected exit 2 for %s, got %d\nstdout:\n%s", tc.name, exitCode, stdout)
+			}
+			parsed := firstErrorJSONLine(t, stdout)
+			if code, _ := parsed["code"].(string); code != "ERR_USAGE" {
+				t.Fatalf("expected code=ERR_USAGE, got %v\nstdout:\n%s", parsed["code"], stdout)
+			}
+			if !strings.Contains(stderr, "subcomandos") {
+				t.Fatalf("expected usage hint listing subcommands on stderr, got %q", stderr)
 			}
 		})
 	}
@@ -692,7 +722,7 @@ func TestCutoverRejectsUnknownConfigKey(t *testing.T) {
 	}
 	configPath := writeCutoverConfig(t, dir, "cutover.json", config)
 
-	stdout, _, exitCode := runBuiltCLI(t, "cmd/compat-cutover", configPath)
+	stdout, _, exitCode := runBuiltCLI(t, "cmd/compat", "cutover", configPath)
 	if exitCode != 1 {
 		t.Fatalf("expected exit 1 for unknown config key, got %d\nstdout:\n%s", exitCode, stdout)
 	}
@@ -724,7 +754,7 @@ func TestCutoverRejectsSchemaAndSchemaRef(t *testing.T) {
 	}
 	configPath := writeCutoverConfig(t, dir, "cutover.json", config)
 
-	stdout, _, exitCode := runBuiltCLI(t, "cmd/compat-cutover", configPath)
+	stdout, _, exitCode := runBuiltCLI(t, "cmd/compat", "cutover", configPath)
 	if exitCode != 1 {
 		t.Fatalf("expected exit 1 for schema + schema_ref, got %d\nstdout:\n%s", exitCode, stdout)
 	}
@@ -746,7 +776,7 @@ func TestCutoverRejectsMissingSchemaAndSchemaRef(t *testing.T) {
 	}
 	configPath := writeCutoverConfig(t, dir, "cutover.json", config)
 
-	stdout, _, exitCode := runBuiltCLI(t, "cmd/compat-cutover", configPath)
+	stdout, _, exitCode := runBuiltCLI(t, "cmd/compat", "cutover", configPath)
 	if exitCode != 1 {
 		t.Fatalf("expected exit 1 for missing schema/schema_ref, got %d\nstdout:\n%s", exitCode, stdout)
 	}
@@ -805,7 +835,7 @@ func TestCutoverWithSchemaRefSucceeds(t *testing.T) {
 	}
 	configPath := writeCutoverConfig(t, dir, "cutover.json", config)
 
-	stdout, stderr, exitCode := runBuiltCLI(t, "cmd/compat-cutover", configPath)
+	stdout, stderr, exitCode := runBuiltCLI(t, "cmd/compat", "cutover", configPath)
 	if exitCode != 0 {
 		t.Fatalf("expected exit 0, got %d\nstderr:\n%s\nstdout:\n%s", exitCode, stderr, stdout)
 	}

@@ -163,18 +163,18 @@ func TestSystemCompatCopyCLIEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	command := exec.Command("go", "run", "./cmd/compat-copy", configPath)
+	command := exec.Command("go", "run", "./cmd/compat", "copy", configPath)
 	command.Dir = ".."
 	output, err := command.CombinedOutput()
 	if err != nil {
-		t.Fatalf("compat-copy failed: %v\n%s", err, output)
+		t.Fatalf("compat copy failed: %v\n%s", err, output)
 	}
 	var report compat.VerificationReport
 	if err := json.Unmarshal(output, &report); err != nil {
-		t.Fatalf("invalid compat-copy output %q: %v", output, err)
+		t.Fatalf("invalid compat copy output %q: %v", output, err)
 	}
 	if !report.Equivalent {
-		t.Fatalf("compat-copy reported non-equivalent snapshots: %+v", report)
+		t.Fatalf("compat copy reported non-equivalent snapshots: %+v", report)
 	}
 
 	postgres := openPostgres(t)
