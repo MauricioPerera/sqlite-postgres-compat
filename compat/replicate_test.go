@@ -449,6 +449,163 @@ func TestApplyChangesPreservesArbitraryPrecisionDecimal(t *testing.T) {
 	}
 }
 
+// TestApplyChangesPreservesArbitraryPrecisionDecimalEndToEnd is the ALTA-1
+// definition-of-done test: a DECIMAL stored as TEXT (the canonical DDL mapping,
+// ddl.go) must survive the full capture -> journal -> apply -> verify chain
+// byte-for-byte. The former isCompactFloatText heuristic rewrote ≤17-digit text
+// that merely looked like a float, corrupting values that are not the round-trip
+// representation of any float64 and degrading scale, and VerifySnapshots could not
+// catch it because both sides canonized through the same lossy path. Each input is
+// INSERTed verbatim into the source, captured, applied to the destination, read
+// back, and compared byte-for-byte; the snapshots must also verify equivalent.
+func TestApplyChangesPreservesArbitraryPrecisionDecimalEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	// The four PM inputs plus the scale/leading-zero cases. Every one of these was
+	// corrupted or reformatted by the old heuristic; none is the round-trip repr of
+	// a float64 (so a verbatim-passthrough fix must leave each untouched).
+	inputs := []string{
+		"0.10000000000000001",
+		"1.50",
+		"123456789012345.67",
+		"99999999999999999",
+		"007",
+		"0.10",
+	}
+
+	source, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	destination, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destination.Close()
+
+	schema := decimalTestSchema("decimal_fidelity_items")
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := destination.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	// Capture is installed on the source so the trigger fires on the INSERT and
+	// journals the row through the typeof-gated CAST path (typeof='text' here, so
+	// verbatim, with no realDecimalMarker).
+	if err := source.InstallChangeCapture(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, want := range inputs {
+		if _, err := source.DB.ExecContext(ctx,
+			`INSERT INTO decimal_fidelity_items (id, amount) VALUES (?, ?)`, i+1, want); err != nil {
+			t.Fatal(err)
+		}
+	}
+	changes, err := source.ReadCapturedChanges(ctx, schema, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != len(inputs) {
+		t.Fatalf("expected %d captured changes, got %d", len(inputs), len(changes))
+	}
+	// The captured after-state must already carry the exact text, proving the
+	// corruption was not merely hidden until apply.
+	for i, want := range inputs {
+		if got := changes[i].After["amount"].Value; got != want {
+			t.Fatalf("captured amount for input %q was already altered: want %q, got %q", want, want, got)
+		}
+	}
+	if err := destination.ApplyChanges(ctx, schema, changes); err != nil {
+		t.Fatalf("arbitrary-precision decimal replication must apply: %v", err)
+	}
+
+	// Read each destination row back as raw TEXT and compare byte-for-byte.
+	for i, want := range inputs {
+		var got string
+		if err := destination.DB.QueryRowContext(ctx,
+			`SELECT amount FROM decimal_fidelity_items WHERE id = ?`, i+1).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("input %q was not preserved byte-identical end-to-end: want %q, got %q", want, want, got)
+		}
+	}
+
+	// VerifySnapshots must report the snapshots equivalent (both sides now carry
+	// the same exact text), and the digests must actually reflect the distinct
+	// values rather than collapsing them through the old lossy path.
+	sourceSnapshot, err := source.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationSnapshot, err := destination.ExportSnapshot(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := VerifySnapshots(sourceSnapshot, destinationSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Equivalent {
+		t.Fatalf("snapshots must be equivalent for byte-identical decimals: %+v", report)
+	}
+	for i, want := range inputs {
+		if got := destinationSnapshot.Rows["decimal_fidelity_items"][i]["amount"].Value; got != want {
+			t.Fatalf("destination snapshot for input %q diverged: want %q, got %q", want, want, got)
+		}
+	}
+}
+
+// TestApplyChangesInsertDuplicateRaisesConflictError guards BAJA-3: in strict
+// (non-tolerant) mode an Insert whose primary key already exists must surface as
+// a typed ConflictError naming the table and primary key, not as the raw driver
+// uniqueness violation. It remains a hard error: the row is not modified and the
+// transaction rolls back.
+func TestApplyChangesInsertDuplicateRaisesConflictError(t *testing.T) {
+	ctx := context.Background()
+	schema := replicationTestSchema("insert_conflict_items")
+	store, err := OpenSQLite(Version{Major: 3}, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB.Exec(`INSERT INTO insert_conflict_items (id, title) VALUES (1, 'local')`); err != nil {
+		t.Fatal(err)
+	}
+	change := Change{
+		Source:     Target{Engine: Postgres, Version: Version{Major: 17}},
+		Sequence:   1,
+		Kind:       Insert,
+		Table:      "insert_conflict_items",
+		PrimaryKey: Row{"id": {Kind: IntegerValue, Value: "1"}},
+		After:      Row{"id": {Kind: IntegerValue, Value: "1"}, "title": {Kind: TextValue, Value: "remote"}},
+	}
+	err = store.ApplyChanges(ctx, schema, []Change{change})
+	var conflict *ConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("expected ConflictError for duplicate insert, got %v", err)
+	}
+	if conflict.Table != "insert_conflict_items" {
+		t.Fatalf("conflict table mismatch: want insert_conflict_items, got %q", conflict.Table)
+	}
+	if conflict.PrimaryKey["id"].Value != "1" {
+		t.Fatalf("conflict primary key mismatch: want 1, got %q", conflict.PrimaryKey["id"].Value)
+	}
+	// The strict semantics are preserved: the row is unchanged.
+	var title string
+	if err := store.DB.QueryRow(`SELECT title FROM insert_conflict_items WHERE id = 1`).Scan(&title); err != nil {
+		t.Fatal(err)
+	}
+	if title != "local" {
+		t.Fatalf("duplicate insert must not modify the existing row: want local, got %q", title)
+	}
+}
+
 // TestApplyChangesTolerantSkipsInsertAlreadyPresent covers the overlap window
 // where an insert journaled after capture-install already traveled inside the
 // snapshot: the row exists and equals the change's after state, so the tolerant

@@ -2,6 +2,7 @@ package compat
 
 import (
 	"context"
+	"math"
 	"strings"
 	"testing"
 )
@@ -182,16 +183,40 @@ func TestCanonicalFloatNormalization(t *testing.T) {
 	}
 }
 
+// TestCanonicalFloatRejectsInfNaN guards BAJA-2: the FloatType branch must
+// reject non-finite values with a clear error instead of canonicalizing them to
+// "+Inf"/"NaN", mirroring the finiteness gate the DecimalType branch keeps and
+// how the rest of the layer refuses impossible values. Both the textual forms a
+// driver/trigger may emit and the Go float64 shapes are rejected.
+func TestCanonicalFloatRejectsInfNaN(t *testing.T) {
+	for _, in := range []any{"inf", "+inf", "-inf", "Inf", "nan", "NaN", float64(math.Inf(1)), float64(math.Inf(-1)), math.NaN()} {
+		if _, err := canonicalValue(FloatType, in); err == nil {
+			t.Fatalf("expected error for non-finite float %v, got nil", in)
+		}
+	}
+	// A finite float still canonicalizes normally.
+	got, err := canonicalValue(FloatType, "1.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Value != "1.5" {
+		t.Fatalf("finite float must still canonicalize: want 1.5, got %q", got.Value)
+	}
+}
+
 func TestCanonicalDecimalReconcilesFloatStorage(t *testing.T) {
 	// A DECIMAL value that SQLite stored as REAL surfaces two ways: as a Go
 	// float64 from the destination driver, and as the capture trigger's
-	// printf('%!.17g') text. canonicalValue must map both to one shortest form so
-	// rowsEqual does not raise a spurious ConflictError.
+	// realDecimalMarker-prefixed printf('%!.17g') text. canonicalValue must map
+	// both to one shortest form so rowsEqual does not raise a spurious
+	// ConflictError. The marker prefix is what distinguishes a REAL-journaled
+	// value from an arbitrary-precision TEXT decimal (which is preserved verbatim
+	// — see TestCanonicalDecimalPreservesArbitraryPrecisionText).
 	fromFloat, err := canonicalValue(DecimalType, 1.2345678901234567e+14)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fromText, err := canonicalValue(DecimalType, "123456789012345.67")
+	fromText, err := canonicalValue(DecimalType, realDecimalMarker+"123456789012345.67")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,9 +242,10 @@ func TestCanonicalDecimalReconcilesFloatStorage(t *testing.T) {
 	}
 
 	// A high-magnitude decimal that SQLite would render with a rounded CAST
-	// ("99999999999999.984") is reconciled to the same form as the driver float64,
-	// not left as a divergent raw string.
-	fromRounded, err := canonicalValue(DecimalType, "99999999999999.984")
+	// ("99999999999999.984") is reconciled to the same form as the driver float64
+	// when it arrives as REAL-stored (marker-prefixed) capture text, not left as a
+	// divergent raw string.
+	fromRounded, err := canonicalValue(DecimalType, realDecimalMarker+"99999999999999.984")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,6 +264,44 @@ func TestCanonicalDecimalReconcilesFloatStorage(t *testing.T) {
 	}
 	if integer.Value != "1234567890123456789" {
 		t.Fatalf("integer-valued decimal must be preserved, got %q", integer.Value)
+	}
+}
+
+// TestCanonicalDecimalPreservesArbitraryPrecisionText guards the ALTA-1 fix: an
+// arbitrary-precision DECIMAL stored as TEXT (the canonical DDL mapping) must
+// pass through canonicalValue byte-for-byte. The former isCompactFloatText
+// heuristic rewrote any ≤17-significant-digit text that looked like a float,
+// corrupting values that are not the round-trip representation of any float64
+// (value change "0.10000000000000001" -> "0.1"), dropping scale ("1.50" -> "1.5"),
+// and changing repr ("123456789012345.67" -> "1.2345678901234567e+14"). Only
+// REAL-stored values (Go float64, or marker-prefixed capture text) are reconciled.
+func TestCanonicalDecimalPreservesArbitraryPrecisionText(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"seventeen-digit non-round-trip", "0.10000000000000001"},
+		{"scale-bearing", "1.50"},
+		{"seventeen-digit magnitude", "123456789012345.67"},
+		{"seventeen-nines integer", "99999999999999999"},
+		{"leading zeros", "007"},
+		{"trailing zero scale", "0.10"},
+		{"thirty-eight-digit", "12345678901234567890.123456789012345678"},
+		{"round-trip float text stays equal", "0.1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := canonicalValue(DecimalType, tc.in)
+			if err != nil {
+				t.Fatalf("canonicalValue(DecimalType, %q): %v", tc.in, err)
+			}
+			if got.Value != tc.in {
+				t.Fatalf("TEXT-stored decimal was altered: want %q, got %q", tc.in, got.Value)
+			}
+			if got.Kind != DecimalValue {
+				t.Fatalf("unexpected kind %q for %q", got.Kind, tc.in)
+			}
+		})
 	}
 }
 

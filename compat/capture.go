@@ -12,6 +12,22 @@ import (
 
 const changeJournalTable = "__compat_change_journal"
 
+// realDecimalMarker prefixes a DECIMAL value that the SQLite capture trigger
+// journaled from REAL storage (typeof(col) = 'real'). The trigger emits the
+// round-trip printf('%!.17g') form ONLY on that branch and prepends this
+// sentinel; every other branch (TEXT/INTEGER storage, and Postgres, whose
+// numeric/float8 text already round-trips) emits the raw CAST verbatim with no
+// marker. This lets canonicalValue distinguish a genuine float64 storage
+// representation — which must be reconciled through normalizeFloat so a
+// REAL-stored DECIMAL does not raise a spurious ConflictError — from an
+// arbitrary-precision TEXT decimal, which must be preserved byte-for-byte.
+//
+// The marker begins with a control byte (SOH, \x01) that no legitimate decimal
+// text can start with — decimal numbers begin with a digit, sign, or dot — so a
+// TEXT-stored value never collides with it. It is a reserved internal sentinel
+// of the capture layer, not valid user data in a DECIMAL column.
+const realDecimalMarker = "\x01real"
+
 // InstallChangeCapture installs engine-native triggers which journal every
 // committed row mutation in canonical, ordered form.
 func (store *Store) InstallChangeCapture(ctx context.Context, schema Schema) error {
@@ -162,13 +178,15 @@ func captureJSONExpression(engine Engine, alias string, columns []Column) string
 			// fractional values as REAL, so CAST(col AS TEXT) truncates to ~15
 			// significant digits while the destination driver reconstructs the full
 			// float64, raising a spurious ConflictError. Emit the round-trip
-			// 17-significant-digit form ONLY when the storage is REAL (typeof(col) =
-			// 'real'); arbitrary-precision values stored as TEXT or INTEGER pass
-			// through CAST verbatim, preserving every digit (e.g. a 38-digit
-			// decimal). PostgreSQL NUMERIC preserves arbitrary precision in CAST, so
-			// no special-casing is needed there.
+			// printf('%!.17g') form ONLY when the storage is REAL (typeof(col) =
+			// 'real') and prefix it with the reserved realDecimalMarker so
+			// canonicalValue can tell a REAL-stored value apart from an
+			// arbitrary-precision TEXT decimal; arbitrary-precision values stored as
+			// TEXT or INTEGER pass through CAST verbatim, preserving every digit
+			// (e.g. a 38-digit decimal). PostgreSQL NUMERIC preserves arbitrary
+			// precision in CAST, so no special-casing is needed there.
 			if engine == SQLite {
-				encoded = "CASE typeof(" + value + ") WHEN 'real' THEN printf('%!.17g', " + value + ") ELSE CAST(" + value + " AS TEXT) END"
+				encoded = "CASE typeof(" + value + ") WHEN 'real' THEN " + sqlString(realDecimalMarker) + " || printf('%!.17g', " + value + ") ELSE CAST(" + value + " AS TEXT) END"
 			}
 		}
 		arguments = append(arguments, "CASE WHEN "+value+" IS NULL THEN NULL ELSE "+encoded+" END")

@@ -201,7 +201,20 @@ func applyChange(ctx context.Context, tx *sql.Tx, engine Engine, table Table, ch
 				return &ConflictError{Table: table.Name, PrimaryKey: change.PrimaryKey, Expected: change.After, Actual: actual}
 			}
 		}
-		return insertRow(ctx, tx, engine, table, change.After)
+		// Strict mode inserts directly: a row whose primary key already exists
+		// trips a raw driver uniqueness violation, which is opaque to callers.
+		// Wrap that case as a typed ConflictError naming the table and primary key
+		// (and the divergent rows when the collision is observable) so it can be
+		// distinguished from other driver errors; it remains a hard error, so the
+		// strict semantics are preserved. Any other insert failure is surfaced as-is.
+		if err := insertRow(ctx, tx, engine, table, change.After); err != nil {
+			actual, found, lookupErr := loadRow(ctx, tx, engine, table, change.PrimaryKey)
+			if lookupErr == nil && found {
+				return &ConflictError{Table: table.Name, PrimaryKey: change.PrimaryKey, Expected: change.After, Actual: actual}
+			}
+			return err
+		}
+		return nil
 	case Update, Delete:
 		actual, found, err := loadRow(ctx, tx, engine, table, change.PrimaryKey)
 		if err != nil {

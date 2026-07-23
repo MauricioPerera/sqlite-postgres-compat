@@ -166,9 +166,11 @@ func TestCompileCaptureTriggersUsesTransactionLocalGUCOnPostgres(t *testing.T) {
 // lossless capture encoding for FLOAT and REAL-stored DECIMAL columns. SQLite's
 // CAST(REAL AS TEXT) truncates to ~15 significant digits, so the journal must
 // emit the 17-significant-digit round-trip form via printf('%!.17g'). DECIMAL
-// columns gate that on typeof(col) = 'real' so arbitrary-precision TEXT and
-// INTEGER storage still pass through CAST verbatim. Postgres must keep the
-// plain CAST, since its float8/numeric text already round-trips.
+// columns gate that on typeof(col) = 'real' AND prefix the printf output with the
+// reserved realDecimalMarker so canonicalValue can tell a REAL-stored value from
+// an arbitrary-precision TEXT decimal (which still passes through CAST verbatim).
+// Postgres must keep the plain CAST, since its float8/numeric text already
+// round-trips.
 func TestCompileCaptureTriggersUsesRoundTripFloatEncodingOnSQLite(t *testing.T) {
 	schema := Schema{Tables: []Table{{
 		Name: "encoding_items",
@@ -188,8 +190,12 @@ func TestCompileCaptureTriggersUsesRoundTripFloatEncodingOnSQLite(t *testing.T) 
 	if !strings.Contains(sqliteJoined, "printf('%!.17g', ") {
 		t.Fatalf("sqlite capture trigger must encode floats with printf('%%!.17g'):\n%s", sqliteJoined)
 	}
-	if !strings.Contains(sqliteJoined, "CASE typeof(") || !strings.Contains(sqliteJoined, "WHEN 'real' THEN printf('%!.17g', ") {
-		t.Fatalf("sqlite capture trigger must gate decimal printf on typeof 'real':\n%s", sqliteJoined)
+	// The DECIMAL branch emits the marker-prefixed printf form ONLY for REAL
+	// storage; the typeof gate and the realDecimalMarker prefix are both required
+	// so canonicalValue reconciles REAL storage without rewriting TEXT decimals.
+	realBranch := "WHEN 'real' THEN " + sqlString(realDecimalMarker) + " || printf('%!.17g', "
+	if !strings.Contains(sqliteJoined, "CASE typeof(") || !strings.Contains(sqliteJoined, realBranch) {
+		t.Fatalf("sqlite capture trigger must gate decimal printf on typeof 'real' with the marker prefix:\n%s", sqliteJoined)
 	}
 
 	postgresJoined := strings.Join(compileCaptureTriggers(Postgres, schema.Tables[0], primary), "\n")
