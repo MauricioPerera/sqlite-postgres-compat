@@ -565,3 +565,47 @@ func TestParseCatalogSelectCTEOverCompound(t *testing.T) {
 		t.Fatalf("expected a CTE over a union compound, got %+v", got)
 	}
 }
+
+// TestParseCatalogSelectRejectsSelfReferentialCTE freezes AUDIT10 M2: a
+// non-recursive CTE that names itself in its own body (with a real base table of
+// the same name) parses and compiles byte-identically but diverges at runtime —
+// SQLite errors "circular reference", PostgreSQL binds the inner name to the base
+// table and returns rows. The parser rejects it by the self-reference property,
+// closing the gap the RECURSIVE-keyword guard cannot see.
+func TestParseCatalogSelectRejectsSelfReferentialCTE(t *testing.T) {
+	_, err := parseCatalogSelect(`WITH t AS (SELECT id FROM t) SELECT id FROM t`)
+	if err == nil {
+		t.Fatal("expected rejection for self-referential CTE, got nil")
+	}
+	if !strings.Contains(err.Error(), "self-referential") || !strings.Contains(err.Error(), "RECURSIVE") {
+		t.Fatalf("expected a self-referential CTE rejection, got %q", err.Error())
+	}
+}
+
+// TestParseCatalogSelectRejectsSelfReferentialCTEInJoin confirms the self-
+// reference is caught whether the CTE names itself in FROM or in a JOIN.
+func TestParseCatalogSelectRejectsSelfReferentialCTEInJoin(t *testing.T) {
+	_, err := parseCatalogSelect(`WITH t AS (SELECT s.id FROM s INNER JOIN t ON t.id = s.id) SELECT id FROM t`)
+	if err == nil {
+		t.Fatal("expected rejection for self-referential CTE in JOIN, got nil")
+	}
+	if !strings.Contains(err.Error(), "self-referential") {
+		t.Fatalf("expected a self-referential CTE rejection, got %q", err.Error())
+	}
+}
+
+// TestParseCatalogSelectAcceptsSiblingCTEReference is the M2 non-regression
+// guard: a second CTE referencing the *first* (a legitimate, non-recursive
+// pattern) must still parse. Only a CTE referencing its own name is rejected.
+func TestParseCatalogSelectAcceptsSiblingCTEReference(t *testing.T) {
+	got, err := parseCatalogSelect(`WITH a AS (SELECT id FROM products), b AS (SELECT id FROM a) SELECT id FROM b`)
+	if err != nil {
+		t.Fatalf("sibling CTE reference must still parse: %v", err)
+	}
+	if len(got.With) != 2 || got.With[0].Name != "a" || got.With[1].Name != "b" {
+		t.Fatalf("expected CTEs a and b, got %+v", got.With)
+	}
+	if got.With[1].Query.From.Table != "a" {
+		t.Fatalf("second CTE should read from the first: %+v", got.With[1].Query)
+	}
+}

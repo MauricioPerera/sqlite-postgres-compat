@@ -884,6 +884,31 @@ func TestCompileCTEForBothEngines(t *testing.T) {
 	}
 }
 
+// TestCompileRejectsSelfReferentialCTE freezes the compile-time (hand-built AST)
+// half of the M2 guard: a CommonTableExpr whose body reads from its own name is
+// rejected before any DDL is emitted, on both engines, mirroring the parser guard
+// so a self-referential CTE can never reach a database however it was built.
+func TestCompileRejectsSelfReferentialCTE(t *testing.T) {
+	query := SelectQuery{
+		With: []CommonTableExpr{{
+			Name: "t",
+			Query: SelectQuery{
+				Columns: []Projection{{Expression: Expression{Kind: "column", Value: "id"}}},
+				From:    TableSource{Table: "t"},
+			},
+		}},
+		Columns: []Projection{{Expression: Expression{Kind: "column", Value: "id"}}},
+		From:    TableSource{Table: "t"},
+	}
+	for _, engine := range []Engine{SQLite, Postgres} {
+		if _, err := compileSelect(engine, query); err == nil {
+			t.Fatalf("%s: expected self-referential CTE to be rejected", engine)
+		} else if !strings.Contains(err.Error(), "self-referential") {
+			t.Fatalf("%s: unexpected error %q", engine, err.Error())
+		}
+	}
+}
+
 // TestCompileMultipleCTEsForBothEngines freezes a two-CTE clause feeding a joined
 // main query, confirming the comma-separated WITH list and the join both compile.
 func TestCompileMultipleCTEsForBothEngines(t *testing.T) {

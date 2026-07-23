@@ -317,3 +317,155 @@ func TestValidReferentialActionRejectsUnknownActions(t *testing.T) {
 		})
 	}
 }
+
+// genRandomUUIDCheckSchema builds a table carrying a CHECK constraint whose
+// predicate embeds the non-deterministic gen_random_uuid() node, the exact
+// AUDIT10 M1 case. is_not_null(gen_random_uuid()) mirrors the reported DDL both
+// engines accept unguarded.
+func genRandomUUIDCheckSchema() Schema {
+	return Schema{Tables: []Table{{
+		Name: "audit10_check",
+		Columns: []Column{
+			{Name: "id", Type: Type{Family: UUIDType}},
+		},
+		Constraints: []Constraint{{
+			Kind: Check,
+			Expression: &Expression{Kind: "is_not_null", Args: []Expression{
+				{Kind: "gen_random_uuid"},
+			}},
+		}},
+	}}}
+}
+
+// TestSchemaValidateRejectsGenRandomUUIDInCheck freezes M1: a CHECK constraint
+// containing gen_random_uuid() is rejected by Schema.Validate (engine-agnostic),
+// so CompileDDL refuses it for both SQLite and PostgreSQL before any DDL is
+// emitted. gen_random_uuid() is non-deterministic; a CHECK re-evaluates its
+// predicate per row on each engine independently, which would silently accept or
+// reject the same row differently between SQLite and PostgreSQL.
+func TestSchemaValidateRejectsGenRandomUUIDInCheck(t *testing.T) {
+	schema := genRandomUUIDCheckSchema()
+	if err := schema.Validate(); err == nil {
+		t.Fatal("expected gen_random_uuid in CHECK to be rejected")
+	} else if !strings.Contains(err.Error(), "gen_random_uuid") || !strings.Contains(err.Error(), "CHECK") {
+		t.Fatalf("unexpected error %q", err.Error())
+	}
+	for _, target := range []Target{
+		{Engine: SQLite, Version: Version{Major: 3}},
+		{Engine: Postgres, Version: Version{Major: 17}},
+	} {
+		if _, err := CompileDDL(target, schema); err == nil {
+			t.Fatalf("%s: expected CompileDDL to reject gen_random_uuid in CHECK", target.Engine)
+		} else if !strings.Contains(err.Error(), "gen_random_uuid") {
+			t.Fatalf("%s: unexpected error %q", target.Engine, err.Error())
+		}
+	}
+}
+
+// TestSchemaValidateRejectsGenRandomUUIDNestedInCheck confirms the guard walks
+// the whole expression tree, not just the top node: gen_random_uuid() buried in a
+// comparison is still caught.
+func TestSchemaValidateRejectsGenRandomUUIDNestedInCheck(t *testing.T) {
+	schema := Schema{Tables: []Table{{
+		Name: "audit10_check_nested",
+		Columns: []Column{
+			{Name: "id", Type: Type{Family: UUIDType}},
+		},
+		Constraints: []Constraint{{
+			Kind: Check,
+			Expression: &Expression{Kind: "lt", Args: []Expression{
+				{Kind: "gen_random_uuid"},
+				{Kind: "string", Value: "8000"},
+			}},
+		}},
+	}}}
+	if err := schema.Validate(); err == nil {
+		t.Fatal("expected nested gen_random_uuid in CHECK to be rejected")
+	} else if !strings.Contains(err.Error(), "gen_random_uuid") {
+		t.Fatalf("unexpected error %q", err.Error())
+	}
+}
+
+// TestSchemaValidateRejectsGenRandomUUIDInDomainCheck confirms a domain CHECK is
+// guarded on the same footing as a table CHECK: both compile through the same
+// per-row compileExpression path, so both must keep out the non-deterministic
+// node.
+func TestSchemaValidateRejectsGenRandomUUIDInDomainCheck(t *testing.T) {
+	schema := Schema{
+		Domains: []Domain{{
+			Name: "audit10_dom",
+			Type: Type{Family: UUIDType},
+			Check: &Expression{Kind: "is_not_null", Args: []Expression{
+				{Kind: "gen_random_uuid"},
+			}},
+		}},
+	}
+	if err := schema.Validate(); err == nil {
+		t.Fatal("expected gen_random_uuid in domain CHECK to be rejected")
+	} else if !strings.Contains(err.Error(), "gen_random_uuid") {
+		t.Fatalf("unexpected error %q", err.Error())
+	}
+}
+
+// TestSchemaValidateAcceptsGenRandomUUIDInDefault is the M1 non-regression guard:
+// a column DEFAULT of gen_random_uuid() (the sanctioned context) still validates
+// and compiles for both engines. Only CHECK is newly restricted.
+func TestSchemaValidateAcceptsGenRandomUUIDInDefault(t *testing.T) {
+	schema := Schema{Tables: []Table{{
+		Name: "audit10_default",
+		Columns: []Column{
+			{Name: "id", Type: Type{Family: UUIDType}, Default: &Expression{Kind: "gen_random_uuid"}},
+		},
+	}}}
+	if err := schema.Validate(); err != nil {
+		t.Fatalf("column DEFAULT gen_random_uuid must still validate: %v", err)
+	}
+	for _, target := range []Target{
+		{Engine: SQLite, Version: Version{Major: 3}},
+		{Engine: Postgres, Version: Version{Major: 17}},
+	} {
+		if _, err := CompileDDL(target, schema); err != nil {
+			t.Fatalf("%s: column DEFAULT gen_random_uuid must still compile: %v", target.Engine, err)
+		}
+	}
+}
+
+// TestSchemaValidateAcceptsGenRandomUUIDInTriggerAction is the second M1
+// non-regression guard: a trigger action that inserts gen_random_uuid() (the
+// other sanctioned context) still validates and compiles for both engines.
+func TestSchemaValidateAcceptsGenRandomUUIDInTriggerAction(t *testing.T) {
+	schema := Schema{
+		Tables: []Table{{
+			Name: "audit10_trig",
+			Columns: []Column{
+				{Name: "id", Type: Type{Family: UUIDType}},
+				{Name: "n", Type: Type{Family: IntegerType}, Nullable: true},
+			},
+		}},
+		Triggers: []Trigger{{
+			Name:   "audit10_trig_ins",
+			Table:  "audit10_trig",
+			Timing: "before",
+			Event:  "insert",
+			Actions: []TriggerAction{{
+				Kind:  "insert",
+				Table: "audit10_trig",
+				Assignments: []Assignment{
+					{Column: "id", Value: Expression{Kind: "gen_random_uuid"}},
+					{Column: "n", Value: Expression{Kind: "integer", Value: "1"}},
+				},
+			}},
+		}},
+	}
+	if err := schema.Validate(); err != nil {
+		t.Fatalf("trigger-action gen_random_uuid must still validate: %v", err)
+	}
+	for _, target := range []Target{
+		{Engine: SQLite, Version: Version{Major: 3}},
+		{Engine: Postgres, Version: Version{Major: 17}},
+	} {
+		if _, err := CompileDDL(target, schema); err != nil {
+			t.Fatalf("%s: trigger-action gen_random_uuid must still compile: %v", target.Engine, err)
+		}
+	}
+}

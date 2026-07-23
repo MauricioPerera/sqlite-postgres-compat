@@ -326,6 +326,15 @@ func stripCatalogWith(text string) ([]CommonTableExpr, string, error) {
 		if err != nil {
 			return nil, "", err
 		}
+		if cteQueryReferencesName(query, name) {
+			// A non-recursive CTE that names itself in its own body is not modeled.
+			// The RECURSIVE guard above catches the keyword; this catches the
+			// property. Without RECURSIVE the two engines diverge at runtime on the
+			// same DDL: SQLite errors ("circular reference"), PostgreSQL binds the
+			// inner name to a real base table of the same name and returns rows.
+			// Rejecting it here keeps that divergent view from ever compiling.
+			return nil, "", fmt.Errorf("self-referential CTE %q requires RECURSIVE, which is outside the canonical grammar", name)
+		}
 		ctes = append(ctes, CommonTableExpr{Name: name, Query: query})
 		tail := strings.TrimSpace(body[close+1:])
 		if strings.HasPrefix(tail, ",") {
@@ -719,6 +728,54 @@ func parseCatalogFrom(text string) (TableSource, []Join, error) {
 		joins = append(joins, join)
 	}
 	return base, joins, nil
+}
+
+// cteQueryReferencesName reports whether a CTE's own body references the CTE's
+// own name as a table source, which would make it self-referential (recursive in
+// fact) without the RECURSIVE keyword. A CTE legitimately referencing a *previous*
+// sibling CTE is not caught: this only inspects a query for references to the one
+// name passed in (the CTE's own name).
+//
+// Inner shadowing is respected: if a nested scope rebinds name via its own WITH,
+// references to name inside that scope resolve to the inner binding, not the outer
+// CTE, so that scope is not treated as a self-reference.
+func cteQueryReferencesName(query SelectQuery, name string) bool {
+	// If this query rebinds name via its own WITH, every reference to name at or
+	// below this query resolves to that inner binding, not to the CTE we are
+	// checking, so this scope is not a self-reference.
+	for _, cte := range query.With {
+		if cte.Name == name {
+			return false
+		}
+	}
+	for _, cte := range query.With {
+		if cteQueryReferencesName(cte.Query, name) {
+			return true
+		}
+	}
+	if tableSourceReferencesName(query.From, name) {
+		return true
+	}
+	for _, join := range query.Joins {
+		if tableSourceReferencesName(join.Table, name) {
+			return true
+		}
+	}
+	for _, compound := range query.Compounds {
+		if cteQueryReferencesName(compound.Query, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// tableSourceReferencesName reports whether a FROM/JOIN source is (or, for a
+// derived table, contains a reference to) the named table.
+func tableSourceReferencesName(source TableSource, name string) bool {
+	if source.Subquery != nil {
+		return cteQueryReferencesName(*source.Subquery, name)
+	}
+	return source.Table == name
 }
 
 func nextCatalogJoin(text string) (position int, kind string, keyword string, found bool) {

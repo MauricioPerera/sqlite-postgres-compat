@@ -1052,6 +1052,95 @@ func TestSystemClaimsExactCoverageForRequiredFeatureFamilies(t *testing.T) {
 	}
 }
 
+// TestSystemRejectsAudit10DivergentDDLBeforeEngines reproduces the two AUDIT10
+// MEDIA cases against both real engines and confirms compat now refuses each one
+// during compilation — before a single statement reaches SQLite or PostgreSQL.
+//
+//   - M1: a CHECK constraint embedding the non-deterministic gen_random_uuid().
+//     Both engines used to accept the DDL, then evaluate the predicate per row
+//     independently (silent data divergence). ApplySchema now errors on both.
+//   - M2: a non-recursive CTE that references its own name. The same byte-
+//     identical DDL used to apply on both engines, then diverge at query time
+//     (SQLite: "circular reference"; PostgreSQL: rows). ApplySchema now errors on
+//     both. The exact report string `WITH t AS (SELECT id FROM t) SELECT id FROM t`
+//     is frozen at the parser level in compat.TestParseCatalogSelectRejectsSelfReferentialCTE;
+//     here the equivalent hand-built AST is refused before compilation.
+//
+// After each rejection the target relation is confirmed absent in PostgreSQL,
+// proving no DDL escaped to the engine.
+func TestSystemRejectsAudit10DivergentDDLBeforeEngines(t *testing.T) {
+	ctx := context.Background()
+
+	checkSchema := compat.Schema{Tables: []compat.Table{{
+		Name:    "audit10_check",
+		Columns: []compat.Column{{Name: "id", Type: compat.Type{Family: compat.UUIDType}}},
+		Constraints: []compat.Constraint{{
+			Kind: compat.Check,
+			Expression: &compat.Expression{Kind: "is_not_null", Args: []compat.Expression{
+				{Kind: "gen_random_uuid"},
+			}},
+		}},
+	}}}
+
+	selfRefView := compat.Schema{
+		Tables: []compat.Table{{
+			Name:    "audit10_base_t",
+			Columns: []compat.Column{{Name: "id", Type: compat.Type{Family: compat.IntegerType}}},
+		}},
+		Views: []compat.View{{
+			Name: "audit10_selfref",
+			Query: compat.SelectQuery{
+				With: []compat.CommonTableExpr{{
+					Name: "t",
+					Query: compat.SelectQuery{
+						Columns: []compat.Projection{{Expression: compat.Expression{Kind: "column", Value: "id"}}},
+						From:    compat.TableSource{Table: "t"},
+					},
+				}},
+				Columns: []compat.Projection{{Expression: compat.Expression{Kind: "column", Value: "id"}}},
+				From:    compat.TableSource{Table: "t"},
+			},
+		}},
+	}
+
+	cases := []struct {
+		name      string
+		schema    compat.Schema
+		wantInErr string
+		relation  string
+	}{
+		{"M1 gen_random_uuid in CHECK", checkSchema, "gen_random_uuid", "audit10_check"},
+		{"M2 self-referential CTE", selfRefView, "self-referential", "audit10_selfref"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sqlite := openSQLite(t, filepath.Join(t.TempDir(), "audit10.db"))
+			postgres := openPostgres(t)
+			for _, store := range []*compat.Store{sqlite, postgres} {
+				err := store.ApplySchema(ctx, tc.schema)
+				if err == nil {
+					t.Fatalf("%s: expected ApplySchema to reject divergent DDL", store.Target.Engine)
+				}
+				if !strings.Contains(err.Error(), tc.wantInErr) {
+					t.Fatalf("%s: error %q does not mention %q", store.Target.Engine, err.Error(), tc.wantInErr)
+				}
+			}
+			// The relation must not exist in PostgreSQL: no DDL reached the engine.
+			var count int
+			if err := postgres.DB.QueryRowContext(ctx,
+				`SELECT (SELECT count(*) FROM information_schema.tables WHERE table_name = $1)
+				      + (SELECT count(*) FROM information_schema.views  WHERE table_name = $1)`,
+				tc.relation).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != 0 {
+				t.Fatalf("relation %q leaked into PostgreSQL despite rejection", tc.relation)
+			}
+		})
+	}
+}
+
 func openSQLite(t *testing.T, path string) *compat.Store {
 	t.Helper()
 	store, err := compat.OpenSQLite(compat.Version{Major: 3}, "file:"+filepath.ToSlash(path))

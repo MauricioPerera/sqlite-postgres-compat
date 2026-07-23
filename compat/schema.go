@@ -393,6 +393,14 @@ func validateDomains(domains []Domain) (map[string]Domain, error) {
 				return nil, fmt.Errorf("domain %q vector base type requires a single positive dimension", domain.Name)
 			}
 		}
+		if domain.Check != nil && expressionIsNonDeterministic(*domain.Check) {
+			// A domain CHECK is compiled by the same compileExpression path as a
+			// table CHECK and enforced per row by each engine independently. A
+			// non-deterministic predicate would accept or reject the same value
+			// differently on SQLite and PostgreSQL — the silent divergence the
+			// byte-identical discipline forbids (see expressionIsNonDeterministic).
+			return nil, fmt.Errorf("domain %q CHECK uses gen_random_uuid, which is non-deterministic and cannot appear in a CHECK constraint", domain.Name)
+		}
 		resolved[domain.Name] = domain
 	}
 	return resolved, nil
@@ -434,6 +442,18 @@ func validateTable(table Table, domains map[string]Domain, tables map[string]str
 					return fmt.Errorf("table %q primary key includes generated column %q", table.Name, name)
 				}
 			}
+		}
+		if constraint.Kind == Check && constraint.Expression != nil && expressionIsNonDeterministic(*constraint.Expression) {
+			// gen_random_uuid() is the only non-deterministic node in the grammar.
+			// In a CHECK it would be evaluated per row, independently by each
+			// engine, so a predicate built on it (e.g. gen_random_uuid() < '8000…')
+			// could accept a row on one engine and reject it on the other — a
+			// silent data divergence. DEFAULT and trigger-action contexts are
+			// unaffected: there the value is generated once and stored/copied as
+			// data, never re-evaluated. Index and generated-column contexts are
+			// already rejected consistently by both engines; CHECK is the only
+			// context both engines accept, so it is the one guarded here.
+			return fmt.Errorf("table %q CHECK constraint uses gen_random_uuid, which is non-deterministic and cannot appear in a CHECK constraint", table.Name)
 		}
 		if constraint.Kind != ForeignKey || constraint.References == nil {
 			continue
@@ -629,6 +649,27 @@ func validateRoutines(routines []Routine) error {
 		}
 	}
 	return nil
+}
+
+// expressionIsNonDeterministic reports whether expression, or any nested
+// argument, is a non-deterministic node. gen_random_uuid() is currently the only
+// such node in the canonical grammar (compat/sqlparse.go); every other node
+// compiles to a value that is identical for a given input on both engines. The
+// walk is used to keep non-determinism out of CHECK constraints, where a
+// per-row, per-engine re-evaluation would let SQLite and PostgreSQL disagree on
+// which rows are valid. It intentionally does NOT restrict DEFAULT or
+// trigger-action contexts, where the function is evaluated once and its result
+// stored/copied as ordinary data.
+func expressionIsNonDeterministic(expression Expression) bool {
+	if expression.Kind == "gen_random_uuid" {
+		return true
+	}
+	for _, arg := range expression.Args {
+		if expressionIsNonDeterministic(arg) {
+			return true
+		}
+	}
+	return false
 }
 
 func validReferentialAction(action ReferentialAction) bool {

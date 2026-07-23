@@ -731,6 +731,14 @@ func compileWith(engine Engine, ctes []CommonTableExpr) (string, error) {
 		if cte.Name == "" {
 			return "", fmt.Errorf("common table expression requires a name")
 		}
+		if cteQueryReferencesName(cte.Query, cte.Name) {
+			// Defense in depth for a hand-built AST that bypasses the parser's
+			// stripCatalogWith guard: a self-referential non-recursive CTE compiles
+			// to byte-identical DDL that diverges at runtime (SQLite: circular
+			// reference; PostgreSQL: binds to the base table and returns rows), so it
+			// must never reach either engine.
+			return "", fmt.Errorf("self-referential CTE %q requires RECURSIVE, which is outside the canonical grammar", cte.Name)
+		}
 		query, err := compileSelect(engine, cte.Query)
 		if err != nil {
 			return "", err
