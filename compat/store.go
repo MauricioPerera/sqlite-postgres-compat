@@ -270,6 +270,17 @@ func canonicalValue(kind TypeFamily, source any, dimension ...int) (Value, error
 		return Value{Kind: BinaryValue, Value: base64.StdEncoding.EncodeToString(bytes)}, nil
 	}
 	if timestamp, ok := source.(time.Time); ok {
+		// A native DATE column on a destination created by an older tool version
+		// (before DateType was mapped to TEXT — see ddl.go) is returned by pgx as a
+		// time.Time at midnight UTC. The generic time.Time branch below would
+		// canonicalize it to a TimestampValue ("2020-01-01T00:00:00Z") and diverge
+		// from the SQLite TEXT source ("2020-01-01"). When the column family is
+		// DateType, emit the date-only canonical form so a legacy native-DATE
+		// destination re-verified against the current source still converges. This
+		// is defensive: new destinations store DateType as TEXT and never reach here.
+		if kind == DateType {
+			return Value{Kind: DateValue, Value: timestamp.UTC().Format("2006-01-02")}, nil
+		}
 		return Value{Kind: TimestampValue, Value: timestamp.UTC().Format(time.RFC3339Nano)}, nil
 	}
 	text := stringify(source)

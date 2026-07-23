@@ -16,7 +16,7 @@ Canonical types are `Type{Family, Arguments}` (`compat/schema.go`). Families:
 | `float` | `REAL` | `DOUBLE PRECISION` | — |
 | `text` | `TEXT` | `TEXT` | — |
 | `binary` | `BLOB` | `BYTEA` | — |
-| `date` | `TEXT` | `DATE` | — |
+| `date` | `TEXT` | `TEXT` | — |
 | `timestamp` | `TEXT` (RFC3339Nano) | `TEXT` (RFC3339Nano) | — |
 | `json` | `TEXT` | `TEXT` | — |
 | `uuid` | `TEXT` | `TEXT` | — |
@@ -300,6 +300,15 @@ This is a **tooling version boundary**, not a data format the journal is self-de
 - **Reinstall capture after upgrading.** Triggers installed by a previous tool version must be **reinstalled** (`InstallChangeCapture`) on every store before capturing new changes with the new code. The old triggers do not emit the marker the new applier expects.
 - **Drain or discard in-flight pre-upgrade journals.** A journal captured by pre-upgrade triggers (no marker) must **not** be applied with the new code: drain it to the destination before upgrading, or discard it and re-snapshot from a clean source. The documented migration contract (install capture → snapshot → catch-up drains the journal) already keeps you on the safe side; a mixed-version in-flight journal is outside that contract.
 - **Divergence is detected, never silent.** If a pre-upgrade journal is nonetheless applied with the new code, `ApplyChanges` does not error, but `VerifySnapshots` reports `Equivalent == false` for affected high-magnitude REAL-stored decimals (the new code reads the unmarked text verbatim while the source canonizes the REAL `float64`). There is no silent corruption: a `verify` step surfaces the divergence.
+
+## 11. Upgrade compatibility — `date` family mapping
+
+`date` now compiles to **`TEXT`** on PostgreSQL (it was previously native `DATE`). A native `DATE` column is returned by pgx as a `time.Time`, which the canonical layer would fold to a `TimestampValue` (`"2020-01-01T00:00:00Z"`) and always diverge from the SQLite `TEXT` source (`"2020-01-01"`). `TEXT` mirrors the protective `timestamp`/`json`/`uuid` mapping and preserves the date byte-for-byte.
+
+This is a **schema mapping boundary**. Observe it when upgrading the tool across it:
+
+- **Recreate a legacy destination's schema.** A destination created by an **older** tool version still holds native `DATE` columns. Re-create the destination schema (drop and re-`ApplySchema`, or re-run the full `compat copy`/`compat cutover` migration from a clean source) so the columns become `TEXT`. `canonicalValue` is defensive: when the family is `date` it still canonicalizes a `time.Time` from a legacy native-`DATE` column to the date-only form, so a stray re-verify against such a column converges rather than diverging — but the supported path is to recreate the schema.
+- **Divergence is detected, never silent.** The first `compat copy`/`compat cutover` verify against a legacy native-`DATE` destination reports `ERR_VERIFY_DIVERGED` / `status=diverged` (exit `1`); there is no silent corruption. Recreate the destination schema to clear it.
 
 ## Interface note
 

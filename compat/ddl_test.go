@@ -63,6 +63,22 @@ func TestPostgresTimestampUsesLosslessTextStorage(t *testing.T) {
 	}
 }
 
+// TestPostgresDateUsesLosslessTextStorage guards the ALTA fix from AUDIT5 §4.1:
+// DateType must compile to TEXT on Postgres, never to native DATE. A native DATE
+// column is returned by pgx as a time.Time, which the canonical layer would fold
+// to a TimestampValue ("2020-01-01T00:00:00Z") and always diverge from the SQLite
+// TEXT source ("2020-01-01"). TEXT mirrors the timestamp/json/uuid protective
+// mapping and keeps the date byte-for-byte.
+func TestPostgresDateUsesLosslessTextStorage(t *testing.T) {
+	typ, err := compileType(Postgres, Type{Family: DateType})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typ != "TEXT" {
+		t.Fatalf("expected TEXT for date storage, got %s", typ)
+	}
+}
+
 func TestCompileCanonicalView(t *testing.T) {
 	where := Expression{Kind: "gt", Args: []Expression{
 		{Kind: "column", Value: "e.score"},

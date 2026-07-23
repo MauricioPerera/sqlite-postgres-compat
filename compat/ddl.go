@@ -157,7 +157,12 @@ func compileType(engine Engine, typ Type) (string, error) {
 		case BinaryType:
 			return "BYTEA", nil
 		case DateType:
-			return "DATE", nil
+			// pgx returns a native DATE column as a time.Time, which the generic
+			// time.Time branch in canonicalValue would fold to a TimestampValue
+			// ("2020-01-01T00:00:00Z") and diverge from the SQLite TEXT source
+			// ("2020-01-01"). TEXT preserves the exact canonical date value used by
+			// both engines, mirroring the timestamp/json/uuid protective mapping.
+			return "TEXT", nil
 		case TimestampType:
 			// PostgreSQL timestamps have microsecond resolution. Canonical RFC3339
 			// text preserves nanoseconds and offsets without rounding.

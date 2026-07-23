@@ -5,6 +5,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSQLiteSnapshotRoundTrip(t *testing.T) {
@@ -302,6 +303,51 @@ func TestCanonicalDecimalPreservesArbitraryPrecisionText(t *testing.T) {
 				t.Fatalf("unexpected kind %q for %q", got.Kind, tc.in)
 			}
 		})
+	}
+}
+
+// TestCanonicalDateHandlesTimeTimeFromLegacyNativeDate guards the ALTA fix from
+// AUDIT5 §4.1. The SQLite source stores a date as TEXT and canonicalValue reads
+// it as a string, yielding DateValue "2020-01-01". A destination created by an
+// older tool version (before DateType mapped to TEXT) keeps a native PG DATE
+// column, which pgx returns as a time.Time at midnight UTC. canonicalValue must
+// fold that time.Time to the same date-only canonical form when the family is
+// DateType, so a legacy native-DATE destination re-verified against the current
+// source still converges instead of diverging as a TimestampValue. New
+// destinations store DateType as TEXT and never reach the time.Time branch.
+func TestCanonicalDateHandlesTimeTimeFromLegacyNativeDate(t *testing.T) {
+	fromText, err := canonicalValue(DateType, "2020-01-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromText.Kind != DateValue || fromText.Value != "2020-01-01" {
+		t.Fatalf("text date = {%q, %q}, want {date, 2020-01-01}", fromText.Kind, fromText.Value)
+	}
+	fromTime, err := canonicalValue(DateType, time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromTime.Kind != DateValue || fromTime.Value != "2020-01-01" {
+		t.Fatalf("time.Time date = {%q, %q}, want {date, 2020-01-01}", fromTime.Kind, fromTime.Value)
+	}
+	if fromText.Value != fromTime.Value {
+		t.Fatalf("expected text and time.Time dates to converge, got %q vs %q", fromText.Value, fromTime.Value)
+	}
+	// A non-UTC offset must still canonicalize to the UTC date-only form.
+	fromOffset, err := canonicalValue(DateType, time.Date(2020, 1, 1, 2, 30, 0, 0, time.FixedZone("UTC+2", 2*3600)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromOffset.Value != "2020-01-01" {
+		t.Fatalf("offset date = %q, want 2020-01-01", fromOffset.Value)
+	}
+	// The generic time.Time path must remain a TimestampValue for non-date families.
+	ts, err := canonicalValue(TimestampType, time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ts.Kind != TimestampValue || ts.Value != "2020-01-01T00:00:00Z" {
+		t.Fatalf("timestamp = {%q, %q}, want {timestamp, 2020-01-01T00:00:00Z}", ts.Kind, ts.Value)
 	}
 }
 

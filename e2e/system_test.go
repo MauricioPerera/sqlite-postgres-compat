@@ -1117,3 +1117,123 @@ func TestDatabaseDSNPreservesConnectionParameters(t *testing.T) {
 		t.Fatalf("unexpected DSN %q", dsn)
 	}
 }
+
+// TestSystemDateFamilyRoundTripsEquivalent guards the ALTA fix from AUDIT5 §4.1.
+// Before the fix, a schema with a `date` column made `compat copy` ALWAYS fail
+// verification with ERR_VERIFY_DIVERGED: Postgres mapped DateType to native DATE,
+// pgx returned it as a time.Time, and canonicalValue folded that to a
+// TimestampValue ("2020-01-01T00:00:00Z") that diverged from the SQLite TEXT
+// source ("2020-01-01"). DateType now maps to TEXT on Postgres (like timestamp/
+// json/uuid), so the date round-trips byte-for-byte. This drives the BUILT
+// binary (go run collapses exit codes on Windows) against real PostgreSQL and
+// asserts exit 0 plus equivalent=true — the exact path that used to diverge.
+func TestSystemDateFamilyRoundTripsEquivalent(t *testing.T) {
+	ctx := context.Background()
+	schema := compat.Schema{Tables: []compat.Table{{
+		Name: "fixa5_dates",
+		Columns: []compat.Column{
+			{Name: "id", Type: compat.Type{Family: compat.IntegerType}},
+			{Name: "d", Type: compat.Type{Family: compat.DateType}, Nullable: true},
+		},
+		Constraints: []compat.Constraint{{Kind: compat.PrimaryKey, Columns: []string{"id"}}},
+	}}}
+
+	sourcePath := filepath.Join(t.TempDir(), "date-source.db")
+	source, err := compat.OpenSQLite(compat.Version{Major: 3}, "file:"+filepath.ToSlash(sourcePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.ApplySchema(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.DB.ExecContext(ctx, `INSERT INTO fixa5_dates (id, d) VALUES (?, ?), (?, ?)`, 1, "2020-01-01", 2, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	configuration := map[string]any{
+		"source_dsn": "file:" + filepath.ToSlash(sourcePath),
+		// Drop and recreate any leftover fixa5_dates table on the shared e2e PG
+		// database so the import is additive into an empty destination.
+		"destination_dsn": postgresTestDSN,
+		"contract": compat.Contract{
+			Source:      compat.Target{Engine: compat.SQLite, Version: compat.Version{Major: 3}},
+			Destination: compat.Target{Engine: compat.Postgres, Version: compat.Version{Major: 17, Minor: 5}},
+		},
+		"schema": schema,
+	}
+	data, err := json.Marshal(configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "date-migration.json")
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Ensure the destination is empty for the described objects (import is
+	// additive); other tests share the e2e PG database, so drop the table first.
+	postgres := openPostgres(t)
+	_, _ = postgres.DB.ExecContext(ctx, `DROP TABLE IF EXISTS fixa5_dates`)
+
+	stdout, stderr, exitCode := runBuiltCLI(t, "cmd/compat", "copy", configPath)
+	if exitCode != 0 {
+		t.Fatalf("expected exit 0 for date copy, got %d\nstdout:\n%s\nstderr:\n%s", exitCode, stdout, stderr)
+	}
+	var report compat.VerificationReport
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &report); err != nil {
+		t.Fatalf("invalid compat copy output %q: %v", stdout, err)
+	}
+	if !report.Equivalent {
+		t.Fatalf("expected equivalent=true for date copy, got %+v\nstderr:\n%s", report, stderr)
+	}
+
+	// Confirm the date value landed as the exact canonical text on Postgres.
+	var d, dn sql.NullString
+	if err := postgres.DB.QueryRowContext(ctx, `SELECT d FROM fixa5_dates WHERE id = 1`).Scan(&d); err != nil {
+		t.Fatal(err)
+	}
+	if err := postgres.DB.QueryRowContext(ctx, `SELECT d FROM fixa5_dates WHERE id = 2`).Scan(&dn); err != nil {
+		t.Fatal(err)
+	}
+	if !d.Valid || d.String != "2020-01-01" {
+		t.Fatalf("expected date '2020-01-01' on Postgres, got %v", d)
+	}
+	if dn.Valid {
+		t.Fatalf("expected NULL date for id=2, got %q", dn.String)
+	}
+}
+
+// TestCLIUsageCountMessageConsistent guards the MEDIA fix from AUDIT5 §4.2. All
+// three subcommands must emit the same "requires exactly one ... JSON argument"
+// form for a wrong positional count, instead of cutover's former divergent
+// "usage: compat cutover [--dry-run] <cutover.json>" envelope message. The hint
+// on stderr is subcommand-specific by design; this asserts only the machine-
+// facing ERR_USAGE envelope message converges to the documented majority form.
+func TestCLIUsageCountMessageConsistent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"audit", []string{"audit"}, "compat audit requires exactly one contract JSON argument"},
+		{"copy", []string{"copy"}, "compat copy requires exactly one migration JSON argument"},
+		{"cutover", []string{"cutover"}, "compat cutover requires exactly one cutover JSON argument"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, _, exitCode := runBuiltCLI(t, "cmd/compat", tc.args...)
+			if exitCode != 2 {
+				t.Fatalf("expected exit 2 for %s wrong count, got %d\nstdout:\n%s", tc.name, exitCode, stdout)
+			}
+			parsed := firstErrorJSONLine(t, stdout)
+			if code, _ := parsed["code"].(string); code != "ERR_USAGE" {
+				t.Fatalf("expected code=ERR_USAGE, got %v", parsed["code"])
+			}
+			if msg, _ := parsed["message"].(string); msg != tc.want {
+				t.Fatalf("expected message %q, got %q", tc.want, msg)
+			}
+		})
+	}
+}

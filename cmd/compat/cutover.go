@@ -84,7 +84,7 @@ func runCutover(args []string) {
 	present, positional := cliout.ParseArgsStrict([]string{"--dry-run"}, args, 1,
 		"uso: compat cutover [--dry-run] <cutover.json>\nel corte del DSN de la aplicación no es responsabilidad de esta herramienta: cortá la conexión de la app manualmente tras recibir status=ready.",
 		"compat cutover: unexpected flag %q",
-		"usage: compat cutover [--dry-run] <cutover.json>")
+		"compat cutover requires exactly one cutover JSON argument")
 	dryRun := present["--dry-run"]
 	var config cutoverConfig
 	if err := cliout.DecodeFileStrict(positional[0], &config); err != nil {
